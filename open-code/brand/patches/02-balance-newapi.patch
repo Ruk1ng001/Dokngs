@@ -1,0 +1,115 @@
+diff --git a/packages/desktop/electron.vite.config.ts b/packages/desktop/electron.vite.config.ts
+index 5d25be209e..cb70a81d91 100644
+--- a/packages/desktop/electron.vite.config.ts
++++ b/packages/desktop/electron.vite.config.ts
+@@ -14,6 +14,32 @@ const channel = (() => {
+ 
+ const nodePtyPkg = `@lydell/node-pty-${process.platform}-${process.arch}`
+ 
++// [cx] US-003: 默认 locale 由品牌配置集中控制；缺失或非字符串时回退中文。
++// renderer 运行时无法读取父仓库 brand.json，故在构建期注入 import.meta.env。
++const brandConfig = await import("../../../brand/brand.json", { with: { type: "json" } })
++const DEFAULT_LOCALE = typeof brandConfig.default.defaultLocale === "string" ? brandConfig.default.defaultLocale : "zh"
++// [cx] 品牌产品名：集中在 brand.json 的 productName，构建期注入 renderer（i18n runtime 替换）
++// 与主进程（应用菜单）。缺失时回退 "OpenCode"（等于不改名，保持上游原样）。
++const PRODUCT_NAME = typeof brandConfig.default.productName === "string" ? brandConfig.default.productName : "OpenCode"
++
++// [cx] 内置默认渠道地址：未配置 NEWAPI_BASE_URL 时（如未设 CI Secret），回退到内置中转站。
++// 必须带 /v1（OpenAI 兼容路径）：openai-compatible SDK 以 <base>/chat/completions 发请求，
++// 模型查询走 <base>/models（见 balance-panel 的 deriveModelsUrl）。配了 Secret 则以 Secret 为准。
++const DEFAULT_NEWAPI_BASE_URL = "https://dokng.com/v1"
++
++// [cx] US-006: 把 US-003 注入的同名渠道变量在构建期喂给 renderer（浏览器上下文读不到
++// process.env）。baseURL 缺失回退内置默认；key 缺失即空串，余额面板据此显示「未配置凭据」态。
++// 凭据仅内联到打包产物，与上游 OPENCODE_CHANNEL / VITE_SENTRY_* 的 define 注入方式一致。
++const newapiDefine = {
++  "import.meta.env.DEFAULT_LOCALE": JSON.stringify(DEFAULT_LOCALE),
++  // [cx] 品牌产品名，供 renderer 侧 i18n runtime 替换（context/language.tsx）与账户面板等使用。
++  "import.meta.env.PRODUCT_NAME": JSON.stringify(PRODUCT_NAME),
++  "import.meta.env.NEWAPI_BASE_URL": JSON.stringify(process.env.NEWAPI_BASE_URL || DEFAULT_NEWAPI_BASE_URL),
++  "import.meta.env.NEWAPI_API_KEY": JSON.stringify(process.env.NEWAPI_API_KEY ?? ""),
++  // [cx] US-007: 充值页面 URL。缺省时余额面板回退到由 NEWAPI_BASE_URL 推导的站点根。
++  "import.meta.env.NEWAPI_TOPUP_URL": JSON.stringify(process.env.NEWAPI_TOPUP_URL ?? ""),
++}
++
+ const sentry =
+   process.env.SENTRY_AUTH_TOKEN && process.env.SENTRY_ORG && process.env.SENTRY_PROJECT
+     ? sentryVitePlugin({
+@@ -35,6 +61,16 @@ export default defineConfig({
+   main: {
+     define: {
+       "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel),
++      // [cx] US-锁定渠道: 主进程运行时读不到 process.env 里的渠道值（打包产物在用户机器上
++      // 无这些环境变量），故与 renderer 同款在构建期内联。server.ts 据此构造
++      // OPENCODE_CONFIG_CONTENT 注入内核 sidecar，使 App 默认走内置渠道。三者缺失即空串，
++      // server.ts 会跳过注入、退回 opencode 原生行为（不破坏 dev）。
++      // baseURL 缺失回退内置默认（DEFAULT_NEWAPI_BASE_URL，带 /v1）；key / model 缺失即空串。
++      "import.meta.env.NEWAPI_BASE_URL": JSON.stringify(process.env.NEWAPI_BASE_URL || DEFAULT_NEWAPI_BASE_URL),
++      "import.meta.env.NEWAPI_API_KEY": JSON.stringify(process.env.NEWAPI_API_KEY ?? ""),
++      "import.meta.env.NEWAPI_MODEL": JSON.stringify(process.env.NEWAPI_MODEL ?? ""),
++      // [cx] 品牌名注入主进程（desktop-menu 的菜单 label 用；主进程读不到 process.env 里的品牌值）。
++      "import.meta.env.PRODUCT_NAME": JSON.stringify(PRODUCT_NAME),
+     },
+     build: {
+       rollupOptions: {
+@@ -91,7 +127,36 @@ const require = __cjs_mod__.createRequire(import.meta.url);
+     },
+   },
+   renderer: {
+-    plugins: [appPlugin, sentry],
++    // [cx] US-006: 把 US-003 注入的同名渠道变量透传到 renderer 的 import.meta.env，
++    // 供独立余额面板拉取 new-api 余额/用量用。renderer 是浏览器上下文读不到 process.env，
++    // 故在构建期 define 注入；未注入时为空串，面板据此显示「未配置凭据」。不硬编码任何值。
++    define: newapiDefine,
++    plugins: [
++      appPlugin,
++      sentry,
++      // [dokng] 画布产物拷贝（待办 4）：把 prebuild 阶段以 VITE_BASE=/canvas/ 构建出的
++      // infinite-canvas web/dist/ 递归拷进 out/renderer/canvas/。因 oc:// 特权协议已白名单
++      // out/renderer 全子树，iframe 以 oc://renderer/canvas/index.html 加载，主进程/协议零改。
++      // 放 writeBundle（renderer 构建后 out/renderer 已存在、不会被 emptyOutDir 清掉）；
++      // 范式对齐上方 main 侧的 opencode:copy-server-assets（拷 .wasm）。
++      {
++        name: "dokng:copy-canvas",
++        async writeBundle() {
++          const CANVAS_DIST = "../../../infinite-canvas/web/dist"
++          const DEST = "./out/renderer/canvas"
++          try {
++            await fs.access(CANVAS_DIST)
++          } catch {
++            // dev（electron-vite dev 不跑 prebuild）或未构建画布时跳过，不阻断桌面构建。
++            console.warn(`[dokng:copy-canvas] 未找到画布产物 ${CANVAS_DIST}，跳过拷贝（dev 或未构建画布时正常）。`)
++            return
++          }
++          await fs.rm(DEST, { recursive: true, force: true })
++          await fs.cp(CANVAS_DIST, DEST, { recursive: true })
++          console.log(`[dokng:copy-canvas] 已拷贝画布产物 → ${DEST}`)
++        },
++      },
++    ],
+     publicDir: "../../../app/public",
+     root: "src/renderer",
+     build: {
+diff --git a/packages/desktop/src/renderer/env.d.ts b/packages/desktop/src/renderer/env.d.ts
+index 6dff3baf1c..cf85b6a5e7 100644
+--- a/packages/desktop/src/renderer/env.d.ts
++++ b/packages/desktop/src/renderer/env.d.ts
+@@ -1,6 +1,18 @@
+ import type { ElectronAPI } from "../preload/types"
+ 
+ declare global {
++  // [cx] US-003: 品牌层默认 locale，经 renderer.define 在构建期注入。
++  interface ImportMetaEnv {
++    readonly DEFAULT_LOCALE: string
++  }
++  // [cx] US-006: 声明构建期由 electron.vite renderer.define 注入的渠道变量
++  // （复用 US-003 的 NEWAPI_BASE_URL / NEWAPI_API_KEY）。未注入时为空串。
++  // [cx] US-007: NEWAPI_TOPUP_URL —— 充值页面地址，缺省时余额面板回退到站点根。
++  interface ImportMetaEnv {
++    readonly NEWAPI_BASE_URL: string
++    readonly NEWAPI_API_KEY: string
++    readonly NEWAPI_TOPUP_URL: string
++  }
+   interface Window {
+     api: ElectronAPI
+     __OPENCODE__?: {

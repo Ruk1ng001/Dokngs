@@ -1,0 +1,75 @@
+/* [cx] 品牌开屏动画：直接用完整品牌 logo（狗脸 + 环绕爪印），只叠加三个动画钩子，
+   图形一个像素都不改（内联自 brand/icons/logo.svg，保留底板/光晕/滤镜/高光全部细节）。
+   —— 三层动画，贴合 opencode 克制的动效风格：
+      · 整体呼吸（cx-splash，透明度 + 极轻微缩放，3s），呼应上游 animate-pulse 的平静；
+      · 爪印层轻摆（cx-splash-paws，绕狗脸中心 ±3.5° 往复，像小狗好奇微晃，非整圈旋转）；
+      · 双眼周期眨眼（cx-splash-eye，快速纵向压扁再张开，每 ~4.5s 一次），俏皮但克制。
+   —— 落点：空的上游 renderer/styles.css（renderer/index.tsx 顶部 import "./styles.css"，
+      上游为空、无补丁触碰，扩展零冲突）。开屏只显示 1-3s，滤镜/渐变无性能压力。
+   —— 尊重系统「减少动态效果」：prefers-reduced-motion 时停所有动画，回落静态品牌图。 */
+
+@keyframes cx-splash-breathe {
+  0%,
+  100% {
+    opacity: 0.62;
+    transform: scale(0.99);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.01);
+  }
+}
+
+/* 爪印轻摆：绕狗脸中心（viewBox 48×48 → 24,24）极小角度往复，像小狗好奇地微晃动。 */
+@keyframes cx-splash-sway {
+  0%,
+  100% {
+    transform: rotate(-3.5deg);
+  }
+  50% {
+    transform: rotate(3.5deg);
+  }
+}
+
+/* 眨眼：绝大多数时间睁眼，快速闭合再张开（自然眨眼节奏），每 ~4.5s 一次。 */
+@keyframes cx-splash-blink {
+  0%,
+  88%,
+  100% {
+    transform: scaleY(1);
+  }
+  92% {
+    transform: scaleY(0.08);
+  }
+  96% {
+    transform: scaleY(1);
+  }
+}
+
+[data-slot="cx-splash"] {
+  animation: cx-splash-breathe 3s ease-in-out infinite;
+  transform-origin: center;
+  will-change: opacity, transform;
+}
+
+/* 爪印层：绕狗脸视觉中心轻摆。transform-box: view-box 让 transform-origin 以 viewBox 坐标计。 */
+[data-slot="cx-splash"] [data-slot="cx-splash-paws"] {
+  animation: cx-splash-sway 2.8s ease-in-out infinite;
+  transform-box: view-box;
+  transform-origin: 24px 24px;
+}
+
+/* 双眼各自绕自身中心纵向眨。transform-box: fill-box → transform-origin 以各自包围盒计。 */
+[data-slot="cx-splash"] [data-slot="cx-splash-eye"] {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: cx-splash-blink 4.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="cx-splash"],
+  [data-slot="cx-splash"] [data-slot="cx-splash-paws"],
+  [data-slot="cx-splash"] [data-slot="cx-splash-eye"] {
+    animation: none;
+  }
+}

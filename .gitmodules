@@ -1,0 +1,9 @@
+[submodule "cc-switch/upstream"]
+	path = cc-switch/upstream
+	url = https://github.com/farion1231/cc-switch.git
+[submodule "open-code/opencode"]
+	path = open-code/opencode
+	url = https://github.com/anomalyco/opencode.git
+[submodule "open-code/infinite-canvas"]
+	path = open-code/infinite-canvas
+	url = https://github.com/basketikun/infinite-canvas.git

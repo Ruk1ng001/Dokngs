@@ -1,0 +1,33 @@
+# [ccs] 补丁清单：每个 section 对应 brand/patches/<name>.patch。
+# 由 scripts/check-manifest.py 在 preflight 强校验：
+#   - section 集合与磁盘 .patch 集合一致；
+#   - file = 列表与补丁实际 diff 文件集（git apply --numstat）一致；
+#   - depends = 的序号必须小于本补丁（NN 字典序即应用序）；
+#   - 补丁不得触碰 overlay / i18n 合并 / updater 注入接管的保留路径。
+#
+# 注意：新文件不进补丁——放 brand/overlay/（apply-patches.sh 补丁后复制）；
+#       locale 文案放 brand/i18n/account.<locale>.json（语义合并）；
+#       updater pubkey/endpoints 放 brand/updater.conf.json（定点注入）。
+
+[02-account-backend-anchors]
+# overlay 提供 commands/account.rs + services/account.rs + deeplink_account.rs，
+# 本补丁只做接线锚点：命令注册 + services/commands mod 声明 + deeplink_account mod
+# 声明 + 两处深链接入口的 account 拦截（handle_deeplink_url、macOS RunEvent::Opened）
+# + setup 内 drain_launch_deeplinks 冷启动补扫（emit 不重放，见补丁头注释）。
+file = src-tauri/src/commands/mod.rs
+file = src-tauri/src/lib.rs
+file = src-tauri/src/services/mod.rs
+
+[04-account-ui-anchors]
+# App.tsx 3 行挂载（import + 顶栏按钮 + CcsAccountMount）+ dokng 图标注册。
+# depends：运行时调用 02 注册的 get_account_profile / get_account_models。
+depends = 02-account-backend-anchors
+file = src/App.tsx
+file = src/icons/extracted/index.ts
+file = src/icons/extracted/metadata.ts
+
+[06-tray-account-entry]
+# 托盘「我的账户」入口（仅 Rust 侧）；emit 的 "ccs-open-account" 由 04 挂载的
+# CcsAccountMount 消费，故声明依赖 04。
+depends = 04-account-ui-anchors
+file = src-tauri/src/tray.rs

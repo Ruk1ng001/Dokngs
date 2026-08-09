@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>Dokng 开屏动画预览（与补丁 14 逐字一致）</title>
+<style>
+/* ↓↓↓ 以下 keyframes/选择器直接取自 brand/patches/14-splash-brand.patch 的 styles.css ↓↓↓ */
+/* [cx] 品牌开屏动画：轨道旋转 + 整体呼吸，贴合 opencode 克制的动效风格。
+   —— 空的上游 renderer/styles.css 是这段动画的落点（该文件被 renderer/index.tsx
+      在顶部 import "./styles.css" 引入，且上游为空、无补丁触碰，扩展零冲突）。
+   —— 动画分两层：外圈轨道环 + 节点匀速旋转（8s，慢到不晕），笑脸主体不旋转（转起来会
+      倒置很怪）；整组叠加 3s 呼吸（透明度 + 极轻微缩放），呼应上游原版 animate-pulse 的平静感。
+   —— 尊重系统「减少动态效果」偏好：prefers-reduced-motion 时停所有动画，回落到静态品牌图。 */
+
+@keyframes cx-splash-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes cx-splash-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.985);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.015);
+  }
+}
+
+/* 整组呼吸：透明度 + 极轻微缩放，节奏舒缓（3s ease-in-out 无限循环）。
+   transform-origin: center 对 svg 根元素即其自身几何中心。 */
+[data-slot="cx-splash"] {
+  animation: cx-splash-breathe 3s ease-in-out infinite;
+  transform-origin: center;
+  will-change: opacity, transform;
+}
+
+/* 轨道层（环 + 弧 + 节点）匀速旋转。
+   transform-box: view-box + transform-origin: 24px 24px 让旋转绕 viewBox（48×48）视觉中心，
+   而非元素包围盒——否则旋转会偏心画圈。两者缺一不可（Chromium/Electron 下默认 box 不保证）。 */
+[data-slot="cx-splash"] [data-slot="cx-splash-orbit"] {
+  animation: cx-splash-spin 8s linear infinite;
+  transform-box: view-box;
+  transform-origin: 24px 24px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="cx-splash"],
+  [data-slot="cx-splash"] [data-slot="cx-splash-orbit"] {
+    animation: none;
+  }
+}
+/* ↑↑↑ 补丁原文结束 ↑↑↑ */
+
+body { margin: 0; font-family: system-ui, sans-serif; display: flex; min-height: 100vh; }
+.pane { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; }
+.light { background: #ffffff; color: #171717; }
+.dark { background: #0a0a0a; color: #ededed; }
+.label { font-size: 12px; opacity: .5; letter-spacing: .1em; }
+</style>
+</head>
+<body>
+  <div class="pane light">
+    <svg
+        data-slot="cx-splash"
+        width="120" height="120"
+        viewBox="0 0 48 48"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <defs>
+          <linearGradient id="gL" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#06b6d4" />
+            <stop offset=".5" stop-color="#3b82f6" />
+            <stop offset="1" stop-color="#8b5cf6" />
+          </linearGradient>
+        </defs>
+
+        
+        <g data-slot="cx-splash-orbit">
+          <circle cx="24" cy="24" r="17.6" fill="none" stroke="#c7d2fe" stroke-width=".85" stroke-dasharray="1.5 2.3" opacity=".55" />
+          <circle cx="24" cy="24" r="15.35" fill="none" stroke="#c7d2fe" stroke-width="1" opacity=".5" />
+          <path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#gL)" stroke-width="2.45" stroke-linecap="round" />
+          <path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#gL)" stroke-width="2.45" stroke-linecap="round" />
+          <circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4" />
+          <circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6" />
+        </g>
+
+        
+        <path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#gL)" stroke-width="2.25" stroke-linecap="round" />
+        <circle cx="20.2" cy="22.1" r="1.5" fill="#06b6d4" />
+        <circle cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6" />
+        <ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#gL)" />
+      </svg>
+    <div class="label">LIGHT · 轨道旋转 8s + 呼吸 3s</div>
+  </div>
+  <div class="pane dark">
+    <svg
+        data-slot="cx-splash"
+        width="120" height="120"
+        viewBox="0 0 48 48"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <defs>
+          <linearGradient id="gD" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#06b6d4" />
+            <stop offset=".5" stop-color="#3b82f6" />
+            <stop offset="1" stop-color="#8b5cf6" />
+          </linearGradient>
+        </defs>
+
+        
+        <g data-slot="cx-splash-orbit">
+          <circle cx="24" cy="24" r="17.6" fill="none" stroke="#c7d2fe" stroke-width=".85" stroke-dasharray="1.5 2.3" opacity=".55" />
+          <circle cx="24" cy="24" r="15.35" fill="none" stroke="#c7d2fe" stroke-width="1" opacity=".5" />
+          <path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#gD)" stroke-width="2.45" stroke-linecap="round" />
+          <path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#gD)" stroke-width="2.45" stroke-linecap="round" />
+          <circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4" />
+          <circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6" />
+        </g>
+
+        
+        <path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#gD)" stroke-width="2.25" stroke-linecap="round" />
+        <circle cx="20.2" cy="22.1" r="1.5" fill="#06b6d4" />
+        <circle cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6" />
+        <ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#gD)" />
+      </svg>
+    <div class="label">DARK · 笑脸静止，仅外圈轨道旋转</div>
+  </div>
+</body>
+</html>

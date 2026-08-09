@@ -1,0 +1,276 @@
+# 03-lock-channel —— 内核注入 / 默认锁定内置渠道（token 来源：本地激活 key，回退构建期内置）
+#
+# 职责：让桌面产物开箱即走内置 newapi 渠道，无需用户手动配置；并让内核用「当前激活 key」发请求。
+#   1. 主进程渠道值 (NEWAPI_BASE_URL / NEWAPI_API_KEY / NEWAPI_MODEL) 由 02 补丁的
+#      electron.vite main.define 内联进 import.meta.env（主进程运行时读不到打包机的
+#      process.env）——vite 注入统一收敛在 02，本补丁不触碰 electron.vite.config.ts。
+#   2. server.ts buildChannelConfigContent() —— 拼装一份 opencode config,
+#      结构对齐 brand/opencode.template.json;createSidecarEnv() 经 OPENCODE_CONFIG_CONTENT
+#      传给内核 sidecar,在 config 合并链末端覆盖用户同名配置,实现「默认注入内置渠道」。
+#      baseURL / apiKey 优先取「本地激活 key」(US-003 的 store-channel-keys,主进程侧
+#      electron-store,直接同步读、无需 IPC);本地无激活 key 时回退到构建期内置默认值;
+#      两者都无则不注入,退回 opencode 原生行为(不破坏本地开发)。
+#      US-009：可选模型集合优先取激活 key 缓存的 models(切换激活 key 时拉该 key 的 /v1/models
+#      落盘,见 store-channel-keys 的 setChannelKeyModels);无缓存时回退构建期内置 NEWAPI_MODEL
+#      合成单条。列出的每个模型都写进 provider.newapi.models,成为内核里「该 key 的可选模型」;
+#      默认 model 取 NEWAPI_MODEL(若在列表内)否则列表首项。切换激活 key / 更新模型集合后须重启
+#      sidecar 才生效(US-002 结论)。
+#   3. main/env.d.ts —— 为上述内联变量补 ImportMetaEnv 类型声明,保证 typecheck 通过。
+#
+# 依赖:02-balance-newapi(主进程渠道值经其 electron.vite main.define 注入);
+#      server.ts 引用 04-channel-keys-store 的 store-channel-keys.ts(按 NN 序 03→04 应用,
+#      git apply 只做文本操作不校验 import,typecheck 在全部补丁应用后才跑)。
+# 应用(在 opencode/ 内,基线为 brand/BASE_SHA,按 01→02→03→04 顺序):
+#   git -C opencode apply --3way brand/patches/03-lock-channel.patch
+diff --git a/packages/desktop/src/main/env.d.ts b/packages/desktop/src/main/env.d.ts
+index d69e6feec2..4c90be2698 100644
+--- a/packages/desktop/src/main/env.d.ts
++++ b/packages/desktop/src/main/env.d.ts
+@@ -1,5 +1,10 @@
+ interface ImportMetaEnv {
+   readonly OPENCODE_CHANNEL: string
++  // [cx] 内置渠道锁定：构建期内联的 newapi 渠道值，供主进程启动内核 sidecar 时
++  // 拼装 OPENCODE_CONFIG_CONTENT，使桌面产物默认走内置渠道。缺失即空串。
++  readonly NEWAPI_BASE_URL: string
++  readonly NEWAPI_API_KEY: string
++  readonly NEWAPI_MODEL: string
+ }
+ 
+ interface ImportMeta {
+diff --git a/packages/desktop/src/main/server.ts b/packages/desktop/src/main/server.ts
+index ae1a98efdf..a50a5047cf 100644
+--- a/packages/desktop/src/main/server.ts
++++ b/packages/desktop/src/main/server.ts
+@@ -1,3 +1,4 @@
++import { mkdirSync, writeFileSync } from "node:fs"
+ import { dirname, join } from "node:path"
+ import { fileURLToPath } from "node:url"
+ import { app, utilityProcess } from "electron"
+@@ -6,6 +7,7 @@ import { getLogger } from "./logging"
+ import { getUserShell, loadShellEnv } from "./shell-env"
+ import { getStore } from "./store"
+ import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
++import { readChannelKeysState, channelProviderId, setChannelKeyModels } from "./store-channel-keys"
+ 
+ export type HealthCheck = { wait: Promise<void> }
+ 
+@@ -20,6 +22,19 @@ const SIDECAR_SERVICE_NAME = "opencode server"
+ const SIDECAR_START_STALL_TIMEOUT = 60_000
+ const SIDECAR_STOP_TIMEOUT = 6_000
+ 
++// [cx] 内置渠道配置文件路径：主进程把多-provider config 写到 userData 下这个文件，
++// sidecar 经 OPENCODE_CONFIG 环境变量（指向此路径）在 loadInstanceState 时现读（不缓存）。
++// 增删 key 后主进程重写此文件 + POST /global/dispose，内核重建 instance 即读到新配置——
++// 无需重启进程（切换已注册 key 更是纯前端、零打断）。用自有文件而非用户全局 opencode 配置：
++// 不污染用户配置、无需复刻 xdg 路径、整份覆盖使删除天然生效。
++function getChannelConfigPath(): string {
++  return join(app.getPath("userData"), "cx-channel-config.json")
++}
++
++// [cx] sidecar 连接信息（spawn 时赋值），供 reloadChannelConfig 直连内核发 dispose。
++let sidecarUrl: string | null = null
++let sidecarPassword: string | null = null
++
+ type SpawnLocalServerOptions = {
+   userDataPath: string
+   onStdout?: (message: string) => void
+@@ -60,6 +75,9 @@ export async function spawnLocalServer(
+   password: string,
+   options: SpawnLocalServerOptions,
+ ) {
++  // [cx] 记录连接信息，供 reloadChannelConfig 直连内核发 /global/dispose 热重载。
++  sidecarUrl = `http://${hostname}:${port}`
++  sidecarPassword = password
+   const sidecar = join(dirname(fileURLToPath(import.meta.url)), "sidecar.js")
+   const child = utilityProcess.fork(sidecar, [], {
+     cwd: process.cwd(),
+@@ -210,12 +228,189 @@ export async function checkHealth(url: string, password?: string | null): Promis
+   return false
+ }
+ 
++// [cx] 多 provider 内置渠道 —— 构造 opencode config 对象（写入 OPENCODE_CONFIG 指向的文件）。
++//   把「每个本地 key」构造成一个**独立 provider**（providerID = channelProviderId(key.id)），
++//   内核启动/重建时读该文件，同时握着所有 key 的 provider；原生 model 选择器能列出每个 key
++//   及其模型。在已注册 key 之间切换是纯前端（model.set），零打断；增删 key 改变 provider 集合，
++//   由主进程重写文件 + POST /global/dispose 热重载生效（不重启进程）。
++//
++//   provider 来源优先级：
++//     1. 本地 stored keys（store-channel-keys）——每个 key 一个 provider；
++//     2. 无任何 key 时回退构建期内置默认单 provider（import.meta.env.NEWAPI_*），保证首启开箱即用；
++//     3. 两者都无 → 返回 undefined（不写文件、不设 OPENCODE_CONFIG，退回 opencode 原生行为）。
++//
++//   每个 provider 的模型：优先用该 key 缓存的 models（增删/切换时主进程拉 /v1/models 落盘）；
++//   无缓存回退构建期 NEWAPI_MODEL 合成单条；再无则跳过该 key。顶层默认 model 指向激活 key。
++function buildChannelConfig(): Record<string, unknown> | undefined {
++  const state = readChannelKeysState()
++  const builtinModel = import.meta.env.NEWAPI_MODEL
++
++  // 把单个 key 构造成一个 provider 条目。models 为空则跳过该 key（无法确定可选模型）。
++  // 返回 { id, providerId, defaultModel, entry } 或 null。
++  function buildProvider(key: { id: string; label: string; key: string; baseURL: string; models?: string[] }) {
++    const baseURL = key.baseURL || import.meta.env.NEWAPI_BASE_URL
++    const apiKey = key.key || import.meta.env.NEWAPI_API_KEY
++    if (!baseURL || !apiKey) return null
++
++    const cached = key.models?.filter((m) => typeof m === "string" && m.length > 0) ?? []
++    const modelList = cached.length > 0 ? cached : builtinModel ? [builtinModel] : []
++    if (modelList.length === 0) return null
++
++    const defaultModel = builtinModel && modelList.includes(builtinModel) ? builtinModel : modelList[0]
++    const models = Object.fromEntries(modelList.map((id) => [id, { name: id }]))
++    const providerId = channelProviderId(key.id)
++    return {
++      providerId,
++      defaultModel,
++      entry: {
++        npm: "@ai-sdk/openai-compatible",
++        // provider 显示名 = label + 短 id 后缀（与 renderer 侧一致，见 channelProviderId）。
++        name: `${key.label || "内置渠道"} (${key.id.slice(0, 8)})`,
++        options: { baseURL, apiKey },
++        models,
++      },
++    }
++  }
++
++  const provider: Record<string, unknown> = {}
++  let topModel: string | undefined
++
++  if (state.keys.length > 0) {
++    // 有本地 key：每个 key 注入成独立 provider。
++    for (const key of state.keys) {
++      const built = buildProvider(key)
++      if (!built) continue
++      provider[built.providerId] = built.entry
++      // 顶层默认 model 指向激活 key（无激活项时用首个成功构造的 provider）。
++      const isActive = key.id === state.activeKeyId
++      if (isActive || !topModel) topModel = `${built.providerId}/${built.defaultModel}`
++    }
++  } else {
++    // 无本地 key：回退构建期内置默认单 provider（首启开箱即用）。
++    const baseURL = import.meta.env.NEWAPI_BASE_URL
++    const apiKey = import.meta.env.NEWAPI_API_KEY
++    if (baseURL && apiKey && builtinModel) {
++      provider["newapi"] = {
++        npm: "@ai-sdk/openai-compatible",
++        name: "内置渠道",
++        options: { baseURL, apiKey },
++        models: { [builtinModel]: { name: builtinModel } },
++      }
++      topModel = `newapi/${builtinModel}`
++    }
++  }
++
++  if (Object.keys(provider).length === 0 || !topModel) return undefined
++
++  return {
++    $schema: "https://opencode.ai/config.json",
++    model: topModel,
++    provider,
++  }
++}
++
++// [cx] 把内置渠道 config 写入 OPENCODE_CONFIG 文件（整份覆盖，删除的 key 天然消失）。
++// 返回 true = 写了有效配置；false = 无可用渠道值（此时不应设 OPENCODE_CONFIG）。
++// spawn 前调用即完成首启注入（内核第一次读文件就位，无 HTTP、无时序竞争）。
++function writeChannelConfigFile(): boolean {
++  const config = buildChannelConfig()
++  const path = getChannelConfigPath()
++  try {
++    mkdirSync(dirname(path), { recursive: true })
++    if (!config) {
++      // 无可用渠道：写一个空对象，保证文件存在（OPENCODE_CONFIG 指向的文件缺失时内核会忽略）。
++      writeFileSync(path, "{}", "utf8")
++      return false
++    }
++    writeFileSync(path, JSON.stringify(config, null, 2), "utf8")
++    return true
++  } catch (error) {
++    getLogger().error("写入内置渠道配置文件失败", { error: String(error) })
++    return false
++  }
++}
++
++// [cx] 由渠道 baseURL 推导 OpenAI 兼容 /v1/models 端点（与 renderer 侧 deriveModelsUrl 同规则）。
++function deriveModelsUrl(baseURL: string): string {
++  const trimmed = baseURL.trim().replace(/\/+$/, "")
++  return /\/v1$/.test(trimmed) ? `${trimmed}/models` : `${trimmed}/v1/models`
++}
++
++// [cx] 主进程侧拉取某 key 的可用模型（无 CORS 限制，比 renderer fetch 更稳）。失败返回空数组。
++// baseURL 缺省回退构建期内置默认（NEWAPI_BASE_URL）。不打印 key 明文。
++async function fetchModelIds(baseURL: string, apiKey: string): Promise<string[]> {
++  const base = baseURL || import.meta.env.NEWAPI_BASE_URL
++  if (!base || !apiKey) return []
++  try {
++    const res = await fetch(deriveModelsUrl(base), {
++      headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" },
++      signal: AbortSignal.timeout(10_000),
++    })
++    if (!res.ok) return []
++    const body = (await res.json()) as { data?: unknown } | unknown[]
++    const list = Array.isArray(body) ? body : Array.isArray((body as { data?: unknown }).data) ? (body as { data: unknown[] }).data : []
++    const ids = list
++      .map((m) => (typeof m === "string" ? m : m && typeof m === "object" ? (m as { id?: unknown }).id : undefined))
++      .filter((id): id is string => typeof id === "string" && id.length > 0)
++    return Array.from(new Set(ids))
++  } catch {
++    return []
++  }
++}
++
++// [cx] 拉取指定 key 的 /v1/models 并落盘，然后热重载。新增 key 时调用（renderer 经 IPC 触发）：
++// 主进程拉模型 → setChannelKeyModels → 重写文件 + dispose，使该 key 成为可用 provider——不重启。
++export async function refreshKeyModelsAndReload(id: string): Promise<void> {
++  const state = readChannelKeysState()
++  const key = state.keys.find((k) => k.id === id)
++  if (key) {
++    const models = await fetchModelIds(key.baseURL, key.key)
++    if (models.length > 0) setChannelKeyModels(id, models)
++  }
++  await reloadChannelConfig()
++}
++
++// [cx] 热重载内置渠道：重写 OPENCODE_CONFIG 文件 + POST /global/dispose 让内核重建 instance
++// 读到新配置——不重启进程。增删 key / 更新模型后由 IPC 调用。dispose 会中断进行中的流式生成
++// （partial 存为 interrupted，同原生加/连 provider 行为），故调用方应在会话空闲时触发。
++export async function reloadChannelConfig(): Promise<void> {
++  writeChannelConfigFile()
++  if (!sidecarUrl) return
++  let disposeUrl: URL
++  try {
++    disposeUrl = new URL("/global/dispose", sidecarUrl)
++  } catch {
++    return
++  }
++  const headers = new Headers({ "content-type": "application/json" })
++  if (sidecarPassword) {
++    headers.set("authorization", `Basic ${Buffer.from(`opencode:${sidecarPassword}`).toString("base64")}`)
++  }
++  try {
++    await fetch(disposeUrl, { method: "POST", headers, signal: AbortSignal.timeout(10_000) })
++  } catch (error) {
++    getLogger().error("触发内核热重载（dispose）失败", { error: String(error) })
++  }
++}
++
+ function createSidecarEnv(): Record<string, string> {
+   const env = Object.fromEntries(
+     Object.entries(process.env).flatMap(([key, value]) => (value === undefined ? [] : [[key, String(value)]])),
+   )
+   delete env.DEBUG
+   if (process.platform === "linux") delete env.LD_PRELOAD
++  // [cx] 内置渠道注入：spawn 前写好 OPENCODE_CONFIG 文件，用环境变量指向它。
++  //   不用 OPENCODE_CONFIG_CONTENT（值在合并链里覆盖一切、且进程启动后不可变，换 key 必须重启）；
++  //   改用 OPENCODE_CONFIG 指向文件——内核 loadInstanceState 时现读（不缓存），增删 key 后主进程
++  //   重写文件 + dispose 即热重载生效，无需重启进程。
++  //   关键：**始终**设 OPENCODE_CONFIG（即便当前无 key，writeChannelConfigFile 也会写 `{}`）。
++  //   内核只在进程启动时读一次 Flag.OPENCODE_CONFIG；若首启无 key 时不设该变量，则该进程整个
++  //   生命周期都不认这个文件——之后热重载写文件、dispose 也不会重读，导致后加的 key 永不生效。
++  //   写空对象内核可容忍；有 key 后热重载重写文件即被读到。
++  writeChannelConfigFile()
++  env.OPENCODE_CONFIG = getChannelConfigPath()
++  // 清掉可能从 process.env 继承来的旧注入方式，避免覆盖文件配置。
++  delete env.OPENCODE_CONFIG_CONTENT
+   return env
+ }
+ 

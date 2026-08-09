@@ -1,0 +1,87 @@
+# 04-account-ui-anchors —— 账户面板在前端的最小接入锚点
+#
+# 职责：只做「接线」，不含任何组件实现。组件本体全部在 brand/overlay/：
+#   - src/components/account/CcsAccountMount.tsx：唯一挂载点（顶栏按钮 AccountEntryButton
+#     + 面板 Dialog 容器 + 首启/无渠道自动弹出 + 托盘 "ccs-open-account" 监听）；
+#   - src/components/account/{AccountPanel,KeyCard,importKey,useAccountProfile}：面板实现；
+#   - src/lib/api/account.ts、src/lib/account/format.ts：接口封装与展示纯函数。
+#
+# 覆盖文件：
+#   - src/App.tsx（3 处极小 hunk）：import 挂载点组件；顶栏插 <AccountEntryButton/>；
+#     尾部挂 <CcsAccountMount contentTopOffset={...}/>（面板需避让固定顶栏）。
+#     不引入任何状态/Dialog/事件逻辑——全部收敛在 CcsAccountMount 内，上游升级零纠缠。
+#   - src/icons/extracted/index.ts / metadata.ts：注册 dokng 品牌图标（上游高频文件，
+#     若冲突通常是上游新增了其它图标条目，rebase 时只需保住 dokng 两段插入）。
+#
+# 依赖：02（运行时调用其注册的 get_account_profile / get_account_models）；
+#       overlay 文件由 apply-patches.sh 在补丁后复制，编译期必须同时在场。
+# 应用（在 upstream/ 内，基线为 brand/BASE_SHA）：
+#   git -C upstream apply brand/patches/04-account-ui-anchors.patch
+diff --git a/src/App.tsx b/src/App.tsx
+index 227deae6..8c7116b2 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -81,6 +81,11 @@ import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
+ import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
+ import { AgentsPanel } from "@/components/agents/AgentsPanel";
+ import { UniversalProviderPanel } from "@/components/universal";
++// [ccs] 账户功能唯一挂载点（顶栏按钮 + 面板 Dialog + 托盘事件监听），见 components/account/*。
++import {
++  AccountEntryButton,
++  CcsAccountMount,
++} from "@/components/account/CcsAccountMount";
+ import { McpIcon } from "@/components/BrandIcons";
+ import { Button } from "@/components/ui/button";
+ import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
+@@ -1216,6 +1221,8 @@ function App() {
+                 >
+                   <Settings className="w-4 h-4" />
+                 </Button>
++                {/* [ccs] 账户面板入口按钮 */}
++                <AccountEntryButton />
+                 <UpdateBadge
+                   onClick={() => {
+                     setSettingsDefaultTab("about");
+@@ -1658,6 +1665,8 @@ function App() {
+ 
+       <DeepLinkImportDialog />
+       <FirstRunNoticeDialog />
++      {/* [ccs] 账户面板挂载（Dialog + 首启自动弹出 + 托盘 "ccs-open-account" 监听） */}
++      <CcsAccountMount contentTopOffset={contentTopOffset} />
+     </div>
+   );
+ }
+diff --git a/src/icons/extracted/index.ts b/src/icons/extracted/index.ts
+index c988f2c8..d07a787b 100644
+--- a/src/icons/extracted/index.ts
++++ b/src/icons/extracted/index.ts
+@@ -101,6 +101,9 @@ export const icons: Record<string, string> = {
+   novita: `<svg width="1em" height="1em" style="flex:none;line-height:1" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg"><title>Novita</title><g clip-path="url(#clip0_3135_1230)"><path d="M15.5564 8.26172V16.5239L2.1875 29.8928H15.5564V21.6302L23.8194 29.8928H37.1875L15.5564 8.26172Z" fill="#000000"/></g><defs><clipPath id="clip0_3135_1230"><rect width="35" height="21.6311" fill="white" transform="translate(2.1875 8.26172)"/></clipPath></defs></svg>`,
+   nvidia: `<svg height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><title>Nvidia</title><path d="M10.212 8.976V7.62c.127-.01.256-.017.388-.021 3.596-.117 5.957 3.184 5.957 3.184s-2.548 3.647-5.282 3.647a3.227 3.227 0 01-1.063-.175v-4.109c1.4.174 1.681.812 2.523 2.258l1.873-1.627a4.905 4.905 0 00-3.67-1.846 6.594 6.594 0 00-.729.044m0-4.476v2.025c.13-.01.259-.019.388-.024 5.002-.174 8.261 4.226 8.261 4.226s-3.743 4.69-7.643 4.69c-.338 0-.675-.031-1.007-.092v1.25c.278.038.558.057.838.057 3.629 0 6.253-1.91 8.794-4.169.421.347 2.146 1.193 2.501 1.564-2.416 2.083-8.048 3.763-11.24 3.763-.308 0-.603-.02-.894-.048V19.5H24v-15H10.21zm0 9.756v1.068c-3.356-.616-4.287-4.21-4.287-4.21a7.173 7.173 0 014.287-2.138v1.172h-.005a3.182 3.182 0 00-2.502 1.178s.615 2.276 2.507 2.931m-5.961-3.3c1.436-1.935 3.604-3.148 5.961-3.336V6.523C5.81 6.887 2 10.723 2 10.723s2.158 6.427 8.21 7.015v-1.166C5.77 16 4.25 10.958 4.25 10.958h-.002z" fill="#74B71B" fill-rule="nonzero"></path></svg>`,
+   bailian: `<svg fill="currentColor" fill-rule="evenodd" height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><title>BaiLian</title><path d="M6.336 8.919v6.162l5.335-3.083L6.337 8.92z" fill-opacity=".4"></path><path d="M21.394 5.288s-.006-.006-.01-.006L17.01 2.754 6.336 8.92l5.335 3.082 9.701-5.6.016-.01a.635.635 0 00.006-1.1v-.003z" fill-opacity=".8"></path><path d="M21.71 12.465a.62.62 0 00-.316.085s-.006 0-.009.003l-4.375 2.528 5.05 2.915h.006a2.06 2.06 0 00.28-1.04v-3.855a.637.637 0 00-.636-.636z"></path><path d="M22.06 17.996l-5.05-2.915L6.34 21.242l4.27 2.465s.016.006.022.012a2.102 2.102 0 002.093 0c.006-.003.016-.006.022-.012l8.538-4.93c.003 0 .006-.003.01-.006.321-.183.589-.45.775-.772h-.006l-.004-.003z" fill-opacity=".8"></path><path d="M11.672 11.998l-5.336 3.083-1.444.832-3.605 2.083H1.28c.173.303.416.555.709.738l.078.044.016.01.02.012 4.232 2.442 10.671-6.161-5.335-3.082z"></path><path d="M12.74.29c-.1-.06-.208-.107-.315-.148-.02-.006-.038-.016-.057-.022a2.121 2.121 0 00-.7-.12c-.233 0-.457.038-.668.11l-.031.01a2.196 2.196 0 00-.372.17L2.068 5.222s-.003 0-.006.003c-.324.183-.592.451-.781.773h.006l5.049 2.918L17.01 2.758 12.74.29z" fill-opacity=".6"></path><path d="M1.287 6.001H1.28A2.06 2.06 0 001 7.041v9.915c0 .378.1.735.28 1.043h.007l5.049-2.918V8.919l-5.05-2.918z" fill-opacity=".3"></path></svg>`,
++  // [ccs] Dokng 品牌图标。来自 brand/icons/logo.svg（open-code 同款），压单行 + defs id 加
++  // dokng- 前缀防与页面其它 inline SVG 的 gradient/filter id 冲突 + 尺寸改 1em 适配图标系统。
++  dokng: `<svg width="1em" height="1em" style="flex:none;line-height:1" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><title>Dokng</title><defs><linearGradient id="dokng-bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse"><stop stop-color="#f8fafc"/><stop offset=".5" stop-color="#eff6ff"/><stop offset="1" stop-color="#e0e7ff"/></linearGradient><linearGradient id="dokng-main" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#06b6d4"/><stop offset=".5" stop-color="#3b82f6"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient><linearGradient id="dokng-sheen" x1="8" y1="6" x2="40" y2="42" gradientUnits="userSpaceOnUse"><stop stop-color="#ffffff" stop-opacity=".92"/><stop offset=".5" stop-color="#ffffff" stop-opacity=".18"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient><radialGradient id="dokng-glow" cx="0.34" cy="0.28" r="0.8"><stop stop-color="#38bdf8" stop-opacity=".2"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></radialGradient><filter id="dokng-soft" x="-35%" y="-35%" width="170%" height="170%"><feGaussianBlur stdDeviation=".8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#dokng-bg)" stroke="#c7d2fe"/><rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#dokng-glow)"/><rect x="2.4" y="2.4" width="43.2" height="43.2" rx="13.1" fill="url(#dokng-sheen)" opacity=".55"/><rect x="2.8" y="2.8" width="42.4" height="42.4" rx="12.7" fill="none" stroke="#ffffff" stroke-opacity=".5" stroke-width=".75"/><circle cx="24" cy="24" r="17.6" fill="none" stroke="#e0e7ff" stroke-width=".85" stroke-dasharray="1.5 2.3"/><circle cx="24" cy="24" r="15.35" fill="none" stroke="#c7d2fe" stroke-width="1" opacity=".68"/><circle cx="24" cy="24" r="13.35" fill="none" stroke="#ddd6fe" stroke-width="1.1" opacity=".82"/><path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#dokng-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#dokng-soft)"/><path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#dokng-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#dokng-soft)"/><path d="M11.8 15 A15.05 15.05 0 0 1 17.7 9.2" fill="none" stroke="#67e8f9" stroke-width="1.1" stroke-linecap="round" opacity=".5"/><path d="M36.2 33 A15.05 15.05 0 0 1 30.3 38.8" fill="none" stroke="#c4b5fd" stroke-width="1.1" stroke-linecap="round" opacity=".5"/><g filter="url(#dokng-soft)"><circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4"/><circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6"/></g><circle cx="38.05" cy="17.05" r="1" fill="#ecfeff"/><circle cx="9.95" cy="30.95" r="1" fill="#f5f3ff"/><circle cx="17.7" cy="9.2" r=".9" fill="#22d3ee" opacity=".65"/><circle cx="30.3" cy="38.8" r=".9" fill="#a78bfa" opacity=".65"/><path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#dokng-main)" stroke-width="2.25" stroke-linecap="round"/><path d="M15.6 22 C13.1 22 13.4 26.6 15.3 27.8" fill="none" stroke="url(#dokng-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4"/><path d="M32.4 22 C34.9 22 34.6 26.6 32.7 27.8" fill="none" stroke="url(#dokng-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4"/><circle cx="20.2" cy="22.1" r="1.5" fill="#06b6d4"/><circle cx="20.2" cy="22.1" r=".52" fill="#ffffff" opacity=".75"/><circle cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6"/><circle cx="27.8" cy="22.1" r=".52" fill="#ffffff" opacity=".75"/><ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#dokng-main)"/><ellipse cx="24" cy="27.35" rx="1.35" ry=".6" fill="#ffffff" opacity=".65"/><circle cx="14.8" cy="12.4" r=".7" fill="#22d3ee" opacity=".55"/><circle cx="33.2" cy="35.6" r=".7" fill="#a78bfa" opacity=".55"/><path d="M9 24h1.8M37.2 24h1.8" stroke="#93c5fd" stroke-width=".8" stroke-linecap="round" opacity=".35"/></svg>`,
+ };
+ 
+ export const iconUrls: Record<string, string> = {
+diff --git a/src/icons/extracted/metadata.ts b/src/icons/extracted/metadata.ts
+index 905febea..93cf5cd3 100644
+--- a/src/icons/extracted/metadata.ts
++++ b/src/icons/extracted/metadata.ts
+@@ -457,6 +457,15 @@ export const iconMetadata: Record<string, IconMetadata> = {
+     keywords: [],
+     defaultColor: "currentColor",
+   },
++  // [ccs] Dokng 品牌图标元数据。defaultColor 用品牌主色（青蓝渐变中段），
++  // 无自定义 color 时 ProviderIcon 会取它着色。
++  dokng: {
++    name: "dokng",
++    displayName: "Dokng",
++    category: "ai-provider",
++    keywords: ["dokng", "gateway", "relay", "claude", "codex", "gemini"],
++    defaultColor: "#3b82f6",
++  },
+   notion: {
+     name: "notion",
+     displayName: "notion",

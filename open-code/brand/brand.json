@@ -1,0 +1,10 @@
+{
+  "$comment": "品牌配置：承载所有非密钥的定制值（产品名、appId、命令名、渠道展示名等）。真实密钥与个人 baseURL 绝不写入本文件——它们只经 channel.env / CI Secret 在打包期注入。productName / appId 为最终占位值（待确认），electron-builder.brand.ts 从此处读取以覆盖上游。",
+  "productName": "Dokng",
+  "appId": "ai.dokng.desktop",
+  "binName": "dokng",
+  "channelName": "内置渠道",
+  "defaultModel": "gpt-5-codex",
+  "defaultLocale": "zh",
+  "updateBaseUrl": "https://dl.dokng.com/open-code"
+}

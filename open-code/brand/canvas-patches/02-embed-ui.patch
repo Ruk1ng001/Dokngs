@@ -1,0 +1,219 @@
+diff --git a/web/src/components/layout/user-status-actions.tsx b/web/src/components/layout/user-status-actions.tsx
+index 509bbf9..2324a49 100644
+--- a/web/src/components/layout/user-status-actions.tsx
++++ b/web/src/components/layout/user-status-actions.tsx
+@@ -3,12 +3,8 @@ import { Tooltip } from "antd";
+ import { BookOpen, Keyboard, Puzzle, Settings2 } from "lucide-react";
+ import { useTranslation } from "react-i18next";
+ 
+-import { AnimatedThemeToggler } from "@/components/ui/animated-theme-toggler";
+-import { GitHubLink } from "@/components/layout/github-link";
+-import { VersionReleaseModal } from "@/components/layout/version-release-modal";
+ import { DOCS_URL } from "@/constant/env";
+ import { changeAppLocale, type AppLocale } from "@/i18n";
+-import { cn } from "@/lib/utils";
+ import { canvasThemes } from "@/lib/canvas-theme";
+ import { useConfigStore } from "@/stores/use-config-store";
+ import { useThemeStore } from "@/stores/use-theme-store";
+@@ -20,17 +16,16 @@ type UserStatusActionsProps = {
+     onOpenPlugins?: () => void;
+ };
+ 
++// [dokng] 顶栏精简：隐藏主题切换、版本显示、GitHub 三个入口（嵌入桌面壳内主题跟随宿主、
++// 版本/仓库标识对终端用户无意义）。仅保留文档、配置、节点插件、语言切换、快捷键入口。
++// theme 仍从 store 读取供 variant="canvas" 的图标取色，只是不再暴露切换按钮。
+ export function UserStatusActions({ showConfig = true, variant = "default", onOpenShortcuts, onOpenPlugins }: UserStatusActionsProps) {
+     const { i18n, t } = useTranslation();
+     const theme = useThemeStore((state) => state.theme);
+-    const setTheme = useThemeStore((state) => state.setTheme);
+     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
+     const canvasTheme = canvasThemes[theme];
+     const naturalIconClass = "inline-flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-stone-600 transition-colors hover:bg-black/5 hover:text-stone-950 dark:text-stone-300 dark:hover:bg-white/10 dark:hover:text-white [&_svg]:size-4";
+     const iconStyle: CSSProperties | undefined = variant === "canvas" ? { color: canvasTheme.node.text } : undefined;
+-    const versionStyle = iconStyle;
+-    const gitHubClassName = "size-7 text-base";
+-    const gitHubStyle = iconStyle;
+     const locale = i18n.resolvedLanguage as AppLocale;
+     const nextLocale = locale === "zh-CN" ? "en-US" : "zh-CN";
+     const languageLabel = t("topNav.switchLanguage", { language: t(nextLocale === "zh-CN" ? "locale.zhCN" : "locale.enUS") });
+@@ -55,9 +50,6 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
+                     {locale === "zh-CN" ? "中" : "EN"}
+                 </button>
+             </Tooltip>
+-            <AnimatedThemeToggler theme={theme} onThemeChange={setTheme} className={naturalIconClass} style={iconStyle} aria-label={t(theme === "dark" ? "topNav.lightTheme" : "topNav.darkTheme")} title={t(theme === "dark" ? "topNav.lightTheme" : "topNav.darkTheme")} />
+-            <VersionReleaseModal style={versionStyle} />
+-            <GitHubLink className={cn("bg-transparent hover:bg-transparent dark:hover:bg-transparent", gitHubClassName)} style={gitHubStyle} />
+             {onOpenShortcuts ? (
+                 <button type="button" className={naturalIconClass} style={iconStyle} onClick={onOpenShortcuts} aria-label={t("topNav.shortcuts")} title={t("topNav.shortcuts")}>
+                     <Keyboard className="size-4" />
+diff --git a/web/src/pages/home/index.tsx b/web/src/pages/home/index.tsx
+index 975f4f2..1fa9655 100644
+--- a/web/src/pages/home/index.tsx
++++ b/web/src/pages/home/index.tsx
+@@ -1,13 +1,10 @@
+ import { ArrowRight } from "lucide-react";
+-import { type ReactNode, useEffect, useState } from "react";
+-import { App, Button, Image, Tag } from "antd";
++import { type ReactNode } from "react";
++import { Button } from "antd";
+ import { useNavigate } from "react-router-dom";
+ import { Trans, useTranslation } from "react-i18next";
+ 
+-import { fetchPrompts, type Prompt } from "@/services/api/prompts";
+ import { navigationTools } from "@/constant/navigation-tools";
+-import i18n from "@/i18n";
+-import { cn } from "@/lib/utils";
+ 
+ function Highlighter({ action, color, children }: { action: "highlight" | "underline"; color: string; children?: ReactNode }) {
+     return (
+@@ -22,28 +19,21 @@ function Highlighter({ action, color, children }: { action: "highlight" | "under
+     );
+ }
+ 
++// [dokng] 首页精简：只保留顶部 hero（标题 + 开始使用 / 打开画布），下方「沉淀每一次好结果」
++// 提示词宫格整块移除（图片来源不稳定、与画布主流程弱相关）。hero 容器拉满可用高度、垂直居中，
++// 布局伸缩铺满整个视口，不再受固定 min-height 约束。
+ export default function IndexPage() {
+-    const { message } = App.useApp();
+     const { t } = useTranslation();
+     const navigate = useNavigate();
+     const [primaryTool] = navigationTools;
+-    const [promptShowcase, setPromptShowcase] = useState<Prompt[]>([]);
+-    const [previewIndex, setPreviewIndex] = useState(0);
+-    const [previewOpen, setPreviewOpen] = useState(false);
+-
+-    useEffect(() => {
+-        void fetchPrompts({ pageSize: 12 })
+-            .then((data) => setPromptShowcase(data.items))
+-            .catch((error) => message.error(error instanceof Error ? error.message : i18n.t("home.promptError")));
+-    }, [message]);
+ 
+     return (
+         <main className="relative h-full overflow-y-auto bg-background bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] text-stone-950 dark:bg-[radial-gradient(rgba(245,245,244,.18)_1px,transparent_1px)] dark:text-stone-100">
+-            <section className="relative mx-auto min-h-[calc(100vh-4rem)] max-w-7xl overflow-hidden px-6">
++            <section className="relative mx-auto flex h-full min-h-full max-w-7xl flex-col overflow-hidden px-6">
+                 <div className="pointer-events-none absolute left-[15%] top-24 size-20 rounded-full border border-dashed border-stone-200 dark:border-stone-800" />
+                 <div className="pointer-events-none absolute right-[23%] top-[48%] size-20 rounded-full border border-dashed border-stone-200 dark:border-stone-800" />
+ 
+-                <div className="relative flex min-h-[620px] flex-col items-center justify-center pt-10 text-center">
++                <div className="relative flex flex-1 flex-col items-center justify-center text-center">
+                     <h1 className="ai-title-aurora max-w-5xl text-balance text-5xl font-semibold tracking-normal sm:text-7xl lg:text-8xl">{t("meta.title")}</h1>
+                     <p className="mt-8 max-w-3xl text-balance text-lg leading-8 text-stone-500 dark:text-stone-400">
+                         <Trans i18nKey="home.description" components={{ canvas: <Highlighter action="underline" color="#FF9800" />, content: <Highlighter action="highlight" color="#87CEFA" /> }} />
+@@ -57,64 +47,7 @@ export default function IndexPage() {
+                         </Button>
+                     </div>
+                 </div>
+-
+-                <section className="relative mx-auto mb-20 max-w-6xl border-t border-stone-200 pt-12 dark:border-stone-800">
+-                    <div className="mb-8 grid gap-4 md:grid-cols-[1fr_auto_1fr] md:items-start">
+-                        <div />
+-                        <div className="max-w-2xl text-center">
+-                            <h2 className="text-3xl font-semibold text-stone-950 dark:text-stone-100">{t("home.showcaseTitle")}</h2>
+-                            <p className="mt-3 text-base leading-7 text-stone-500 dark:text-stone-400">{t("home.showcaseDescription")}</p>
+-                        </div>
+-                        <Button type="link" onClick={() => navigate("/prompts")} className="justify-self-center md:justify-self-end" icon={<ArrowRight className="size-4" />} iconPlacement="end">
+-                            {t("home.viewPrompts")}
+-                        </Button>
+-                    </div>
+-                    <div className="grid auto-rows-[210px] gap-4 md:grid-cols-4">
+-                        {promptShowcase.map((item, index) => (
+-                            <button
+-                                key={item.id}
+-                                type="button"
+-                                onClick={() => {
+-                                    setPreviewIndex(index);
+-                                    setPreviewOpen(true);
+-                                }}
+-                                className={cn(
+-                                    "group relative cursor-pointer overflow-hidden border border-stone-200 bg-stone-100 text-left dark:border-stone-800 dark:bg-stone-900",
+-                                    index === 0 && "md:col-span-2 md:row-span-2",
+-                                    index === 3 && "md:col-span-2",
+-                                )}
+-                            >
+-                                <img src={item.coverUrl} alt={item.title} className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.03]" />
+-                                <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 via-black/35 to-transparent p-4 text-white">
+-                                    <div className="mb-2 flex flex-wrap gap-1.5">
+-                                        {item.tags.slice(0, 2).map((tag) => (
+-                                            <Tag key={tag} variant="filled" className="m-0 bg-white/15 text-[11px] text-white backdrop-blur">
+-                                                {tag}
+-                                            </Tag>
+-                                        ))}
+-                                    </div>
+-                                    <h3 className="text-sm font-medium">{item.title}</h3>
+-                                    <p className="mt-1 line-clamp-2 text-xs leading-5 text-white/75">{item.prompt}</p>
+-                                </div>
+-                            </button>
+-                        ))}
+-                    </div>
+-                </section>
+             </section>
+-            <Image.PreviewGroup
+-                preview={{
+-                    open: previewOpen,
+-                    current: previewIndex,
+-                    onOpenChange: setPreviewOpen,
+-                    onChange: setPreviewIndex,
+-                }}
+-            >
+-                <div className="hidden">
+-                    {promptShowcase.map((item) => (
+-                        <Image key={item.id} src={item.coverUrl} alt={item.title} />
+-                    ))}
+-                </div>
+-            </Image.PreviewGroup>
+         </main>
+     );
+ }
+diff --git a/web/src/services/api/prompt-source-runtime.ts b/web/src/services/api/prompt-source-runtime.ts
+index cd198f2..0e80943 100644
+--- a/web/src/services/api/prompt-source-runtime.ts
++++ b/web/src/services/api/prompt-source-runtime.ts
+@@ -22,8 +22,34 @@ export type RawPrompt = {
+ 
+ type RunOptions = { signal?: AbortSignal };
+ 
++// [dokng] GitHub raw 域（raw.githubusercontent.com）国内基本不可达。上游 v0.10.0 起提示词改为
++// 拉取预编译 JSON registry（内置六源的 url 都在 raw 域），图片链接也来自 registry JSON。
++// 与 v0.9.0 时代对 prompts.ts 的适配同义迁移到本文件（新的唯一网络入口）：
++//   1. toCdn()：把 raw.githubusercontent.com/{owner}/{repo}/{ref}/... 重写为
++//      cdn.jsdelivr.net/gh/{owner}/{repo}@{ref}/...（jsDelivr 的 GitHub 镜像，国内可达），
++//      应用于 fetchSource 的 source.url（覆盖内置六源与用户自定义 raw 链接；非 raw 链接原样）。
++//   2. proxyImage()：对「非 GitHub raw 的绝对图片链接」统一套图片代理（默认公共 weserv，
++//      可换自建 Cloudflare Worker 反代，如 https://img.dokng.com/?url=；设空串整体关闭），
++//      raw 链接走 jsDelivr；应用于 normalizeItems 产出的 coverUrl / referenceImageUrls。
++//      sourceUrl 是「查看原文」网页链接，不做改写。
++function toCdn(url: string) {
++    return url.replace(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)(\/.*)?$/, "https://cdn.jsdelivr.net/gh/$1/$2@$3$4");
++}
++
++const IMAGE_PROXY = "https://images.weserv.nl/?url=";
++
++function proxyImage(url: string) {
++    if (!url) return url;
++    if (/^https:\/\/raw\.githubusercontent\.com\//i.test(url)) return toCdn(url);
++    if (!IMAGE_PROXY) return url;
++    // 已经是代理 / jsDelivr 链接的不再二次包裹。
++    if (url.startsWith(IMAGE_PROXY) || /^https:\/\/cdn\.jsdelivr\.net\//i.test(url)) return url;
++    return `${IMAGE_PROXY}${encodeURIComponent(url.replace(/^https?:\/\//i, ""))}`;
++}
++
+ async function fetchSource(source: PromptSource, options?: RunOptions) {
+-    const response = await fetch(source.url, { cache: "no-store", signal: options?.signal });
++    // [dokng] registry JSON 拉取走 jsDelivr 镜像（见 toCdn 注释）。
++    const response = await fetch(toCdn(source.url), { cache: "no-store", signal: options?.signal });
+     if (!response.ok) throw new Error(i18n.t("config.promptSources.runtime.requestFailed", { status: response.status }));
+     return response.json();
+ }
+@@ -59,8 +85,9 @@ function normalizeItems(values: unknown[], source: PromptSource) {
+         const id = stringValue(record.id).trim() || `${source.id}-${leftPad(index + 1)}`;
+         if (seen.has(id)) return;
+         seen.add(id);
+-        const referenceImageUrls = stringArray(record.referenceImageUrls).map((url) => absoluteUrl(source.url, url));
+-        const coverUrl = absoluteUrl(source.url, stringValue(record.coverUrl)) || referenceImageUrls[0] || "";
++        // [dokng] 图片链接经 proxyImage 保证国内可达（raw→jsDelivr，其余外链→图片代理）。
++        const referenceImageUrls = stringArray(record.referenceImageUrls).map((url) => proxyImage(absoluteUrl(source.url, url)));
++        const coverUrl = proxyImage(absoluteUrl(source.url, stringValue(record.coverUrl))) || referenceImageUrls[0] || "";
+         items.push({
+             id,
+             title,

@@ -1,0 +1,187 @@
+diff --git a/web/src/components/layout/client-root-init.tsx b/web/src/components/layout/client-root-init.tsx
+index 576d387..cbb6539 100644
+--- a/web/src/components/layout/client-root-init.tsx
++++ b/web/src/components/layout/client-root-init.tsx
+@@ -3,19 +3,54 @@ import { useEffect, useRef } from "react";
+ import { App } from "antd";
+ import { useTranslation } from "react-i18next";
+ 
+-import { createModelChannel, useConfigStore } from "@/stores/use-config-store";
++import type { ChannelModel, ModelCapability, ModelChannel } from "@/stores/use-config-store";
++import { createModelChannel, modelOptionsFromChannels, normalizeChannelModels, normalizeModelOptionValue, useConfigStore } from "@/stores/use-config-store";
+ import { usePromptSourceScheduler } from "@/hooks/use-prompt-source-scheduler";
+ 
++// [dokng] 是否运行在宿主 iframe 内（opencode 桌面壳把画布产物以 oc://renderer/canvas/ 加载，
++// 用 <iframe> 嵌进 SolidJS 外壳）。standalone web 打开时 window.parent === window。
++const IS_EMBEDDED = typeof window !== "undefined" && window.parent !== window;
++
++// [dokng] 宿主页 origin。iframe 与宿主同为 oc:// 协议、host=renderer，故同源 origin 恒为此值。
++// postMessage 双向都严格校验，杜绝任意站点向画布注入 key。
++const HOST_ORIGIN = "oc://renderer";
++
++// [dokng] 宿主 → 画布：投递选中 key 合成的渠道数组（含每个 key 的 baseUrl/apiKey/models）。
++// 宿主每次槽位变化或 iframe ready 均重投，画布据此重建 config.channels。
++type InjectedChannel = {
++    id: string;
++    name?: string;
++    baseUrl: string;
++    apiKey: string;
++    models?: Array<string | { name: string; capability?: ModelCapability }>;
++};
++type CanvasConfigMessage = {
++    type: "dokng:canvas-config";
++    channels: InjectedChannel[];
++    imageModel?: string;
++    videoModel?: string;
++    textModel?: string;
++    audioModel?: string;
++};
++
++function isCanvasConfigMessage(data: unknown): data is CanvasConfigMessage {
++    if (!data || typeof data !== "object") return false;
++    const msg = data as Record<string, unknown>;
++    return msg.type === "dokng:canvas-config" && Array.isArray(msg.channels);
++}
++
+ export function ClientRootInit({ children }: { children: ReactNode }) {
+     const { message } = App.useApp();
+     const { t } = useTranslation();
+     const handledConfigParams = useRef(false);
++    const injectedOnce = useRef(false);
+     const updateConfig = useConfigStore((state) => state.updateConfig);
+     const config = useConfigStore((state) => state.config);
+     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
+ 
+     usePromptSourceScheduler();
+ 
++    // [dokng] query 参数注入（standalone web 的既有链路，行为不变）：?baseUrl=&apiKey= 写单个 channels[0]。
+     useEffect(() => {
+         if (handledConfigParams.current) return;
+         const searchParams = new URLSearchParams(window.location.search);
+@@ -49,5 +84,63 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
+         message.success(t("config.importedDirectConfig"));
+     }, [config.channels, message, openConfigDialog, t, updateConfig]);
+ 
++    // [dokng] postMessage 注入（宿主 iframe 链路）：宿主投来渠道数组 → 重建 config.channels。
++    // 注入的 apiKey 只驻留内存、不落盘（见 use-config-store 的 partialize：嵌入态剥离 apiKey），
++    // 每次进画布页由宿主重投。listener 与 query 注入独立，互不干扰。
++    useEffect(() => {
++        if (!IS_EMBEDDED) return;
++
++        const applyInjectedChannels = (msg: CanvasConfigMessage) => {
++            const channels: ModelChannel[] = msg.channels
++                .filter((entry) => entry && typeof entry.id === "string" && entry.id.trim())
++                .map((entry) =>
++                    createModelChannel({
++                        id: entry.id,
++                        name: entry.name,
++                        baseUrl: entry.baseUrl,
++                        apiKey: entry.apiKey,
++                        // 宿主已按用途标好 capability（作图槽→image/video、对话槽→text、audio）；
++                        // normalizeChannelModels 保留对象自带 capability，仅当传字符串时才回退
++                        // guessCapability（避免误判 new-api 自定义模型名）。
++                        models: normalizeChannelModels(entry.models as Array<string | ChannelModel> | undefined),
++                    }),
++                );
++            if (!channels.length) return;
++
++            const useConfig = useConfigStore.getState();
++            useConfig.updateConfig("channels", channels);
++            useConfig.updateConfig("models", modelOptionsFromChannels(channels));
++            // 顶层直连字段指向首个渠道，兼容仍读 config.baseUrl/apiKey 的旧路径。
++            useConfig.updateConfig("baseUrl", channels[0].baseUrl);
++            useConfig.updateConfig("apiKey", channels[0].apiKey);
++            // 联动各类默认模型选择（宿主可选传入，逐个用 normalize 校验 channelId::model 是否存在）。
++            if (msg.imageModel) useConfig.updateConfig("imageModel", normalizeModelOptionValue(msg.imageModel, channels));
++            if (msg.videoModel) useConfig.updateConfig("videoModel", normalizeModelOptionValue(msg.videoModel, channels));
++            if (msg.textModel) useConfig.updateConfig("textModel", normalizeModelOptionValue(msg.textModel, channels));
++            if (msg.audioModel) useConfig.updateConfig("audioModel", normalizeModelOptionValue(msg.audioModel, channels));
++
++            useConfig.openConfigDialog(false);
++            if (!injectedOnce.current) {
++                injectedOnce.current = true;
++                message.success("已接入客户端渠道");
++            }
++        };
++
++        const onMessage = (event: MessageEvent) => {
++            if (event.origin !== HOST_ORIGIN) return;
++            if (!isCanvasConfigMessage(event.data)) return;
++            applyInjectedChannels(event.data);
++        };
++
++        window.addEventListener("message", onMessage);
++        // 握手：告知宿主 iframe 已就绪，请其投递（宿主）当前槽位配置，避免早投丢失。
++        try {
++            window.parent.postMessage({ type: "dokng:canvas-ready" }, HOST_ORIGIN);
++        } catch {
++            // 跨 origin 受限或无 parent 时静默；query 注入与本地默认仍可用。
++        }
++        return () => window.removeEventListener("message", onMessage);
++    }, [message]);
++
+     return <>{children}</>;
+ }
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+index 69e19db..5e595f6 100644
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -1,4 +1,4 @@
+-import { createBrowserRouter, Outlet } from "react-router-dom";
++import { createHashRouter, Outlet } from "react-router-dom";
+ 
+ import { AnalyticsTracker } from "@/components/layout/analytics-tracker";
+ import UserLayout from "@/layouts/user-layout";
+@@ -12,7 +12,14 @@ import NotFound from "@/pages/not-found";
+ import PromptsPage from "@/pages/prompts";
+ import VideoPage from "@/pages/video";
+ 
+-export const router = createBrowserRouter([
++// [dokng] iframe 内嵌用 HashRouter（路由走 URL hash #/…）。
++// 关键：iframe 以 oc://renderer/canvas/index.html 静态加载，pathname 固定为 /canvas/index.html
++// 且不可控。BrowserRouter + basename 方案在此失败——basename 剥掉 /canvas 后剩 /index.html，
++// 匹配不到任何路由 → 落到 path:"*" 的 NotFound（真机实测 404）。HashRouter 只认 location.hash，
++// pathname 是什么都无所谓：无 hash 时默认 #/ 命中首页，导航写 #/image 等，彻底绕开 basename。
++// 构建仍用 VITE_BASE=/canvas/（asset/script 前缀需要），但路由不再依赖它。
++// standalone web 部署同样适用（hash 路由在任意子路径/根路径都工作），行为对用户无感。
++export const router = createHashRouter([
+     {
+         element: (
+             <UserLayout>
+diff --git a/web/src/stores/use-config-store.ts b/web/src/stores/use-config-store.ts
+index 2097921..9624b34 100644
+--- a/web/src/stores/use-config-store.ts
++++ b/web/src/stores/use-config-store.ts
+@@ -63,6 +63,23 @@ export type WebdavSyncConfig = {
+ export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav";
+ 
+ export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
++
++// [dokng] 是否运行在宿主 iframe 内（嵌入态）。嵌入态下 apiKey 由宿主每次 postMessage 内存注入，
++// 绝不落盘到 iframe 的 localStorage；standalone web 行为不变（照常持久化）。判定用 window.parent !== window，
++// 与 client-root-init.tsx 的 postMessage 注入路径同源约定（宿主 origin=oc://renderer）。
++export const IS_EMBEDDED = typeof window !== "undefined" && window.parent !== window;
++
++// [dokng] 持久化前剥离敏感字段。仅嵌入态生效：清空每个 channel 的 apiKey 与顶层 apiKey，
++// 使注入的 key 只驻留内存。standalone 原样返回，不改上游落盘行为。
++function stripSecretsForPersist(config: AiConfig): AiConfig {
++    if (!IS_EMBEDDED) return config;
++    return {
++        ...config,
++        apiKey: "",
++        channels: config.channels.map((channel) => ({ ...channel, apiKey: "" })),
++    };
++}
++
+ const CHANNEL_MODEL_SEPARATOR = "::";
+ const OPENAI_BASE_URL = "https://api.openai.com";
+ const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+@@ -215,7 +232,7 @@ export const useConfigStore = create<ConfigStore>()(
+         }),
+         {
+             name: CONFIG_STORE_KEY,
+-            partialize: (state) => ({ config: state.config, webdav: state.webdav }),
++            partialize: (state) => ({ config: stripSecretsForPersist(state.config), webdav: state.webdav }),
+             merge: (persisted, current) => {
+                 const persistedState = (persisted || {}) as Partial<ConfigStore>;
+                 const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;

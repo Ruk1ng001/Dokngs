@@ -1,0 +1,383 @@
+# 补丁分组清单：定义每个补丁包含哪些 opencode 源码文件（相对 opencode/ 的路径）。
+# 格式：每段以 [补丁名] 开头，下面列出属于该补丁的文件路径，一行一个。
+# 按 NN- 前缀顺序应用到干净的上游基线（brand/BASE_SHA）上。
+#
+# 为什么用补丁层：opencode 以 git submodule 锁定在上游 tag，gitlink 必须保持干净
+# 才能干净跟随上游 release。凡是必须改动 submodule 内源码的定制，都导出为本目录下
+# 的 .patch，由 CI / 本机在 checkout 后重放，做到「submodule 锁上游 + 薄叠加层」。
+#
+# 应用（在 opencode/ 内，基线为 brand/BASE_SHA）：
+#   git -C opencode apply --3way brand/patches/02-balance-newapi.patch
+# 导出（改动 opencode/ 后，在 opencode/ 内）：
+#   git -C opencode diff -- <文件...> > brand/patches/NN-<name>.patch
+#
+# 补丁序号说明：01 原为 desktop 包内的独立账户面板（renderer/balance/balance-panel.tsx）。
+# 该面板已迁入 app 包、改用原生 v2 Dialog 外壳，见新补丁 09-cx-account-app；旧补丁 01 已删除，
+# 序号 01 空缺（保留其余补丁序号不变，避免重排）。
+
+# 构建期注入统一承载（electron.vite.config.ts 的**唯一**补丁）+ 余额面板凭据注入（US-006/007）：
+#   - 本补丁是全系列中唯一触碰 electron.vite.config.ts 的补丁（03/11/17 的 vite 增量已并入，
+#     消除同文件四补丁叠改的连环冲突面；上游改动该文件时只需 rebase 本补丁）。承载的注入：
+#     · renderer.define：DEFAULT_LOCALE（10 用）/ PRODUCT_NAME（11 用）/ NEWAPI_BASE_URL /
+#       NEWAPI_API_KEY / NEWAPI_TOPUP_URL（09 账户面板用；浏览器上下文读不到 process.env）；
+#     · main.define：NEWAPI_BASE_URL / NEWAPI_API_KEY / NEWAPI_MODEL（03 server.ts 内置默认用）
+#       与 PRODUCT_NAME（11 桌面菜单 / 12 身份注入用）；
+#     · renderer.plugins 的 dokng:copy-canvas writeBundle 钩子（17 画布产物拷贝用）。
+#     渠道值未注入时为空串，面板显示「未配置凭据」；baseURL 缺省回退内置品牌域默认值。
+#   - env.d.ts（renderer）补 ImportMetaEnv 类型声明，保证 typecheck 通过。
+#   - 注：注入变量由迁入 app 包的账户面板（09-cx-account-app，cx-account/*）读取；
+#     desktop 用 app/vite 编译 renderer，构建期 define 对 app 组件同样生效。
+[02-balance-newapi]
+packages/desktop/electron.vite.config.ts
+packages/desktop/src/renderer/env.d.ts
+
+# 内置渠道锁定 / 内核默认注入（US-001 / US-003 / US-004 / US-008 / US-009）：
+#   - 主进程的渠道变量（NEWAPI_BASE_URL / NEWAPI_API_KEY / NEWAPI_MODEL）由 02 补丁的
+#     electron.vite main.define 内联进 import.meta.env（vite 注入统一收敛在 02，本补丁不再
+#     触碰 electron.vite.config.ts）；server.ts 拼装一份 opencode config，经 OPENCODE_CONFIG
+#     文件传给内核 sidecar，使桌面产物开箱即走内置渠道。
+#   - US-004：token 来源改为读本地激活 key。buildChannelConfigContent() 的 baseURL / apiKey
+#     优先取本地激活 key（04-channel-keys-store 的 store-channel-keys，主进程侧 electron-store,
+#     直接同步读、无需 IPC）；本地无激活 key 时回退构建期内置默认；两者都无则不注入、退回原生行为。
+#     model 无 per-key 字段，始终取构建期内置默认。切换激活 key 后须重启 sidecar 才生效（US-002）。
+#   - 内核 config 合并链里 OPENCODE_CONFIG_CONTENT 排在全局 / 项目配置之后，注入的
+#     newapi provider 与默认 model 覆盖用户同名配置。
+#   - US-009：可选模型注入。buildChannelConfigContent() 的模型集合优先取激活 key 缓存的
+#     models（切换激活 key 时拉该 key 的 /v1/models 落盘，见 04 的 setChannelKeyModels），
+#     无缓存时回退构建期内置 NEWAPI_MODEL 合成单条；列出的每个模型都写进 provider.newapi.models
+#     成为内核「该 key 的可选模型」，默认 model 取 NEWAPI_MODEL（在列表内）否则列表首项。
+#   - main/env.d.ts 补上对应 ImportMetaEnv 类型声明，保证 typecheck 通过。
+#   - 注意：server.ts 引用 04 的 store-channel-keys.ts，故 03 须先于/连同 04 应用（git apply 按
+#     NN 序 03→04，只做文本操作不校验 import，typecheck 在全部补丁应用后才跑）。
+[03-lock-channel]
+packages/desktop/src/main/env.d.ts
+packages/desktop/src/main/server.ts
+
+# 本地多 key 列表存储模型（US-003 / US-009）：
+#   - 纯主进程数据层，复用 opencode 既有 electron-store（store.ts / getStore）。
+#     在默认 settings store（app.getPath("userData")/opencode.settings，JSON 明文）内
+#     以单键 channelKeys 保存 { keys: [{ id, label, key, baseURL, models? }], activeKeyId }。
+#   - 提供读写封装：readChannelKeysState / readActiveChannelKey / addChannelKey /
+#     removeChannelKey / updateChannelKeyLabel / setActiveChannelKey / setChannelKeyModels。
+#     无 key 时读激活项返回 null，不报错。key 明文仅存本地、不上传、不写日志（本模块不记录 key 值）。
+#   - US-009：ChannelKey 新增可选 models（切换激活 key 时缓存该 key 的 /v1/models 结果），
+#     新增 setChannelKeyModels(id, models) 落盘；读取时对 models 规整（只留字符串、去重）。
+#   - store-keys.ts 追加 CHANNEL_KEYS_KEY 常量。后续 US（token 来源改造 / key 管理 UI）复用本层。
+[04-channel-keys-store]
+packages/desktop/src/main/store-channel-keys.ts
+packages/desktop/src/main/store-keys.ts
+
+# 本地 key 管理 IPC 通道（US-009）：
+#   - renderer 增删改 key / 切换激活需落到主进程数据层（04 的 store-channel-keys），但不能用
+#     通用 store-set（那会把整个对象存成字符串、破坏主进程 readChannelKeysState 的对象读取），
+#     故为 key 管理开一组专用 IPC：channel-keys-list / -add / -remove / -update-label /
+#     -set-active / -set-models（ipc.ts 注册 handler，直接调 04 的数据层函数）。
+#   - preload/index.ts 经 contextBridge 暴露 window.api.channelKeys*（返回最新状态的 JSON 字符串，
+#     renderer 解析回对象刷新 UI）；preload/types.ts 补对应 ElectronAPI 类型声明。
+#   - 切换激活 key 后重启内核复用既有 window.api.relaunch（stopSidecars → app.relaunch，US-002
+#     结论：config 启动期一次性注入，换 key 必须重启才生效），本补丁不新增重启 IPC。
+#   - 安全底线：key 管理 handler 一律不打印任何入参（尤其 sk- 明文），仅透传给数据层。
+#   - 依赖：ipc.ts import 04 的 store-channel-keys；独立于 02/03 的文件，按 NN 序在其后应用。
+[05-channel-keys-ipc]
+packages/desktop/src/main/ipc.ts
+packages/desktop/src/preload/index.ts
+packages/desktop/src/preload/types.ts
+
+# cx:// 深链协议注册（US-013）：
+#   - 主进程注册本项目自定义的 cx:// 深链协议（网站「一键导入 key」入口），复用上游 opencode
+#     既有的一整套 deep-link 分发机制（open-url / second-instance → emitDeepLinks →
+#     sendDeepLinks → renderer 派发 opencode:deep-link CustomEvent），不新造分发通路。
+#   - main/index.ts 两处改动：① app.setAsDefaultProtocolClient("cx")（紧邻上游 "opencode"
+#     注册）声明 cx:// 归本 App；② second-instance 的 argv 过滤追加识别 cx:// 前缀
+#     （macOS 的 open-url 不过滤 scheme，cx:// 天然可用，无需改）。
+#   - 解析 / 确认 / 写入全在 app 包侧（09 补丁 cx-account 的 parseImportDeepLink + CxDialogImport，
+#     由 layout.tsx 的 handleDeepLinks 接住 cx:// 链接后弹确认框）——主进程只注册协议与透传 URL，
+#     不碰 key 明文。独立于其余补丁的文件（仅改 main/index.ts），按 NN 序在其后应用。
+[06-deeplink-cx]
+packages/desktop/src/main/index.ts
+
+# provider 切换桥 + 侧边栏账户入口 + 账户面板接线（多 provider 改造 + 账户面板迁移接线）：
+#   本补丁触碰 @opencode-ai/app 包（薄叠加，跟随上游升级时重放）。五个文件：
+#   - directory-layout.tsx：在 LocalProvider 作用域内挂一个极小的桥接组件
+#     CxProviderSwitchBridge。账户面板（CxDialogAccount）经原生 v2 Dialog 弹出、挂在 opencode
+#     组件树之外、够不到 useLocal()，故经 window CustomEvent `cx:select-provider`
+#     （detail:{providerID,modelID}）请求切换；桥接组件收到后调用与原生 model 选择器同一入口
+#     useLocal().model.set(...)，把当前会话切到该 provider —— 纯请求级、零重启，效果同原生「闪一下」。
+#   - layout.tsx：① 侧边栏底部（settings / help 同排）新增账户入口 IconButton（仅 desktop 平台
+#     渲染），点击用同作用域的 useDialog() 直接 dialog.show(() => <CxDialogAccount/>) 弹出账户面板
+#     （面板已迁入 app 包，见 09）；② handleDeepLinks 追加 cx:// 一键导入处理——复用 opencode 既有
+#     deep-link 分发（opencode:deep-link 事件 + 启动缓冲），解析出 cx:// 后动态 import cx-account-import
+#     并 dialog.show(() => <CxDialogImport request={req}/>) 弹导入确认框（不静默写入）。cx:// 处理放在
+#     server.isLocal() guard 之前（导入与本地 server 无关）。
+#   - sidebar-shell.tsx：SidebarContent 新增可选 slot renderAccountButton，渲染在底部设置齿轮
+#     上方；不传则不渲染（web 等平台不显示）。
+#   —— 上游「新布局」(newLayoutDesigns / layout-new.tsx) 适配（新增两个文件）：新布局走
+#      layout-new.tsx（NewLayout），只有 Titlebar + main、没有 SidebarContent，故上面 layout.tsx /
+#      sidebar-shell.tsx 挂的账户按钮 + onMount 里的 dokng:// 深链 / 首启无 key 引导在新布局下全失效。
+#   - cx-account-launcher.tsx（新文件）：把这三件事重新接到新布局。CxAccountLauncher 组件仅 desktop
+#     生效——① 标题栏右侧账户按钮（经 useTitlebarRightMount() 的 #opencode-titlebar-right portal 挂载，
+#     与原生 status popover 同排，new-session.tsx / session-header.tsx 同款范式）；② dokng:// 一键导入
+#     深链（复用 opencode:deep-link 事件 + drainPendingDeepLinks 启动缓冲，逻辑同 layout.tsx 段）；
+#     ③ 首启无 key 引导。逻辑与 layout.tsx 段等价，仅挂载点不同（旧布局侧边栏 slot → 新布局标题栏 portal）。
+#     两套布局运行时二选一（app.tsx），本组件只在 layout-new.tsx 挂载，不与旧布局重复触发。
+#   - layout-new.tsx：在 <Titlebar/> 之后挂一行 <CxAccountLauncher/>（组件内部自判 desktop）。
+#   注：切 key 的 cx:select-provider 桥仍在 directory-layout.tsx（CxProviderSwitchBridge，跨布局通用，
+#      新布局 session 页仍经过 DirectoryDataProvider），无需为新布局重复实现。
+#
+#   多 provider 改造总述（配合 03 的 buildChannelConfigContent 多 provider 注入 + 04 的
+#   channelProviderId）：每个本地 key 被注入成一个独立 opencode provider（providerID =
+#   channelProviderId(key.id) = `newapi-<id前8位>`），内核启动时同时握有全部 key 的 provider。
+#   在已注入的 key 之间切换是纯请求级（renderer model.set），零重启；只有新增/删除 key 改变了
+#   provider 集合，才需重启一次让新 provider 注册进内核。
+[07-provider-switch-bridge]
+packages/app/src/pages/directory-layout.tsx
+packages/app/src/pages/layout.tsx
+packages/app/src/pages/layout/sidebar-shell.tsx
+packages/app/src/components/cx-account/cx-account-launcher.tsx
+packages/app/src/pages/layout-new.tsx
+
+#
+# [08-self-update-prerelease] 放行 prerelease，让 GitHub 回退源能选中 -dokng.N 版本。
+#   updater.ts：allowPrerelease=false → true。dokng 版本号 -dokng.N 属 semver prerelease。
+#   [monorepo] 本仓已不发 GitHub Release，唯一更新源是 R2 GenericProvider（按 latest*.yml 的
+#   version 比对、忽略此开关），故本补丁现为冗余。**仍然保留**：删补丁要重排后续补丁序号、
+#   重验 strict 重放，为一个无副作用的布尔值付这个代价不值。
+#   注意：R2 的「安装包下沉 open-code/<version>/ 子目录」的 url 前缀改写**不在补丁层**——
+#   release job 不重放补丁（finalize-latest-yml.ts 跑的是上游原版，写出的 yml 是裸文件名），
+#   前缀仅由 open-code-release.yml 的 R2 上传步骤对 R2 副本 sed 添加。历史上曾把该改动放进
+#   本补丁的 finalize-latest-yml.ts，属死代码且与 workflow 方案矛盾，已删除。
+#   配套（父仓库，非补丁）：brand publish 源改 R2 generic 单源 + mac 加 zip；
+#   open-code-release.yml 注入版本号 + 合并 latest*.yml + 上传 R2
+#   （安装包进 <version>/ immutable、元数据留根 no-cache）。
+#   本补丁另含 macOS 安装期死循环止损（同一文件内）：ad-hoc 签名（CX_UNSIGNED=1，见
+#   brand/electron-builder.brand.ts）包的 designated requirement 退化成 cdhash H"..."，
+#   Squirrel.Mac 安装前校验新包必然不匹配（「代码未能满足指定的代码要求」）；该错误由
+#   electron-updater 经 emit("error") **异步**抛出，quitAndInstall() 不同步抛，于是上游
+#   updater-controller.install() 走成功分支、状态回到 ready，用户可无限点「重启更新」每次静默
+#   失败（日志表现 ready⇄installing 反复切换；伴生的 "The command is disabled" 是上一次校验
+#   在飞行中所致，非独立故障）。修法：updater.ts 挂 autoUpdater.on("error") 把安装期失败记成
+#   一次性状态 installFailure，首次失败弹框说明并引导去官网覆盖安装，后续 quitAndInstall 直接
+#   同步抛错让 controller 走 catch 分支如实报失败。只改 updater.ts、不动 updater-controller.ts，
+#   避免扩大补丁面。这是止损而非修复——彻底解决需 Apple Developer ID 签名 + 公证。
+[08-self-update-prerelease]
+packages/desktop/src/main/updater.ts
+
+# 账户面板（app 包，原生 v2 Dialog + v2 语义变量）——承载 US-005 → US-013 的账户面板全部能力，
+# 由原 desktop 包 renderer/balance/balance-panel.tsx（自绘浮层 + 硬编码金色内联样式）迁入并用
+# 上游 v2 设计系统重写：
+#   本补丁是账户面板落在 @opencode-ai/app 包的实现，用原生
+#   @opencode-ai/ui/v2/dialog-v2（Dialog/DialogHeader/DialogBody）+ useDialog() 外壳，配色全走 v2
+#   语义变量（跟随明暗主题、与原生设置页视觉统一）；接线（账户按钮 dialog.show、cx:// 深链
+#   handleDeepLinks）在 07 补丁的 layout.tsx 内完成。低冲突原则：新文件独立目录
+#   packages/app/src/components/cx-account/，全部 Cx 前缀，避免与上游撞名 / 撞文件；对上游现有
+#   文件零改动（接线复用 07 已占的 layout.tsx，面板不再挂 desktop renderer/index.tsx）。
+#   跨包类型缺口（app 包看不到 desktop preload 的 window.api.channelKeys* / channelConfig* /
+#   import.meta.env.NEWAPI_*）在 cx-account-api.ts 内用局部 interface + 断言访问器解决，
+#   不碰上游类型文件（preload/types.ts、env.d.ts）；web 端无 window.api，全走可选链兜底。
+#   四个文件：
+#   - cx-account-api.ts：纯数据层（零 UI import，可离线 typecheck）——对接 new-api 取 profile
+#     （GET /api/app/profile，Bearer sk-）/ models（/v1/models）、读写本地 key 列表、解析 cx://
+#     深链（parseImportDeepLink）、providerID 派生、额度金额与真实模型 Token 数格式化（12.1K / 12.4M）、
+#     打码（maskKey）等纯函数与类型。profile 明确区分 account_* 账户额度、key_* API Key 限额和
+#     logs.prompt_tokens + completion_tokens 模型用量，并兼容旧版二开字段。跨包类型缺口在此用局部
+#     interface + 断言访问器（cxChannelApi / cxEnv）解决。全部网络请求包 try/catch，永不抛出。
+#   - cx-account.css：样式全部走上游 v2 语义变量（--v2-background-* / --v2-text-* / --v2-border-*
+#     / --v2-state-* / --v2-background-bg-accent 等），不硬编码任何颜色，跟随明暗主题、与原生设置页
+#     视觉统一。工作台采用账户头部 + 融合用量总览 + 紧凑 Keys 列表；桌面宽度下一行完整呈现一个
+#     Key（名称、用量、费用、模型、额度、操作），Keys 区不设独立滚动层，窄屏自动折行；用
+#     kebab-case 类名 + data-slot 选择器（贴合上游 xx-v2.css 写法）。
+#   - cx-account-dialog.tsx：CxDialogAccount——v2 Dialog(size=x-large) 外壳（DialogHeader/DialogBody），
+#     账户余额和真实模型 Token 用量合并为单张总览卡：环形图只表达账户额度使用率（不受 Key 的
+#     unlimited_quota 影响），指标网格展示今日 Tokens、输入 / 输出及今日 / 累计费用；下方 Keys 使用
+#     一行一个 Key 的紧凑列表，同排展示今日 Tokens、费用、模型、额度和操作，不再内部滚动。点击整行
+#     切换 Key，当前项使用强调背景和左侧色条标识，不显示冗余激活按钮；支持键盘 Enter / Space。含
+#     US-008 逐 key profile、US-009 增删改切换（ButtonV2 +
+#     TextInputV2）、US-011 首启无 key 引导。新增 Key 本地写入后立即反馈，远端名称 / 模型 / profile
+#     转后台同步，失败保留表单并显示错误。切换激活派发 cx:select-provider 事件，由 07 的
+#     CxProviderSwitchBridge 接住 → useLocal().model.set，零重启。用 useDialog() 弹出/关闭。
+#   - cx-account-import.tsx：CxDialogImport——US-013 cx:// 深链导入确认框（展示 label / 打码 key /
+#     baseURL，用户确认后才 channelKeysAdd 写入，避免恶意深链静默写入），写入成功可「设为激活」。
+#     同样用 v2 Dialog 外壳；自包含，用同栈 useDialog().close() 关闭自身（无需外层传 onClose）。
+#   依赖：接线在 07 的 layout.tsx（账户按钮 dialog.show(CxDialogAccount)、handleDeepLinks 解析 cx://
+#   后 dialog.show(CxDialogImport)）；运行时经 07 的 cx:select-provider 桥与 05 的 channelKeys* IPC
+#   协作。按 NN 序最后应用（仅新增 app 包文件，独立于其余补丁，对上游现有文件零改动）。
+[09-cx-account-app]
+packages/app/src/components/cx-account/cx-account-api.ts
+packages/app/src/components/cx-account/cx-account.css
+packages/app/src/components/cx-account/cx-account-dialog.tsx
+packages/app/src/components/cx-account/cx-account-import.tsx
+
+# 首启默认 locale（US-001 / US-003）：
+#   - 默认值单一来源为父仓库 brand/brand.json 的 defaultLocale；02 补丁在构建期读取并通过
+#     renderer.define 注入 import.meta.env.DEFAULT_LOCALE，配置缺失或非字符串时回退为 "zh"。
+#   - renderer/index.tsx 的 DesktopRoot.loadLocale：本地无语言存储（既无 opencode.global.dat
+#     的 language、也无 language.v1 legacy，raw 为空）时，normalize 后加载品牌默认 locale。
+#     已存储语言时行为不变，仍以用户选择为先。
+#   - 独立于其余补丁的文件（仅改 renderer/index.tsx，与 01/02-08 均不共享此改动点），按 NN 序最后应用。
+[10-default-locale-zh]
+packages/desktop/src/renderer/index.tsx
+
+# 品牌名可配置替换（用户可见文案去 OpenCode 化）：
+#   - 单一数据源 brand/brand.json 的 productName，经 02 补丁的 electron.vite 在构建期注入
+#     import.meta.env.PRODUCT_NAME（renderer + main 两处 define，vite 注入统一收敛在 02，
+#     本补丁不再触碰 electron.vite.config.ts）；缺省回退 "OpenCode"。
+#   - context/language.tsx：在唯一翻译出口 i18n.translator 处包一层 rebrand()，运行时把文案里的
+#     "OpenCode" 统一替换为 PRODUCT_NAME，一处覆盖全部 18 个语言字典、不改任何字典文件、跟随上游升级
+#     零冲突。保护词（OpenCode Zen / OpenCode Go / opencode.ai / opencode.json）用哨兵占位法保留原样，
+#     避免误改真实第三方服务名 / 文件名 / 技术标识符。app.name.desktop 的 "OpenCode Desktop" 随之变成
+#     "<productName> Desktop"。
+#   - 原生字符串（macOS 菜单 / 原生对话框 / 崩溃恢复提示）自 v1.18.13 起改走 i18n：desktop-menu.ts
+#     用 labelKey 指向 desktop-native 的 key，主进程经 nativeT() 取值。这条链路不经过 translator，
+#     故在 language.tsx 的 createDesktopNativeBundle 取值回调上再包一层 rebrand()——只此一处即可覆盖
+#     desktop.menu.app / documentation / ariaLabel 与 recovery 全部字面量，无需改 desktop-menu.ts。
+#     小写 "opencode"（CLI 名、wsl 错误文案）不在替换范围内，保持原样。
+#   - env.d.ts：补 PRODUCT_NAME 的 ImportMetaEnv 类型声明。
+#   - 依赖 02 补丁的 electron.vite.config.ts（PRODUCT_NAME 注入在 02 承载）；仅改 app 包既有文件，
+#     按 NN 序最后应用。
+[11-rebrand]
+packages/app/src/context/language.tsx
+packages/app/src/env.d.ts
+
+# 模型身份品牌覆盖（被问「你是什么」时回答品牌名而非 opencode）：
+#   - 问题根源：各 provider 系统提示词（session/prompt/*.txt）里写死 "You are opencode"，
+#     11-rebrand 的 i18n 运行时替换只覆盖 UI 文案，够不到发给 LLM 的系统提示词。
+#   - session/system.ts：在 environment() 返回数组最前追加一句身份声明。系统提示词组装顺序为
+#     provider 提示词（"You are opencode"）→ environment → user.system（见 session/llm/request.ts），
+#     故身份声明排在其后、用覆盖式措辞压过它；一处覆盖全部 provider，不改任何 txt，随上游升级零冲突。
+#   - 品牌名来源：内核 sidecar 是独立进程，读不到主进程 import.meta.env，故经运行时 env 传递——
+#     desktop server.ts createSidecarEnv() 把 11-rebrand 注入主进程的 PRODUCT_NAME（来自 brand.json）
+#     写进 sidecar env；system.ts 读 process.env.PRODUCT_NAME，缺省回退 "Dokng"。
+#   - 依赖 03（createSidecarEnv 定义）与 11（主进程 PRODUCT_NAME 注入），按 NN 序最后应用。
+[12-identity]
+packages/desktop/src/main/server.ts
+packages/opencode/src/session/system.ts
+
+# 修复上游 v1.17.20 的坏依赖引用（CI bun install 404）：
+#   - 上游 v1.17.20 的根 package.json 把 catalog 里的 @solidjs/start 钉死到临时预览包
+#     https://pkg.pr.new/@solidjs/start@dfb2020；pkg.pr.new 会回收预览包，该地址已 404，
+#     导致 bun install 在下载阶段失败（这是 v1.17.20 tag 自带的坑，非本项目引入）。
+#   - 修法：把 catalog 里该依赖改成正式 npm 版本 ^1.2.0（@solidjs/start 已正式发布 1.2.0）。
+#   - 仅改 package.json 一行；bun.lock 不入补丁——CI 用非 frozen bun install（报错日志有
+#     "Saved lockfile"），检测到 package.json 与 lockfile 不一致会自动重解析、更新 lockfile。
+#     已本地用真实 bun install 验证：只改这一行即可装成功、不再碰死链。lockfile diff 达 961 行、
+#     且随上游频繁变动，入补丁会极度脆弱，故不纳入。
+#   - 独立于其余补丁的文件（仅改根 package.json），按 NN 序最后应用。
+[13-fix-solidjs-dep]
+package.json
+
+# 品牌开屏动画（启动加载态的 logo 从上游方块换成品牌「狗脸 + 环绕爪印」+ 动效）：
+#   - 问题：上游桌面启动加载态（renderer/index.tsx 的 LoadingSplash）渲染 @opencode-ai/ui 的
+#     方块 <Splash> + Tailwind animate-pulse（纯呼吸）。品牌化后展示本项目的狗脸标识。
+#   - 改法（仅改 desktop 包既有文件，不碰 @opencode-ai/ui 的 logo.tsx，避免影响该组件其它用处）：
+#     · renderer/index.tsx：LoadingSplash 内联完整品牌 logo SVG（viewBox 48×48，青→蓝→紫渐变，
+#       内联自 brand/icons/logo.svg，保留底板/光晕/滤镜/高光细节），叠加三个动画钩子——
+#       整体 data-slot="cx-splash"、爪印层 <g data-slot="cx-splash-paws">（4 条弧 + 节点）、
+#       双眼 <g data-slot="cx-splash-eye">；狗脸主体（眉弧/腮弧/嘴）保持静止。
+#       同时移除不再引用的 `import { Splash } from "@opencode-ai/ui/logo"`。
+#     · styles.css：上游为空文件、被 renderer/index.tsx 顶部 import "./styles.css" 引入、无其它
+#       补丁触碰——动画 keyframes/选择器的理想落点。三层动画：cx-splash-breathe（整体 3s 透明度
+#       + 极轻微缩放呼吸，呼应上游 animate-pulse 的平静感）、cx-splash-sway（爪印层绕 24,24
+#       中心 ±3.5° 往复轻摆，非整圈旋转）、cx-splash-blink（双眼每 ~4.5s 快速纵向眨一次）；
+#       prefers-reduced-motion 时停所有动画回落静态。
+#   - 依赖：仅改 desktop 包的 index.tsx（splash 区，与 10 的 loadLocale 区不重叠）与 styles.css；
+#     按 NN 序最后应用。source（品牌 SVG/CSS 的可读原始件）留存在父仓库 brand/splash/。
+[14-splash-brand]
+packages/desktop/src/renderer/index.tsx
+packages/desktop/src/renderer/styles.css
+
+# 账户入口图标（侧边栏 / 标题栏账户按钮换用户头像，而非难以联想到「账户」的芯片图标）：
+#   - 问题：07 补丁的账户入口按钮原借用上游 icon.tsx 的 "providers" 图标（芯片 / 网格造型），
+#     语义上更像「模型供应商」，用户难以联想到「我的账户」。
+#   - 改法（仅给上游共享 icon.tsx 的 icons 表新增一个键，不改任何既有图标、不动其它文件，
+#     零冲突扩展）：新增 "user" 图标（经典用户头像：圆头 + 肩部半圆，stroke=currentColor，
+#     跟随主题与按钮态）。07 补丁的账户按钮 Icon name 由 "providers" 改引 "user"。
+#   - 依赖 07（账户入口按钮）。仅改 packages/ui 的 icon.tsx，按 NN 序在其后应用。
+[15-account-icon]
+packages/ui/src/components/icon.tsx
+
+# 品牌字标（新会话空状态的 "opencode" 矢量字标换成品牌 DOKNG 字形）：
+#   - 问题：新会话空状态渲染上游 @opencode-ai/ui 的 WordmarkV2 —— "opencode" 六字母的纯 SVG
+#     路径。11-rebrand 的 i18n 运行时替换只覆盖文案，够不到 SVG 路径，故该字标不受品牌名
+#     替换影响，仍显示 "opencode"。
+#   - 承载文件随上游迁移（v1.18.9，upstream refactor(app): thin new session composition #39227）：
+#     原 components/session/session-new-design-view.tsx 被上游删除，空状态视图整体搬到
+#     pages/new-session/new-session-view.tsx（同款结构：NEW_SESSION_CONTENT_WIDTH 容器内的
+#     <WordmarkV2 class="h-auto w-full text-v2-background-bg-inverse"/>）。本补丁跟随迁移到新文件，
+#     改法不变。若上游再次搬迁，跟着 WordmarkV2 的唯一 app 侧引用处走即可。
+#   - 改法（仅改 app 包既有文件，不碰 @opencode-ai/ui 的 wordmark-v2.tsx，避免影响该共享
+#     组件的其它用处；同 14-splash「只在唯一引用处内联品牌图形」的低冲突范式）：
+#     · new-session-view.tsx：内联 WordmarkBrand 组件（DOKNG 像素网格字形，viewBox
+#       1024×200），替换 <WordmarkV2/>；移除不再引用的 WordmarkV2 import，solid-js import
+#       补 createUniqueId（mask/gradient id 去重用）。配色融入主题——去掉源件自带的 #0a0a0a
+#       黑底与近黑渐变字，字改 fill=currentColor 继承外层
+#       text-v2-background-bg-inverse（浅色主题深字 / 深色主题浅字），保留上游 opacity 0.6 +
+#       底部渐变淡出遮罩，维持低调水印质感、与上游字标同款。
+#   - source（品牌字标的可读原始 SVG）留存在父仓库 brand/wordmark/wordmark-svg.txt。
+#   - 独立于其余补丁的文件（仅改 new-session-view.tsx），按 NN 序最后应用。
+[16-wordmark-brand]
+packages/app/src/pages/new-session/new-session-view.tsx
+
+# 画布嵌入（infinite-canvas 无限画布作为第二上游，以 iframe 嵌进桌面壳）：
+#   - 构建接线：prebuild.ts 触发 build-canvas.ts 把 infinite-canvas/web 产物打进 desktop 资源；
+#     产物拷贝的 dokng:copy-canvas writeBundle 钩子在 02 补丁的 electron.vite.config.ts 内承载
+#     （vite 注入统一收敛在 02，本补丁不触碰该文件）；运行时由 canvas-embed.tsx 以 oc://renderer
+#     源加载 iframe（sandbox 含 allow-same-origin 供 IndexedDB 持久化）。
+#   - 保活（需求 #5）：CanvasHost 常驻挂在 NewLayout（layout-new.tsx，跨路由不卸载），iframe 由
+#     mounted 信号懒挂载、之后常驻内存；切走只 display:none 不卸载，画布状态跨路由保留。app.tsx
+#     的 /canvas 路由是 () => null 空占位，真正宿主在 NewLayout。
+#   - 画布四槽位（需求 #4/#6）：cx-canvas-slots.ts 存生图/视频/文本/音频四个槽的 key id，账户面板
+#     cx-account-dialog.tsx 每张 key 卡片加四个槽位按钮（移入身份行 flex 右侧，非绝对定位角标，
+#     避免挤压右侧数据），画布页读槽位并合成 payload 投递（画布 web 侧本就四能力，宿主侧解耦即可）。
+#     v2/components/icon.tsx 加四个语义图标 canvas-image/video/text/audio（该 v2 图标文件此前无补丁，
+#     由本补丁新增这 4 个图标）。cx-account-launcher.tsx 标题栏加彩色 palette 画布入口；
+#     canvas-embed.tsx 常驻挂在 NewLayout 的 main 内容区（absolute inset-0，只占 Titlebar 下方），
+#     壳 Titlebar 的会话 tab / 画布 / 账户入口在画布内全程可见，不再维护重复的画布极简顶栏。
+#   - 模型刷新：账户 key 卡片的 reset 按钮复用既有 channelConfigRefreshKey IPC，一次完成主进程
+#     /v1/models 重拉、store 落盘、内核 config 重写 + dispose 热重载，再通知画布重读并重投；按钮禁用
+#     + 旋转图标 + 成功/失败 notice 提供反馈，tooltip 提醒会短暂重载内核、应在会话空闲时操作。
+#   - 依赖 07（NewLayout 接线 / CxAccountLauncher）、09（cx-account 面板）。layout-new.tsx 与
+#     cx-account.css / cx-account-dialog.tsx 为共享文件，本补丁只叠加画布相关增量。按 NN 序最后应用。
+[17-canvas-embed]
+packages/app/src/app.tsx
+packages/app/src/components/cx-account/cx-account-dialog.tsx
+packages/app/src/components/cx-account/cx-account-launcher.tsx
+packages/app/src/components/cx-account/cx-account.css
+packages/app/src/components/cx-account/cx-canvas-slots.ts
+packages/app/src/pages/canvas-embed.tsx
+packages/app/src/pages/layout-new.tsx
+packages/desktop/scripts/build-canvas.ts
+packages/desktop/scripts/prebuild.ts
+packages/ui/src/v2/components/icon.tsx
+
+# 画布数据落盘（图片 + 画布 JSON 全落盘）：
+#   - 起因：画布图片在关闭软件再打开后加载不出来。根因是数据从未真正落到磁盘上——
+#     二进制存 IndexedDB（未申请 navigator.storage.persist()，属可回收的 best-effort 存储），
+#     节点里只留会话级的 blob: URL；而画布 JSON 的 persist 带 400ms debounce 且无
+#     beforeunload/pagehide 兜底，主进程退出走 app.exit(0) 硬退出，pending 写直接丢。
+#     结果：节点没了 → 磁盘/IndexedDB 里的图片成为无人引用的孤儿，并被启动时的清理逻辑删除。
+#   - 落盘位置（userData = appData/<appId>，与 store-* 同级的固定路径）：
+#     · <userData>/canvas-files/<sanitized storageKey>.<ext>  媒体原始字节
+#     · <userData>/canvas-state.json                          画布项目 / 节点 / 连线
+#   - store-canvas-files.ts（新增）是唯一的路径解析处，入参全部来自画布 iframe，视为不可信：
+#     storageKey 必须匹配 `<kind>:<id>` 模式（id 仅 [A-Za-z0-9_-]），拒绝而非"尽力清洗"；
+#     解析后再用 relative() 复核落在 canvas-files 内（双重闸门，同 windows.ts 协议 handler）；
+#     扩展名走白名单（避免写出 .exe/.lnk 等可执行后缀）；写入用临时文件 + rename 原子落盘，
+#     防断电/被杀留下半截文件；单文件 256MB、画布 JSON 64MB 上限；一律不打印 key 与内容，
+#     失败只回 false/null，不外泄绝对路径。
+#   - windows.ts：在既有 protocol.handle 内加前缀分支，把 oc://renderer/__canvas-file/<key>
+#     映射到 canvas-files 下的真实文件。复用既有 origin 而不新开 scheme/host，故画布 iframe 的
+#     <img src> 可直接引用磁盘文件——无需 blob: URL、无跨源与 CSP 问题、走浏览器原生缓存，
+#     也就不再需要启动时的 hydrate 重建步骤。range 请求透传（<video> 拖进度条需要）。
+#   - canvas-embed.tsx：postMessage 桥。preload 只挂 BrowserWindow、未开
+#     nodeIntegrationInSubFrames，画布 iframe 里没有 window.api，故落盘链路必须是
+#     iframe → postMessage → 宿主 → IPC → 主进程。op 白名单收敛在宿主侧（画布不能自由指定
+#     channel），校验 event.origin 与 event.source（杜绝同 origin 下其他 frame 借道），
+#     回帖严格限 targetOrigin，错误只回稳定短码。
+#   - 依赖 17（canvas-embed.tsx 宿主组件由 17 引入，本补丁在其上叠加落盘桥）。按 NN 序最后应用。
+[18-canvas-fs]
+packages/app/src/pages/canvas-embed.tsx
+packages/desktop/src/main/ipc.ts
+packages/desktop/src/main/store-canvas-files.ts
+packages/desktop/src/main/windows.ts
+packages/desktop/src/preload/index.ts
+packages/desktop/src/preload/types.ts

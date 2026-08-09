@@ -1,0 +1,1303 @@
+name: open-code release
+
+# US-009 —— dokng 统一 CI 流水线：升级基线 / 检测 / 构建 / 打包 / 发布
+#
+# 本文件由三个原独立 workflow 合并而来（保留全部能力，仅收敛为单文件便于维护）：
+#   - auto-upgrade.yml         → 下方 upgrade-opencode job
+#   - auto-upgrade-canvas.yml  → 下方 upgrade-canvas job
+#   - release.yml（本文件原体）→ 下方 detect / package / release 三段 job
+#
+# [monorepo] 本产品位于仓库子目录 open-code/，故每个 job 都声明
+#   defaults.run.working-directory: open-code
+# 使全部 run 步骤的相对路径（scripts/、brand/、opencode/、infinite-canvas/）语义与
+# 单仓时代完全一致。三类例外必须显式带 open-code/ 前缀（它们不受 defaults.run 影响）：
+#   - step 级 working-directory：一律写成 ${{ github.workspace }}/open-code/... 绝对路径。
+#     官方文档只规定「更具体的默认值覆盖更宽的」，未规定 step 级相对路径以 workspace 根
+#     还是以 job 默认值为基准 —— 绝对路径在两种语义下都成立，不赌未文档化的行为。
+#   - uses: 型步骤的路径参数：bun-version-file、upload/download-artifact 的 path。
+#   - matrix.artifact_glob：同时被 uses: 型 upload-artifact 与 run 步骤消费，故统一定为
+#     「workspace 根相对」，消费它的 run 步骤显式回到根目录执行（见 package job 注释）。
+#
+# [monorepo] 不再发 GitHub Release —— 本仓只保留 tag，R2（dl.dokng.com/open-code）是唯一
+# 分发与自更新源。原 gh release create/upload/edit 步骤已删除。
+# 五个 job 按「事件类型」互斥分流（每个 job 用 if: 只在对应触发下运行，其余事件里被 skip）：
+#
+#   upgrade-opencode —— 每日升级 opencode 基线（brand/BASE_TAG + BASE_SHA + gitlink）。
+#                       验证补丁 strict 重放 + typecheck 通过 → 推 main + 打 dokng tag。
+#                       打的 tag 经 RELEASE_PAT 推送，触发本 workflow 的 push:tag → 走 detect/package/release。
+#   upgrade-canvas   —— 每日升级 infinite-canvas 基线（brand/CANVAS_BASE_TAG + SHA + gitlink）。
+#                       验证画布补丁 strict 重放 + build 通过 → 推 main（不打 tag，画布不独立发版）。
+#   detect           —— 计算下一个 dokng 发布版本号 <opencode版本>-dokng.N，判断是否需要发布。
+#   package          —— 四平台 runner 出安装包（.dmg×2 / .exe / .AppImage）。
+#   release          —— 汇总产物，合并 latest*.yml + 上传 R2（不再创建 GitHub Release）。
+#
+# 【为何 tag-push 跨 run 触发仍成立】upgrade-opencode 用 RELEASE_PAT 推 tag（非 GITHUB_TOKEN，
+#   后者推的 tag 不触发任何 workflow，防无限循环）。PAT 推 tag → 触发本文件 push:tags → 起一个
+#   **新的 run**，该 run 的 detect/package/release 段执行。合并到单文件不改变这个事件驱动链路。
+#
+# 【为何不监听 push:main】历史上曾同时监听 push:main + push:tag，导致升级成功后一次推 main、
+#   一次推 tag，两条 release 流水线并发、版本号碰撞、产物互相覆盖。改为只认 tag：tag 名即确定
+#   版本号（无歧义），平时推代码到 main 不触发无谓全平台构建；要发布就打 tag（自动或手动）。
+#
+# 安全（验收标准 #3）：
+#   - 渠道值 / 密钥全部经 GitHub Secret 注入为环境变量，仓库与工作流文件里不含明文；
+#   - detect / package 段用 ::add-mask:: 把注入的敏感值登记为日志掩码，误打印显示为 ***；
+#   - 这些值只在需要的 job env 里出现，绝不写入 git、不 echo 到日志。
+#
+# 平台矩阵严格对齐验收标准 #4：.dmg=macOS runner，.exe=windows runner，.AppImage=linux runner。
+
+on:
+  schedule:
+    # 北京时间 00:23（UTC+8） → UTC 16:23：opencode 基线升级。避开整点，减少与上游发布高峰重叠。
+    - cron: "23 16 * * *"
+    # 北京时间 01:47（UTC+8） → UTC 17:47：画布基线升级。错开 opencode（UTC 16:23）与整点，减少并发写 main。
+    - cron: "47 17 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "手动运行模式：release=出包发布 / upgrade-opencode=升级 opencode 基线 / upgrade-canvas=升级画布基线"
+        required: true
+        type: choice
+        default: release
+        options:
+          - release
+          - upgrade-opencode
+          - upgrade-canvas
+      force_version:
+        description: "【release 模式】强制指定发布版本号（如 v1.17.15-dokng.3）；留空则自动计算"
+        required: false
+        type: string
+      force_release:
+        description: "【release 模式】即使无新版本也强制走发布"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*-dokng.*"
+
+# 按事件动态选 concurrency，完整保留原三个 workflow 的隔离语义：
+#   - opencode 升级 → group=open-code-auto-upgrade（cancel-in-progress=false，不打断进行中的升级）
+#   - 画布升级    → group=open-code-auto-upgrade-canvas（与上一组独立，两种升级不互斥）
+#   - 发布        → group=open-code-release-<ref>（同一 ref 只跑一个发布流水线，新推送取消旧的）
+# && / || 短路实现三分支「三元」：cond 为真取字符串（真值短路），否则落到下一个分支。
+# [monorepo] group 全部带 open-code- 前缀：同仓的 cc-switch 流水线有自己的同名概念
+# （auto-upgrade / release-<ref>），不加前缀会让两个产品的升级/发布互相排队甚至取消。
+concurrency:
+  group: >-
+    ${{
+      ((github.event_name == 'schedule' && github.event.schedule == '23 16 * * *') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'upgrade-opencode')) && 'open-code-auto-upgrade'
+      || ((github.event_name == 'schedule' && github.event.schedule == '47 17 * * *') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'upgrade-canvas')) && 'open-code-auto-upgrade-canvas'
+      || format('open-code-release-{0}', github.ref)
+    }}
+  # 仅发布链路取消进行中的旧 run（升级链路 cancel-in-progress=false，绝不打断进行中的基线推进）。
+  cancel-in-progress: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release') }}
+
+permissions:
+  contents: write
+
+jobs:
+  # ── upgrade-opencode：每日升级 opencode 上游基线（原 auto-upgrade.yml）────────
+  #
+  # 设计（对齐 brand/ 补丁叠加层架构）：
+  #   - submodule 永远锁在「干净的上游 tag」，定制全在 brand/patches/*.patch；
+  #   - 「升级」= 把基线 tag 推进到上游最新稳定 tag，并验证所有补丁仍能干净重放。
+  #
+  # 为什么用 PAT 推送：GitHub 默认 GITHUB_TOKEN 推 main/tag 不会触发其它 workflow（防无限循环），
+  # 而升级后需要打的 dokng tag 触发本 workflow 的发布段，故用 RELEASE_PAT（repo 权限）推送。
+  upgrade-opencode:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '23 16 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'upgrade-opencode')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: open-code
+    steps:
+      # [monorepo] submodules: false —— 不能用 recursive，否则白拉 infinite-canvas（6M）
+      # 与 cc-switch/upstream（77M）。本 job 只动 opencode 基线，只初始化它。
+      - name: Checkout（不带 submodule；用 PAT 以便推送能触发发布段）
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+          # RELEASE_PAT：repo 权限的 PAT。用它 checkout，后续 git push 即带 PAT 凭据，
+          # 推 dokng tag 才能触发本 workflow 的 push:tag 发布段（默认 GITHUB_TOKEN 不触发）。
+          token: ${{ secrets.RELEASE_PAT }}
+
+      # 不加 --depth=1：detect 要 fetch --tags 后按 tag 列表挑最新稳定版，且要 checkout 到
+      # 任意历史 tag 做补丁 strict apply，浅克隆会缺对象。
+      - name: 初始化 open-code/opencode submodule
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git submodule update --init open-code/opencode
+          echo "submodule 就绪：$(git -C open-code/opencode rev-parse --short HEAD)"
+
+      - name: 检测上游最新稳定 tag
+        id: detect
+        run: |
+          set -euo pipefail
+          CURRENT="$(tr -d '[:space:]' < brand/BASE_TAG)"
+          echo "当前基线 tag：$CURRENT"
+
+          # 拉取 submodule 所有 tag（origin = anomalyco/opencode，已同步上游）。
+          git -C opencode fetch --tags --quiet origin
+
+          # 只认稳定版 tag vX.Y.Z（排除 -rc / pr-*/ beta 等），按语义版本取最大。
+          LATEST="$(git -C opencode tag -l 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)"
+          echo "上游最新稳定 tag：${LATEST:-<无>}"
+
+          if [ -z "$LATEST" ]; then
+            echo "未找到任何稳定 tag，异常退出。" >&2
+            exit 1
+          fi
+
+          # 降级保护：只有当 LATEST 严格新于 CURRENT 时才升级。
+          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)"
+          if [ "$LATEST" != "$CURRENT" ] && [ "$NEWEST" = "$LATEST" ]; then
+            echo "发现新版本：$CURRENT → $LATEST"
+            echo "need=true" >> "$GITHUB_OUTPUT"
+            echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "已是最新（或当前基线更新），无需升级。"
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 Bun
+        if: steps.detect.outputs.need == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
+          bun-version-file: open-code/opencode/package.json
+
+      - name: 切到新 tag 并按 NN 序重放补丁（strict apply）
+        if: steps.detect.outputs.need == 'true'
+        env:
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # 干净 checkout 到新 tag（detached）；清掉任何残留，确保基线纯净。
+          git -C opencode checkout --quiet "$LATEST"
+          git -C opencode reset --hard --quiet
+          git -C opencode clean -fdq
+
+          # 在改动 submodule 前先做纯格式/manifest 预检；corrupt patch 必须零副作用提前失败。
+          scripts/apply-patches.sh --preflight
+
+          # 用统一的重放脚本（strict apply）落地补丁——与发布段 package 同一来源，避免逻辑漂移。
+          # 此刻 brand/BASE_SHA 还是旧基线（升级成功后才刷新），脚本会 warn HEAD≠BASE_SHA，
+          # 但不致命：apply 模式只要求 opencode/ 工作区干净 + 补丁精确适用；任一补丁失败即非 0
+          # → 步骤失败 → 通知维护者手动介入。
+          echo "按 NN 序重放补丁到 ${LATEST}："
+          if scripts/apply-patches.sh; then
+            echo "全部补丁 apply 成功。"
+          else
+            # strict 失败：上游 $LATEST 很可能改到了补丁热点文件（router/layout/server/vite 等）。
+            # 直接在当前 $LATEST 工作区逐补丁 3way 试应用，把冲突 hunk 落成 .rej 打印出来——
+            # 这诊断基于正确的新基线（BASE_SHA 此刻还是旧的，用 --check-3way 会基于旧基线不准），
+            # 让维护者一眼看到哪个补丁的哪些 hunk 撞上了上游改动，缩短 rebase 定位时间。
+            echo "::group::strict apply 失败——3way 漂移诊断（基于新基线 ${LATEST}）" >&2
+            git -C opencode reset --hard --quiet
+            git -C opencode clean -fdq
+            # 诊断必须保留「前序补丁已落地」的累积状态：补丁栈按 NN 序叠加，12/17/18
+            # 这类依赖前序的补丁若在原始基线上单独试应用，会因缺前序而误报冲突（实测
+            # 12-identity 独立诊断报冲突、累积诊断 OK）。故每个补丁成功后就地 commit
+            # 成检查点，冲突时 reset 回检查点（含前序、不含本补丁）再走纯 --reject。
+            # 这些 commit 只存在于这个一次性诊断工作区，收尾 checkout 回 tag 即丢弃。
+            for p in brand/patches/*.patch; do
+              [ -e "$p" ] || continue
+              name="$(basename "$p")"
+              if git -C opencode apply --3way "$PWD/$p" >/dev/null 2>&1; then
+                echo "  3way OK   $name" >&2
+                git -C opencode add -A >/dev/null 2>&1 || true
+                git -C opencode -c user.name=ci -c user.email=ci@local \
+                  commit -q --allow-empty -m "diag: $name" || true
+              else
+                echo "  3way 冲突 ${name}：" >&2
+                # --reject 与 --3way 互斥（同用直接报 "cannot be used together"，
+                # 于是一个 .rej 都产不出、诊断信息全丢）。故冲突分支走纯 --reject。
+                # 先 reset 回检查点：失败的 --3way 不是原子回滚，能合并的文件会留在
+                # index/工作区，脏状态下 --reject 会把本可干净套上的 hunk 误判成
+                # already-applied 而整体落 .rej，诊断失真。
+                git -C opencode reset --hard --quiet || true
+                git -C opencode clean -fdq || true
+                git -C opencode apply --reject "$PWD/$p" 2>&1 | sed 's/^/      /' >&2 || true
+                find opencode -name '*.rej' -print 2>/dev/null | sed 's/^/      rej: /' >&2 || true
+                # 清掉 .rej 与半落地改动回到检查点：本补丁算未落地，后续补丁仍在
+                # 「前序已落地」的正确基础上诊断。
+                git -C opencode reset --hard --quiet || true
+                git -C opencode clean -fdq || true
+              fi
+            done
+            # 收尾：丢弃全部诊断 commit，回到干净的 $LATEST。
+            git -C opencode checkout --quiet --detach "$LATEST"
+            git -C opencode reset --hard --quiet; git -C opencode clean -fdq
+            echo "::endgroup::" >&2
+            echo "补丁 strict apply 失败，需人工把补丁 rebase 到 ${LATEST}（见上方 3way 诊断）。" >&2
+            exit 1
+          fi
+
+      - name: 安装依赖 + typecheck（app + desktop）
+        if: steps.detect.outputs.need == 'true'
+        working-directory: ${{ github.workspace }}/open-code/opencode
+        run: |
+          set -euo pipefail
+          # [dokng] bun install 加重试：npm registry 偶发单包 tarball 下载失败（CI 曾遇
+          # @esbuild/darwin-x64 这类平台可选依赖抽风），一次失败即中断。重试 3 次、间隔递增
+          # （15s/30s）消除瞬时网络抖动；三次仍失败才真正报错（set -e 下走 exit 1）。
+          for attempt in 1 2 3; do
+            bun install && break
+            if [ "$attempt" = 3 ]; then
+              echo "bun install 连续 3 次失败，放弃。" >&2
+              exit 1
+            fi
+            echo "bun install 第 $attempt 次失败，$((attempt * 15))s 后重试…" >&2
+            sleep $((attempt * 15))
+          done
+          # 只 typecheck 定制涉及的两个包，快速验证补丁应用后类型仍自洽。
+          bun turbo typecheck --filter=@opencode-ai/app --filter=@opencode-ai/desktop
+
+      - name: 校验通过 → 更新基线、提交并推送 main + 打 dokng tag
+        if: steps.detect.outputs.need == 'true'
+        env:
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # 恢复 submodule 干净：撤销临时 apply 的补丁，gitlink 记录的是干净 tag 的 HEAD。
+          git -C opencode reset --hard --quiet
+          git -C opencode clean -fdq
+
+          NEWSHA="$(git -C opencode rev-parse HEAD)"
+          echo "新基线：${LATEST}（${NEWSHA}）"
+
+          # 更新基线双文件（保留尾换行，与既有格式一致）。
+          printf '%s\n' "$LATEST" > brand/BASE_TAG
+          printf '%s\n' "$NEWSHA" > brand/BASE_SHA
+
+          git add brand/BASE_TAG brand/BASE_SHA opencode
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(opencode): 自动升级基线到 ${LATEST}（每日自动）"
+
+          # 推 main（保存基线推进）。GITHUB_TOKEN 推送不会触发其它 workflow，
+          # 故用 PAT checkout 后的凭据推送；真正触发出包的是下方推送的 dokng tag。
+          # 加 pull --rebase + 重试：定时任务与手动触发 / 维护者推送可能并发，
+          # 裸 push 遇 non-fast-forward 会被拒。重试 3 次，每次先 rebase 再推。
+          pushed=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              pushed=true
+              break
+            fi
+            echo "push main 第 $attempt 次失败（可能 non-fast-forward），rebase 后重试…" >&2
+            git fetch origin main --quiet || true
+            # rebase 到最新 origin/main；基线文件冲突极少（只有并发升级才可能），
+            # 冲突时放弃自动 rebase，让 job 失败等人工介入（不强推、不覆盖他人提交）。
+            git rebase origin/main || { git rebase --abort || true; break; }
+          done
+          [ "$pushed" = true ] || { echo "push main 连续 3 次失败，放弃（无污染，可重跑）。" >&2; exit 1; }
+          echo "已推送 main。"
+
+          # 计算下一个 dokng 版本 tag（vX.Y.Z-dokng.N，基于新基线 BASE_TAG），打 tag 并推送。
+          # 本 workflow 的 push:tags v* 触发器会据此起新 run 走发布段（复用现有版本号规则）。
+          git fetch --tags --quiet origin || true
+          # next-dokng-version.sh 的 stdout 只打「纯 tag 值」一行（KEY=VALUE 只进
+          # GITHUB_OUTPUT），故 $() 直接拿到干净 tag，无需再 sed 抽取。
+          NEWTAG="$(scripts/next-dokng-version.sh)"
+          [ -n "$NEWTAG" ] || { echo "计算 dokng tag 失败（输出为空）。" >&2; exit 1; }
+          echo "新 dokng 版本 tag：$NEWTAG"
+          git tag "$NEWTAG"
+          git push origin "$NEWTAG"
+          echo "已推送 tag ${NEWTAG}，本 workflow 的 push:tag 发布段将据此自动出包。"
+
+  # ── upgrade-canvas：每日升级 infinite-canvas 上游基线（原 auto-upgrade-canvas.yml）──
+  #
+  # 与 opencode 升级的关键差异：
+  #   - 画布不独立发版：它内嵌进 opencode desktop 构建（out/renderer/canvas/）。故本 job 只
+  #     「推进基线 + 推 main」，**不打 dokng tag、不触发发布段**——画布的变更会搭下一次 opencode
+  #     升级或手动发布的车一起出包，避免 opencode 未变时空发版。
+  #   - 验证步骤是画布 build（cd web && bun install && bun run build），非 typecheck。
+  upgrade-canvas:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '47 17 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'upgrade-canvas')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: open-code
+    steps:
+      # [monorepo] submodules: false —— 不能用 recursive（会白拉 cc-switch/upstream 77M）。
+      # 本 job 要初始化两个：infinite-canvas 是升级对象；opencode 仅为下面 setup-bun 的
+      # bun-version-file 提供锁定的 bun 版本（刻意与发布构建同源，避免版本漂移）。
+      - name: Checkout（不带 submodule；用 PAT 保持与 opencode 升级同款推送凭据）
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+          # RELEASE_PAT：repo 权限 PAT，与 opencode 升级共用。画布升级只推 main、不打 tag，
+          # 用 PAT 保持凭据一致性（后续 git push 带 PAT）。
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: 初始化 open-code/{infinite-canvas,opencode} submodule
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git submodule update --init open-code/infinite-canvas open-code/opencode
+          echo "canvas：$(git -C open-code/infinite-canvas rev-parse --short HEAD)"
+          echo "opencode：$(git -C open-code/opencode rev-parse --short HEAD)"
+
+      - name: 检测上游最新稳定 tag
+        id: detect
+        run: |
+          set -euo pipefail
+          CURRENT="$(tr -d '[:space:]' < brand/CANVAS_BASE_TAG)"
+          echo "当前画布基线 tag：$CURRENT"
+
+          # 拉取 submodule 所有 tag（origin = basketikun/infinite-canvas）。
+          git -C infinite-canvas fetch --tags --quiet origin
+
+          # 只认稳定版 tag vX.Y.Z。此正则天然排除上游历史里的脏 tag v.0.1.0（多一个点、非三段数字）。
+          LATEST="$(git -C infinite-canvas tag -l 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)"
+          echo "上游最新稳定 tag：${LATEST:-<无>}"
+
+          if [ -z "$LATEST" ]; then
+            echo "未找到任何稳定 tag，异常退出。" >&2
+            exit 1
+          fi
+
+          # 降级保护：只有当 LATEST 严格新于 CURRENT 时才升级。
+          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)"
+          if [ "$LATEST" != "$CURRENT" ] && [ "$NEWEST" = "$LATEST" ]; then
+            echo "发现新版本：$CURRENT → $LATEST"
+            echo "need=true" >> "$GITHUB_OUTPUT"
+            echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "已是最新（或当前基线更新），无需升级。"
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 Bun
+        if: steps.detect.outputs.need == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          # 锁定与发布构建同源的 bun 版本（opencode/package.json），
+          # 避免「升级验证构建用某版本、正式发布用另一版本」的漂移导致「升级时通过、发布时挂」。
+          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
+          bun-version-file: open-code/opencode/package.json
+
+      - name: 切到新 tag 并按 NN 序重放画布补丁（strict apply）
+        if: steps.detect.outputs.need == 'true'
+        env:
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # 干净 checkout 到新 tag（detached）；清掉任何残留，确保基线纯净。
+          git -C infinite-canvas checkout --quiet "$LATEST"
+          git -C infinite-canvas reset --hard --quiet
+          git -C infinite-canvas clean -fdq
+
+          # 在改动 submodule 前先做纯格式/manifest 预检；corrupt patch 必须零副作用提前失败。
+          scripts/apply-canvas-patches.sh --preflight
+
+          # 用统一的画布重放脚本（strict apply）落地补丁。此刻 CANVAS_BASE_SHA 还是旧基线，
+          # 脚本会 warn HEAD≠BASE_SHA，但不致命：apply 模式只要求工作区干净 + 补丁精确适用；
+          # 任一补丁失败即非 0 → 步骤失败 → 通知维护者手动介入（上游漂移需人工修补丁）。
+          echo "按 NN 序重放画布补丁到 ${LATEST}："
+          if ! scripts/apply-canvas-patches.sh; then
+            echo "::error::画布补丁 strict apply 失败（上游 $LATEST 漂移）。以下为 3way 诊断，列出冲突 hunk：" >&2
+            # strict 失败后工作区可能已落地部分补丁，先恢复干净再逐补丁 3way 试应用，
+            # 定位真正冲突的 patch/hunk（.rej）。诊断基于正确的新基线（当前已 checkout 到 ${LATEST}）。
+            git -C infinite-canvas reset --hard --quiet
+            git -C infinite-canvas clean -fdq
+            for p in $(find brand/canvas-patches -maxdepth 1 -name '*.patch' | LC_ALL=C sort); do
+              if git -C infinite-canvas apply --3way --whitespace=nowarn "$PWD/$p" 2>/dev/null; then
+                echo "  3way OK   $(basename "$p")" >&2
+              else
+                echo "  3way 冲突 $(basename "$p")：" >&2
+                git -C infinite-canvas apply --3way "$PWD/$p" 2>&1 | sed 's/^/          /' >&2 || true
+              fi
+            done
+            echo "::error::请本地 rebase 画布补丁到 ${LATEST}（检查点 worktree + export-patch.sh 重导出），再更新 CANVAS_BASE_SHA/TAG。" >&2
+            exit 1
+          fi
+          echo "全部画布补丁 apply 成功。"
+
+      - name: 安装依赖 + 构建画布（VITE_BASE=/canvas/，与 desktop 打包一致）
+        if: steps.detect.outputs.need == 'true'
+        working-directory: ${{ github.workspace }}/open-code/infinite-canvas/web
+        env:
+          # 与 desktop 的 build-canvas.ts 完全一致——验证的就是实际内嵌产物的构建路径。
+          VITE_BASE: /canvas/
+        run: |
+          set -euo pipefail
+          # bun install 加重试：npm registry 偶发单包 tarball 下载失败，重试 3 次消抖动
+          # （与 opencode 升级同款策略）。
+          for attempt in 1 2 3; do
+            bun install && break
+            if [ "$attempt" = 3 ]; then
+              echo "bun install 连续 3 次失败，放弃。" >&2
+              exit 1
+            fi
+            echo "bun install 第 $attempt 次失败，$((attempt * 15))s 后重试…" >&2
+            sleep $((attempt * 15))
+          done
+          # 构建画布产物：验证补丁应用后画布仍能干净构建（依赖仓库根的 VERSION / CHANGELOG.md，
+          # vite.config.ts readFileSync 无 try/catch，缺文件即构建失败——submodule 完整则天然在位）。
+          bun run build
+
+      - name: 校验通过 → 更新基线、提交并推送 main（不打 tag）
+        if: steps.detect.outputs.need == 'true'
+        env:
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # 恢复 submodule 干净：撤销临时 apply 的补丁 + build 产物，gitlink 记录干净 tag 的 HEAD。
+          git -C infinite-canvas reset --hard --quiet
+          git -C infinite-canvas clean -fdq
+
+          NEWSHA="$(git -C infinite-canvas rev-parse HEAD)"
+          echo "新画布基线：${LATEST}（${NEWSHA}）"
+
+          # 更新基线双文件（保留尾换行，与既有格式一致）。
+          printf '%s\n' "$LATEST" > brand/CANVAS_BASE_TAG
+          printf '%s\n' "$NEWSHA" > brand/CANVAS_BASE_SHA
+
+          git add brand/CANVAS_BASE_TAG brand/CANVAS_BASE_SHA infinite-canvas
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(canvas): 自动升级画布基线到 ${LATEST}（每日自动）"
+
+          # 只推 main 保存基线推进；**不打 dokng tag**——画布不独立发版，其变更搭下次
+          # opencode 升级 / 手动发布的车出包（见 job 头说明）。
+          # 加 pull --rebase + 重试：canvas 与 opencode 两条升级错开约 84 分钟，正常不撞；
+          # 但手动触发 / 维护者推送可能并发，裸 push 遇 non-fast-forward 会被拒。
+          pushed=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              pushed=true
+              break
+            fi
+            echo "push main 第 $attempt 次失败（可能 non-fast-forward），rebase 后重试…" >&2
+            git fetch origin main --quiet || true
+            git rebase origin/main || { git rebase --abort || true; break; }
+          done
+          [ "$pushed" = true ] || { echo "push main 连续 3 次失败，放弃（无污染，可重跑）。" >&2; exit 1; }
+          echo "已推送 main（画布基线 → ${LATEST}）。未打 tag：画布随下次 opencode 发版一起出包。"
+
+  # ── detect：计算版本号、判断是否发布、登记敏感值日志掩码 ──────────────
+  detect:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'release')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      tag: ${{ steps.calc.outputs.tag }}
+      should_release: ${{ steps.decide.outputs.should_release }}
+    defaults:
+      run:
+        working-directory: open-code
+    steps:
+      # fetch-depth: 0 会连带拉全部 tag —— next-dokng-version.sh 的本地回落
+      # （git tag -l '<base>-dokng.*'）依赖它，缺 tag 会把 N 算回 1 并覆盖线上版本。
+      - name: Checkout（仅父仓库，不需要 submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      # 登记敏感值为日志掩码：一旦后续任何步骤误打印，日志里显示为 ***。
+      # 这些值来自 Secret，本步骤只把「值」喂给 ::add-mask::，不 echo 出来。
+      - name: 屏蔽渠道敏感值（::add-mask::）
+        env:
+          NEWAPI_BASE_URL: ${{ secrets.NEWAPI_BASE_URL }}
+          NEWAPI_API_KEY: ${{ secrets.NEWAPI_API_KEY }}
+          NEWAPI_MODEL: ${{ secrets.NEWAPI_MODEL }}
+          NEWAPI_TOPUP_URL: ${{ secrets.NEWAPI_TOPUP_URL }}
+        run: |
+          # 对每个非空 Secret 调 ::add-mask::。用 printf 经变量传值，绝不把明文写进命令行。
+          mask() { [ -n "$1" ] && echo "::add-mask::$1" || true; }
+          mask "$NEWAPI_BASE_URL"
+          mask "$NEWAPI_API_KEY"
+          mask "$NEWAPI_MODEL"
+          mask "$NEWAPI_TOPUP_URL"
+          echo "已登记渠道敏感值日志掩码（值不回显）。"
+
+      - name: 计算下一个 dokng 发布版本号
+        id: calc
+        env:
+          # 覆盖版本（workflow_dispatch 手填）优先；否则脚本按 BASE_TAG + 已有 tag 计算。
+          FORCE_VERSION: ${{ inputs.force_version }}
+        run: |
+          BASE_TAG="$(tr -d '[:space:]' < brand/BASE_TAG)"
+          echo "基线 opencode tag：$BASE_TAG"
+
+          if [ -n "$FORCE_VERSION" ]; then
+            echo "使用强制指定版本：$FORCE_VERSION"
+            echo "version=$FORCE_VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=$FORCE_VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # push tag 触发时，直接用推上来的 tag 作为版本号。
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            echo "由 tag 触发，版本号取当前 tag：$GITHUB_REF_NAME"
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # [monorepo] 版本号来源从「已有 GitHub Release」改为「已有 git tag」——本仓不再发
+          # Release，tag 是唯一的版本台账。两者集合原本一一对应（每个 release 都有同名 tag），
+          # 故版本号序列连续、R2 路径不变。
+          # 不传 EXISTING_TAGS：脚本自带本地回落 git tag -l '<base>-dokng.*'，且它用
+          # git -C "$PROJECT_ROOT"（= open-code/），在子目录里同样解析到仓库根、tag 是仓库
+          # 全局的，故能读到全部 dokng tag（与 cc-switch 的 next-version.sh 调用方式一致）。
+          git fetch --tags --quiet origin || true
+          echo "已有 dokng tag：$(git tag -l "${BASE_TAG}-dokng.*" | tr '\n' ' ')"
+          bash scripts/next-dokng-version.sh --base "$BASE_TAG"
+
+      - name: 判断是否需要发布
+        id: decide
+        env:
+          FORCE_RELEASE: ${{ inputs.force_release }}
+          TAG: ${{ steps.calc.outputs.tag }}
+        run: |
+          # push tag 或手动 force_release → 一定发布。
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] || [ "$FORCE_RELEASE" = "true" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "触发发布：tag 触发或 force_release。"
+            exit 0
+          fi
+          # 否则：目标 tag 已存在则跳过（幂等），不存在则发布。
+          # [monorepo] 幂等判据从 `gh release view` 改为 tag 是否存在（本仓不发 Release）。
+          # 上一步已 fetch --tags，故本地 tag 视图与远端一致。
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "版本 $TAG 的 tag 已存在，跳过。"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "版本 $TAG 尚无 tag，将发布。"
+          fi
+
+      # [monorepo] 新增：手动发布路径必须自己建 tag。
+      # 原先 `gh release create "$TAG"` 会隐式创建同名 tag，删掉它之后，workflow_dispatch
+      # （mode=release）算出的版本号就再没人落成 tag —— 下一次 detect 会重算出同一个 N，
+      # 重复覆盖已发布到 R2 的版本，客户端永远收不到更新。故在此显式建并推。
+      # 用默认 GITHUB_TOKEN（非 RELEASE_PAT）：GITHUB_TOKEN 推的 tag 不触发任何 workflow，
+      # 正好避免再触发一条 push:tag 发布流水线造成同版本重复出包。
+      # push:tag 触发时跳过（tag 本来就存在）；tag 已存在时也跳过（补发场景，幂等）。
+      - name: 建立并推送发布 tag（仅手动触发路径）
+        if: steps.decide.outputs.should_release == 'true' && github.ref_type != 'tag'
+        env:
+          TAG: ${{ steps.calc.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG 已存在（补发场景），不重建。"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          # 推 tag 加 3 次重试：tag 没落地而后续步骤照常发布到 R2，会让下一次 detect 重算出
+          # 同一个 N 并覆盖线上版本，故必须在本 job 内尽力送达，三次仍失败即中断发布。
+          for attempt in 1 2 3; do
+            if git push origin "$TAG"; then
+              echo "已推送 tag $TAG。"
+              exit 0
+            fi
+            echo "push tag $TAG 第 $attempt 次失败，$((attempt * 5))s 后重试…" >&2
+            sleep $((attempt * 5))
+          done
+          echo "::error::push tag $TAG 连续 3 次失败，中止发布（避免版本号被下次运行重复使用）。" >&2
+          exit 1
+
+  # ── package：四平台各出安装包（矩阵对齐验收标准 #4）────────────────
+  package:
+    needs: detect
+    if: needs.detect.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 四平台矩阵：macOS arm64 + macOS x64 + Windows x64 + Linux x64。
+          # .dmg + .zip（Apple Silicon）：arm64 runner 原生编译，装 arm64 的 node-pty。
+          # dmg 供人工下载，zip 供 electron-updater 自更新（macOS 只能用 zip 更新）。
+          # meta_subdir 对齐 finalize-latest-yml.ts 期望的子目录名（合并 mac 双架构 latest-mac.yml）。
+          - os: macos-latest
+            platform_flag: "--mac"
+            arch_flag: "--arm64"
+            # [monorepo] artifact_glob 一律「workspace 根相对」（带 open-code/ 前缀）：它同时被
+            # uses: 型 upload-artifact（基准恒为 workspace 根，不受 defaults.run 影响）与 R2
+            # 直传 run 步骤消费。两者基准必须一致，故统一按根相对，并让那个 run 步骤显式
+            # working-directory: ${{ github.workspace }} 回到根目录执行。
+            artifact_glob: |
+              open-code/opencode/packages/desktop/dist/*.dmg
+              open-code/opencode/packages/desktop/dist/*.zip
+            artifact_name: dokng-dmg-arm64
+            meta_subdir: latest-yml-aarch64-apple-darwin
+          # .dmg + .zip（Intel）：x64 runner 原生编译，装 x64 的 node-pty。
+          # 关键：node-pty 是按平台拆分的独立子包（@lydell/node-pty-darwin-<arch>），
+          # 靠 optionalDependencies 只装当前 runner 架构那一个。故 x64 包必须在 x64
+          # runner 上编，不能在 arm64 runner 上跨架构出 x64（会塞进 arm64 的 pty.node，
+          # 运行时报 Cannot find ./prebuilds/darwin-x64/pty.node）。
+          - os: macos-15-intel
+            platform_flag: "--mac"
+            arch_flag: "--x64"
+            artifact_glob: |
+              open-code/opencode/packages/desktop/dist/*.dmg
+              open-code/opencode/packages/desktop/dist/*.zip
+            artifact_name: dokng-dmg-x64
+            meta_subdir: latest-yml-x86_64-apple-darwin
+          # .exe 用 windows runner
+          - os: windows-latest
+            platform_flag: "--win"
+            arch_flag: ""
+            artifact_glob: "open-code/opencode/packages/desktop/dist/*.exe"
+            artifact_name: dokng-exe
+            meta_subdir: latest-yml-x86_64-pc-windows-msvc
+          # .AppImage 用 linux runner
+          - os: ubuntu-latest
+            platform_flag: "--linux"
+            arch_flag: ""
+            artifact_glob: "open-code/opencode/packages/desktop/dist/*.AppImage"
+            artifact_name: dokng-appimage
+            meta_subdir: latest-yml-x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      # [dokng] 提到 job 层级：产物交接走 R2 暂存区还是 artifact 回退，由「有无 R2 凭据」决定，
+      # 而做判断的 if: 分散在多个步骤上（含 uses: 类型的 upload-artifact，它们没有自己的
+      # env 块）。步骤自带 env 只对该步骤的 if 可见，故必须在 job 层级声明，否则回退分支的
+      # env.R2_ACCESS_KEY_ID 恒为空 → 永远走 artifact，改造等于没做。
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      # 无签名凭据时降级出未签名包（验收只要求出包，不要求签名）。
+      CX_UNSIGNED: "1"
+      # 上游 electron-builder 配置按 prod 通道出品牌 appId / 无后缀名。
+      OPENCODE_CHANNEL: prod
+      # 渠道值经 Secret 注入为环境变量（构建期由 electron.vite renderer.define
+      # 内联进 renderer bundle，供余额面板读取；绝不进 git / 不进日志）。
+      NEWAPI_BASE_URL: ${{ secrets.NEWAPI_BASE_URL }}
+      NEWAPI_API_KEY: ${{ secrets.NEWAPI_API_KEY }}
+      NEWAPI_MODEL: ${{ secrets.NEWAPI_MODEL }}
+      NEWAPI_TOPUP_URL: ${{ secrets.NEWAPI_TOPUP_URL }}
+    defaults:
+      run:
+        working-directory: open-code
+    steps:
+      # [monorepo] submodules: false —— 不能用 recursive（会白拉 cc-switch/upstream 77M）。
+      # 本 job 两个都要：opencode 是构建主体，infinite-canvas 的画布产物内嵌进 desktop
+      # （build-canvas.ts 以 VITE_BASE=/canvas/ 构建后拷进 out/renderer/canvas/）。
+      - name: Checkout（不带 submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # 不加 --depth=1：下面「校验 submodule gitlink 与 BASE_SHA 一致」要 rev-parse HEAD，
+      # 且补丁 strict apply 需要完整工作树。
+      - name: 初始化 open-code/{opencode,infinite-canvas} submodule
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init open-code/opencode open-code/infinite-canvas
+          echo "opencode：$(git -C open-code/opencode rev-parse --short HEAD)"
+          echo "canvas：$(git -C open-code/infinite-canvas rev-parse --short HEAD)"
+
+      - name: 屏蔽渠道敏感值（::add-mask::）
+        shell: bash
+        run: |
+          mask() { [ -n "$1" ] && echo "::add-mask::$1" || true; }
+          mask "$NEWAPI_BASE_URL"
+          mask "$NEWAPI_API_KEY"
+          mask "$NEWAPI_MODEL"
+          mask "$NEWAPI_TOPUP_URL"
+
+      - name: 校验 submodule gitlink 与 BASE_SHA 一致
+        shell: bash
+        run: |
+          set -euo pipefail
+          # [dokng] 关键不变式：release 构建 checkout 的是父仓库 gitlink 记录的 submodule commit，
+          # 而补丁是针对 BASE_SHA 验证的。二者必须一致，否则会在「未经补丁验证的 commit」上出包
+          # （gitlink 与 BASE_SHA 漂移的成因：手工提交失误、只改 BASE_SHA 没更 gitlink、rebase 解错）。
+          # 升级正常路径会原子更新三者保持一致；此处硬校验兜底，不一致即中断发布。
+          check_pin() {
+            local name="$1" dir="$2" file="$3" head base
+            head="$(git -C "$dir" rev-parse HEAD)"
+            base="$(tr -d '[:space:]' < "$file")"
+            if [ "$head" != "$base" ]; then
+              echo "::error::$name gitlink ($head) 与 $file ($base) 不一致——拒绝在未验证基线上出包。" >&2
+              exit 1
+            fi
+            echo "$name gitlink == ${file}：$head"
+          }
+          check_pin opencode opencode brand/BASE_SHA
+          check_pin infinite-canvas infinite-canvas brand/CANVAS_BASE_SHA
+
+      - name: 预检补丁语法与清单
+        shell: bash
+        run: |
+          # 不创建 worktree、不修改 submodule：先拦截 corrupt patch / CRLF / manifest 漂移，
+          # 避免矩阵构建在落地前序补丁后才于后序 patch 失败。
+          scripts/apply-patches.sh --preflight
+          scripts/apply-canvas-patches.sh --preflight
+
+      - name: 重放 brand 补丁到 opencode/
+        shell: bash
+        run: |
+          # 单一来源：调用 scripts/apply-patches.sh（apply 模式 = strict git apply，
+          # 按 NN 序累积落地到 opencode/ 工作区）。补丁重放逻辑只此一份，
+          # 升级 job 与本地维护者共用同脚本，避免多处内联漂移。
+          scripts/apply-patches.sh
+
+      - name: 重放画布补丁到 infinite-canvas/
+        shell: bash
+        run: |
+          # [dokng] 画布（第二上游）补丁重放：给 infinite-canvas/ 工作区落地 basename /
+          # postMessage 注入 / persist 不落盘（brand/canvas-patches/）。desktop 构建时 prebuild
+          # 的 build-canvas.ts 会以 VITE_BASE=/canvas/ 构建画布、拷进 out/renderer/canvas/；
+          # 若此步不跑，正式包内嵌的画布是未打补丁版（iframe 404 + 收不到宿主 key）。
+          scripts/apply-canvas-patches.sh
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
+          bun-version-file: open-code/opencode/package.json
+
+      - name: 安装 rpm 工具（linux，deb/rpm 依赖，出 AppImage 亦更稳）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+
+      - name: 安装依赖
+        working-directory: ${{ github.workspace }}/open-code/opencode
+        shell: bash
+        run: |
+          # Windows 上用 hoisted linker（对齐上游 setup-bun action 的 workaround）。
+          install_flags=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            install_flags="--linker hoisted"
+          fi
+          # [dokng] bun install 加重试：npm registry 偶发单包 tarball 下载失败（CI 曾遇
+          # @esbuild/darwin-x64 这类平台可选依赖抽风），一次失败即中断整个发布。重试 3 次、
+          # 间隔递增（15s/30s）消除瞬时网络抖动；三次仍失败才真正报错。
+          for attempt in 1 2 3; do
+            bun install $install_flags && break
+            if [ "$attempt" = 3 ]; then
+              echo "bun install 连续 3 次失败，放弃。" >&2
+              exit 1
+            fi
+            echo "bun install 第 $attempt 次失败，$((attempt * 15))s 后重试…" >&2
+            sleep $((attempt * 15))
+          done
+
+      - name: 注入 dokng 版本号到 package.json
+        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
+        shell: bash
+        run: |
+          # electron-builder 用 package.json 的 version 作为产物版本，并写进 latest*.yml。
+          # 硬编码的 1.17.15 会让所有产物版本一致、自更新永远「已是最新」。故用 detect 算出的
+          # dokng 版本号覆盖（剥掉前导 v，semver version 不能带 v）。npm 随 npx 可用。
+          VER="${{ needs.detect.outputs.version }}"
+          npm pkg set version="${VER#v}"
+          echo "package.json version = $(npm pkg get version)"
+
+      - name: 构建 desktop（bun run build）
+        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+          OPENCODE_VERSION: ${{ needs.detect.outputs.version }}
+        run: bun run build
+
+      - name: 打包（electron-builder + brand 配置）
+        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          # 用品牌覆盖配置出包。--publish never：只出产物，发布交给 release job。
+          # 配置路径相对 desktop 目录回溯到仓库根的 brand/。
+          npx electron-builder ${{ matrix.platform_flag }} ${{ matrix.arch_flag }} --publish never \
+            --config ../../../brand/electron-builder.brand.ts
+
+      # [dokng] 产物交接改走 R2 暂存区，不再用 artifact。
+      #
+      # 背景：仓库转私有后 artifact 计入账号级存储配额（Free 500MB），本产品单次 run 的
+      # 4 平台产物约 900MB，一次发布就撑爆，之后所有 upload-artifact 硬失败 → 发布链路断死。
+      # 而 R2 是唯一自更新源，产物终点本来就是 R2，artifact 只是「跨 job 搬运」的中转。
+      # 故直接传到 R2 暂存区 _staging/open-code/<run_id>/，release job 从那里取回，彻底绕开配额。
+      #
+      # 暂存区前缀必须在 open-code/ 之外：release job 末尾的清理步骤会列举 open-code/ 下
+      # 全部对象并按版本 token 判定去留，暂存对象混在里面会被当作垃圾删除，且会干扰
+      # token 抽取。放 _staging/ 与正式布局完全隔离，由 release job 收尾时显式删除。
+      #
+      # _staging 下再分一层产品名：该 R2 桶由 open-code 与 cc-switch 共用，两个产品各自
+      # 回收陈旧暂存对象。不隔离的话，一方的回收会扫到另一方正在用的前缀（run_id 是各仓库
+      # 独立的计数器，也不保证跨仓库唯一）。
+      #
+      # 无 R2 凭据时回退到 artifact（保持原有渐进启用语义：R2 未配置不致整条流水线失败）。
+      - name: 上传安装包产物到 R2 暂存区
+        if: env.R2_ACCESS_KEY_ID != ''
+        shell: bash
+        # [monorepo] 本步显式回到 workspace 根：它消费 matrix.artifact_glob，而该值必须与
+        # uses: 型 upload-artifact 回退分支共用同一基准（workspace 根）。见 matrix 处注释。
+        working-directory: ${{ github.workspace }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          META_SUBDIR: ${{ matrix.meta_subdir }}
+          # 多行 glob（mac 平台为 *.dmg 与 *.zip 两行）经 env 传入，避免在脚本里内联展开。
+          ARTIFACT_GLOB: ${{ matrix.artifact_glob }}
+          # [dokng] Windows runner 上 shell: bash 是 Git Bash（MSYS2）：调用原生 Windows 程序
+          # 时，凡「看起来像 Unix 路径」的参数都会被自动改写成 Windows 形式。aws 是原生 exe，
+          # s3://bucket/key 与 https://... 都可能被误判（MSYS2 文档明确说该启发式会把非路径
+          # 当路径转换），一旦 s3:// 后的 /key 段被改写，对象就传到错误的 key 上或直接报错。
+          # 故按前缀定向排除这两类参数；不用 "*" 全局关闭，因为本步还传 /tmp/stage-* 这类
+          # 本地绝对路径，那些仍需要正常转换。此变量在 Linux/macOS 上无副作用，四平台共用。
+          MSYS2_ARG_CONV_EXCL: "s3://;https://"
+        run: |
+          set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          stage="s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}"
+          # [monorepo] 本步工作目录是 workspace 根（见上），故 dist 带 open-code/ 前缀。
+          dist="open-code/opencode/packages/desktop/dist"
+
+          # 安装包：按 artifact_name 分目录，等价于原先各平台独立 artifact（避免同名互相覆盖）。
+          # if-no-files-found: error 的等价物——数一遍，没有就硬失败。
+          mkdir -p /tmp/stage-pkg
+          # ARTIFACT_GLOB 是多行 glob（mac 平台两行：*.dmg 与 *.zip），逐行展开。
+          # 经 env 传入而非在此内联表达式：多行值内联会破坏脚本缩进与 heredoc 语义。
+          while IFS= read -r pat; do
+            [ -n "$pat" ] || continue
+            for f in $pat; do [ -f "$f" ] && cp -f "$f" /tmp/stage-pkg/ || true; done
+          done <<< "$ARTIFACT_GLOB"
+          n_pkg=$(find /tmp/stage-pkg -type f | wc -l | tr -d ' ')
+          if [ "$n_pkg" -eq 0 ]; then
+            echo "::error::未找到安装包产物（glob 未命中），拒绝继续" >&2; exit 1
+          fi
+          echo "安装包 ${n_pkg} 个 → ${stage}/pkg/${ARTIFACT_NAME}/"
+          ls -la /tmp/stage-pkg
+          aws s3 cp /tmp/stage-pkg/ "${stage}/pkg/${ARTIFACT_NAME}/" \
+            --recursive --endpoint-url "$endpoint" --checksum-algorithm CRC32 --only-show-errors
+
+          # 元数据（latest*.yml + blockmap）：按 meta_subdir 分目录，对齐
+          # finalize-latest-yml.ts 期望的目录名（它按架构子目录读取并合并 mac 双架构）。
+          mkdir -p /tmp/stage-meta
+          for f in "$dist"/*.yml "$dist"/*.blockmap; do
+            [ -f "$f" ] && cp -f "$f" /tmp/stage-meta/ || true
+          done
+          # 原 upload 步骤 if-no-files-found: error 的语义：yml 与 blockmap 皆无才算失败
+          # （个别平台缺 blockmap 是正常的，缺 yml 则该平台发不出更新）。
+          n_meta=$(find /tmp/stage-meta -type f | wc -l | tr -d ' ')
+          if [ "$n_meta" -eq 0 ]; then
+            echo "::error::未找到更新元数据（*.yml / *.blockmap 皆无），拒绝继续" >&2; exit 1
+          fi
+          echo "元数据 ${n_meta} 个 → ${stage}/meta/${META_SUBDIR}/"
+          ls -la /tmp/stage-meta
+          aws s3 cp /tmp/stage-meta/ "${stage}/meta/${META_SUBDIR}/" \
+            --recursive --endpoint-url "$endpoint" --checksum-algorithm CRC32 --only-show-errors
+
+      # 回退路径：未配置 R2 时仍用 artifact（retention-days: 1 压到最小，避免撑爆配额）。
+      - name: 上传安装包产物（artifact 回退，无 R2 凭据时）
+        if: env.R2_ACCESS_KEY_ID == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 1
+
+      # [cx] 上传自更新元数据（latest*.yml + blockmap），按架构分子目录命名，供 release job
+      # 合并（finalize-latest-yml.ts 按 meta_subdir 名读取，合并 mac 双架构 latest-mac.yml）。
+      # 不 merge——各架构独立 artifact，避免同名 latest-mac.yml 互相覆盖。
+      #
+      # [dokng] 仅在无 R2 凭据时启用（有凭据时元数据已随上一步进 R2 暂存区）。
+      #
+      # [dokng] if-no-files-found: error（原为 warn）：yml 是自更新的唯一入口，缺了它这个平台
+      # 就发不出更新，却又不会让构建失败 → release job 照常跑、R2 上传循环静默跳过该 yml，
+      # 根下那份停留在上一版、指向上一版子目录，而其余平台已切新版（错位状态，需靠清理步骤
+      # 的在役版本保护兜底才不至于 404）。改 error 让缺失在源头暴露：矩阵分支失败 → release
+      # 因 needs 未满足而 skip → R2 完全不动，线上保持上一个自洽版本。
+      # glob 同时匹配 *.yml 与 *.blockmap，故仅在两者皆无（即打包真的没出元数据）时才失败；
+      # 个别平台缺 blockmap（差量更新载体）不受影响。
+      - name: 上传更新元数据（artifact 回退，无 R2 凭据时）
+        if: env.R2_ACCESS_KEY_ID == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.meta_subdir }}
+          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
+          path: |
+            open-code/opencode/packages/desktop/dist/*.yml
+            open-code/opencode/packages/desktop/dist/*.blockmap
+          if-no-files-found: error
+          # 同上：仅供 release job 合并后写入 R2，run 结束即无用。
+          retention-days: 1
+
+  # ── release：汇总产物，合并 latest*.yml，上传 R2 ────────────────
+  release:
+    needs:
+      - detect
+      - package
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # [dokng] 提到 job 级：产物取回步骤用 if: env.R2_ACCESS_KEY_ID 在 R2 直传与 artifact
+      # 回退之间二选一。step 级 env 对同一 step 的 if 不可见（if 在 step env 求值前判定），
+      # uses: 型步骤更没有 env 块可写，故必须在 job 级声明。
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+    defaults:
+      run:
+        working-directory: open-code
+    steps:
+      # [monorepo] submodules: false —— 本 job 只需要 opencode（跑它里面的
+      # finalize-latest-yml.ts + 读 package.json 定 bun 版本），不需要画布与 cc-switch/upstream。
+      - name: Checkout（不带 submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: 初始化 open-code/opencode submodule（需 finalize-latest-yml.ts）
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git submodule update --init open-code/opencode
+          echo "opencode：$(git -C open-code/opencode rev-parse --short HEAD)"
+
+      - name: 安装 Bun（跑 finalize-latest-yml.ts）
+        uses: oven-sh/setup-bun@v2
+        with:
+          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
+          bun-version-file: open-code/opencode/package.json
+
+      # [dokng] 从 R2 暂存区取回产物（对应 package job 的直传）。
+      # 目录形状必须与原 download-artifact 完全一致，否则下游步骤全部错位：
+      #   /tmp/artifacts/         ← 安装包平铺（原 merge-multiple: true 的效果）
+      #   /tmp/latest-yml/<arch>/ ← 元数据按架构分子目录（finalize-latest-yml.ts 按名读取）
+      - name: 从 R2 暂存区取回产物
+        if: env.R2_ACCESS_KEY_ID != ''
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          stage="s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}"
+
+          # 安装包：各平台子目录 → 平铺到 /tmp/artifacts（等价 merge-multiple: true）。
+          mkdir -p /tmp/artifacts /tmp/stage-in/pkg
+          aws s3 cp "${stage}/pkg/" /tmp/stage-in/pkg/ \
+            --recursive --endpoint-url "$endpoint" --only-show-errors
+          find /tmp/stage-in/pkg -type f -exec cp -f {} /tmp/artifacts/ \;
+
+          # 元数据：保持 <arch>/ 分层（finalize-latest-yml.ts 依赖这个形状）。
+          mkdir -p /tmp/latest-yml
+          aws s3 cp "${stage}/meta/" /tmp/latest-yml/ \
+            --recursive --endpoint-url "$endpoint" --only-show-errors
+
+          # 取回即校验：暂存区为空说明 package job 的直传没生效（而它本该硬失败），
+          # 此时继续跑会用空目录去发布 → R2 闸门误判、客户端拿到空更新源。就地失败更安全。
+          n_pkg=$(find /tmp/artifacts -type f | wc -l | tr -d ' ')
+          n_meta=$(find /tmp/latest-yml -type f -name '*.yml' | wc -l | tr -d ' ')
+          echo "取回安装包 ${n_pkg} 个、元数据 yml ${n_meta} 个"
+          if [ "$n_pkg" -eq 0 ] || [ "$n_meta" -eq 0 ]; then
+            echo "::error::R2 暂存区 ${stage} 内容不完整（安装包 ${n_pkg} / yml ${n_meta}）" >&2
+            exit 1
+          fi
+
+      # 回退路径：未配置 R2 时仍从 artifact 取（与 package job 的回退分支配对）。
+      - name: 下载安装包产物（artifact 回退，无 R2 凭据时）
+        if: env.R2_ACCESS_KEY_ID == ''
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          pattern: dokng-*
+          merge-multiple: true
+
+      - name: 下载更新元数据（artifact 回退，无 R2 凭据时）
+        if: env.R2_ACCESS_KEY_ID == ''
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/latest-yml
+          pattern: latest-yml-*
+
+      - name: 列出待发布产物
+        run: |
+          echo "安装包产物："; ls -la /tmp/artifacts || true
+          echo "更新元数据目录："; ls -R /tmp/latest-yml || true
+
+      # [monorepo] 原「创建 / 更新 GitHub Release」步骤已删除（本仓只留 tag，不发 Release）。
+      # 但它顺带做的一件事必须保留：把 blockmap 从元数据目录并入 /tmp/artifacts —— 下游 R2
+      # 步骤正是从 /tmp/artifacts 取安装包上传到 open-code/<version>/，漏了它 electron-updater
+      # 就没有差量更新载体（退化为全量下载，不阻断但白丢能力）。
+      - name: 合并 blockmap 到产物目录（供 R2 上传）
+        run: |
+          # blockmap 供 electron-updater 差量更新；缺失则全量下载，非阻断。
+          find /tmp/latest-yml -name '*.blockmap' -exec cp {} /tmp/artifacts/ \; 2>/dev/null || true
+          echo "产物目录当前内容："; ls -la /tmp/artifacts
+
+      - name: 合并更新元数据 latest*.yml
+        env:
+          LATEST_YML_DIR: /tmp/latest-yml
+          # GH_REPO 仍必须非空：finalize-latest-yml.ts 开头硬校验（缺则 throw）。它只被下面
+          # 那个被 shim 吞掉的 gh 调用使用，值本身已无实际作用。
+          GH_REPO: ${{ github.repository }}
+          OPENCODE_VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          # finalize-latest-yml.ts：把 mac 双架构 latest-mac.yml 合并成单个（含两架构 files），
+          # win/linux 透传，写到 ${RUNNER_TEMP}（供下一步 R2 上传取用）。
+          #
+          # [monorepo] gh no-op shim：该脚本是上游原文件（brand/patches.manifest 明确记录不打
+          # 补丁），它在写盘之后还会 `gh release upload` 传到 Release。本仓不发 Release，这个
+          # 调用必然失败并让整步非 0 退出。关键在于脚本的执行顺序是「先 Bun.write 落盘、再调
+          # gh」（源码 119→120 行），故只要让 gh 恒成功即可保住落盘产物，无需改上游源码。
+          # shim 只 export 进本步的 PATH（不写 GITHUB_PATH），不影响其它步骤。
+          shim="$RUNNER_TEMP/gh-shim"
+          mkdir -p "$shim"
+          cat > "$shim/gh" <<'SH'
+          #!/usr/bin/env bash
+          echo "[gh no-op shim] 本仓不发 GitHub Release，已忽略：gh $*" >&2
+          exit 0
+          SH
+          chmod +x "$shim/gh"
+          export PATH="$shim:$PATH"
+          # OPENCODE_VERSION 需不带 v；detect 输出带 v，这里剥掉。
+          export OPENCODE_VERSION="${OPENCODE_VERSION#v}"
+          bun opencode/packages/desktop/scripts/finalize-latest-yml.ts
+          echo "合并后的 yml（供 R2 上传）："; ls -la "$RUNNER_TEMP"/latest*.yml || true
+
+      # [cx] R2 上传：安装包 + blockmap 推到 open-code/<version>/，合并后的 latest*.yml 推到
+      # open-code/ 根 —— [monorepo] 本仓不发 Release，R2 是 electron-updater 的唯一更新源。
+      # 布局与 cc-switch 同构（元数据在产品根固定 URL，安装包下沉版本子目录）。
+      # 守卫：未配置 R2 Secret 时整步跳过，不致整条流水线失败（渐进启用；产物仍在 artifact 里）。
+      # 用 aws s3 CLI（ubuntu runner 自带，R2 兼容 S3 API），endpoint 指向 R2。
+      - name: 上传产物到 Cloudflare R2（open-code/ 目录）
+        if: env.R2_ACCESS_KEY_ID != ''
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          # aws CLI 走 R2 的 S3 兼容凭据（与 R2_* 同源，避免污染其他步骤的 AWS 环境）。
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          RUNNER_TEMP: ${{ runner.temp }}
+          OPENCODE_VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 敏感值登记日志掩码，防误打印。
+          for v in "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # 版本子目录名：去掉 v 前缀的完整版本号，形如 1.17.15-dokng.3（与安装包文件名内的
+          # 版本 token、finalize-latest-yml.ts 写进 yml 的 url 前缀一致）。
+          VERSION="${OPENCODE_VERSION#v}"
+
+          # [dokng] R2 布局（与 cc-switch 同构）：
+          #   open-code/                       ← 产品根，updater 固定 URL 轮询
+          #     ├── latest*.yml                ← 更新元数据，每版覆盖 → 禁缓存
+          #     └── <version>/                 ← 安装包 + blockmap，URL 每版唯一 → immutable 长缓存
+          #         └── *.exe / *.dmg / *.zip / *.AppImage / *.blockmap
+          # 两类内容分开上传，套不同 cache-control。
+
+          # staging-pkg：安装包 + blockmap（release 步骤已 cp 到 /tmp/artifacts）→ 版本子目录。
+          mkdir -p /tmp/r2-pkg
+          cp -f /tmp/artifacts/* /tmp/r2-pkg/ 2>/dev/null || true
+          # staging-meta：合并后的 latest*.yml（finalize 步骤写到 ${RUNNER_TEMP}），确保是含双架构
+          # files 的合并单文件，而非各架构分片 → 产品根。
+          # [dokng] url 版本前缀改写（关键）：yml 里的 url 是 electron-builder 生成的裸文件名
+          #   （如 dokng-mac-arm64.dmg），而 R2 把安装包下沉到 open-code/<version>/ 子目录；客户端
+          #   与下载页按「baseUrl + url」拼地址，裸名会漏掉 <version>/ 这层 → 404。故给每个 url 补
+          #   <version>/ 前缀，让 electron-updater 自更新与下载页 DL_BASE 都指向
+          #   open-code/<version>/<file>。
+          # [monorepo] 改写只作用于 /tmp/r2-meta 这份副本，不动 $RUNNER_TEMP 原文，也不改上游
+          #   finalize-latest-yml.ts（它是未打补丁的上游文件，裸名是它的既定行为）。
+          mkdir -p /tmp/r2-meta
+          for y in latest.yml latest-mac.yml latest-linux.yml latest-linux-arm64.yml; do
+            [ -f "$RUNNER_TEMP/$y" ] || continue
+            # 仅改写尚无版本前缀的裸 url（幂等）：形如 "  - url: <file>" → "  - url: <version>/<file>"。
+            sed -E "s#^  - url: (${VERSION}/)?(.+)\$#  - url: ${VERSION}/\2#" \
+              "$RUNNER_TEMP/$y" > "/tmp/r2-meta/$y"
+          done
+
+          echo "待上传到 R2 open-code/${VERSION}/ 的安装包："; ls -la /tmp/r2-pkg
+          echo "待上传到 R2 open-code/ 的元数据："; ls -la /tmp/r2-meta
+
+          # --checksum-algorithm CRC32：规避 R2 对 S3 默认分块校验（CRC64NVME）的兼容问题。
+          # 安装包/blockmap 文件名带版本号（URL 每版唯一）→ 长缓存 immutable，CDN 尽量命中。
+          aws s3 cp /tmp/r2-pkg/ "s3://${R2_BUCKET}/open-code/${VERSION}/" \
+            --recursive \
+            --endpoint-url "$endpoint" \
+            --checksum-algorithm CRC32 \
+            --cache-control "public,max-age=31536000,immutable"
+
+          # [dokng] 发布闸门：latest*.yml 必须最后写，且只在它引用的安装包全部确认落盘后才写。
+          # yml 一生效，electron-updater 与下载页立刻按其中的 url 取包；若某个安装包漏传或半途
+          # 失败，就会出现「有新版本号、但下载 404」。这里把每个 yml 里的 url（已补 <version>/
+          # 前缀）还原成 R2 object key 逐个 head-object 复核（要求存在且字节数 > 0），任一缺失
+          # 即整步失败退出——此时根下 yml 尚未更新，线上仍是上一个完整可下载的版本。
+          # 注：.blockmap 不在 yml 的 url 里（updater 按同目录推导），不纳入闸门。
+          mapfile -t want_keys < <(
+            grep -hoE '^  - url: .+$' /tmp/r2-meta/*.yml 2>/dev/null \
+              | sed -E 's#^  - url: #open-code/#' | grep -v '^$' | sort -u
+          )
+          if [ "${#want_keys[@]}" -eq 0 ]; then
+            echo "::error::latest*.yml 未引用任何安装包，拒绝更新元数据"; exit 1
+          fi
+          echo "复核 latest*.yml 引用的安装包是否已落盘 R2："
+          for key in "${want_keys[@]}"; do
+            [ -n "$key" ] || continue
+            size="$(aws s3api head-object --bucket "$R2_BUCKET" --key "$key" \
+              --endpoint-url "$endpoint" --query ContentLength --output text 2>/dev/null || true)"
+            if ! printf '%s' "$size" | grep -qE '^[1-9][0-9]*$'; then
+              echo "::error::R2 缺少安装包 $key（latest*.yml 未更新，线上仍为上一版本）"; exit 1
+            fi
+            echo "  ✓ $key（${size} 字节）"
+          done
+
+          # latest*.yml 是固定 URL、每版覆盖 → 必须禁缓存，否则 Cloudflare CDN 会缓存住旧 yml，
+          # 客户端拉不到新版本、自更新延迟数小时。逐个上传并显式 text/yaml + no-cache。
+          for y in /tmp/r2-meta/*; do
+            [ -f "$y" ] || continue
+            aws s3 cp "$y" "s3://${R2_BUCKET}/open-code/$(basename "$y")" \
+              --endpoint-url "$endpoint" \
+              --checksum-algorithm CRC32 \
+              --content-type "text/yaml" \
+              --cache-control "no-cache,max-age=0,must-revalidate"
+          done
+          echo "R2 上传完成：s3://${R2_BUCKET}/open-code/（latest*.yml 禁缓存，安装包 immutable）"
+
+          # [dokng] 只保留最新 1 个版本：安装包按 open-code/<version>/ 分目录存放，key 形如
+          # open-code/1.17.15-dokng.N/xxx。做法：列出 open-code/ 下全部对象 → 抽版本 token →
+          # sort -V 取最新 1 个为保留集 → 逐 key 精确比对（grep -qxF 整行匹配，避免 dokng.2
+          # 误伤 dokng.20），版本不在保留集的对象删除；无版本 token 的对象（根下 latest*.yml）永远保留。
+          # 保留 1 个的前提是本步已过发布闸门（当前版本必然完整落盘），故清理只会命中历史版本。
+          # [monorepo] 代价是放弃旧版回退能力：本仓不发 Release，R2 是唯一源，旧版删掉即不可取回。
+          # 需要保留回退能力时把 KEEP_VERSIONS 调大即可（保留集算法本身支持任意 N）。
+          #
+          # 版本 token 正则不带 v? 前缀（与 cc-switch 一致，勿加）：加了会让内嵌 v 前缀的 key
+          # 抽出两个 token，keep 集被带 v 的假 token 占满，逐 key 比对时全部落空 → 连当前版本
+          # 一起删光。open-code 的安装包名本身不含版本号（dokng-win-x64.exe），token 只来自
+          # 目录名，但正则形态仍与 cc-switch 保持同构。
+          #
+          # 清理放在 latest*.yml 写入之后：先让新版本元数据生效，再删旧包，避免清理失败
+          # （权限/网络）时把已经完成的发布一起中断。
+          KEEP_VERSIONS=1
+          mapfile -t all_keys < <(
+            aws s3 ls "s3://${R2_BUCKET}/open-code/" --recursive --endpoint-url "$endpoint" \
+              | awk '{print $4}' | grep -v '^$' || true
+          )
+          if [ "${#all_keys[@]}" -gt 0 ]; then
+            versions="$(printf '%s\n' "${all_keys[@]}" \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-dokng\.[0-9]+' | sort -V -u || true)"
+            total="$(printf '%s\n' "$versions" | grep -c . || true)"
+            keep="$(printf '%s\n' "$versions" | tail -n "$KEEP_VERSIONS")"
+
+            # [dokng] 在役版本保护（关键，KEEP_VERSIONS=1 下必须）：本产品有 4 个各自独立的
+            # latest*.yml，且 build 矩阵 fail-fast: false。若某平台构建失败，它的 yml 不在
+            # /tmp/r2-meta 里、上面的上传循环会跳过 → 根下那份 yml 仍是上一版内容、url 指向
+            # 上一版的子目录，而其余平台已切到新版。此时若只按「最新 1 个」清理，就会删掉那份
+            # 旧 yml 正在引用的包 → 该平台用户看到新版本号却 404，正是要避免的状态。
+            # 故保留集 = 最新 N 个 ∪ 根下所有 latest*.yml 实际引用的版本。读的是 R2 上刚生效的
+            # 那份（而非本地副本），因此跳过上传的旧 yml 也能被正确识别。
+            served=""
+            for y in latest.yml latest-mac.yml latest-linux.yml latest-linux-arm64.yml; do
+              body="$(aws s3 cp "s3://${R2_BUCKET}/open-code/$y" - \
+                --endpoint-url "$endpoint" 2>/dev/null || true)"
+              [ -n "$body" ] || continue
+              v_in_yml="$(printf '%s' "$body" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-dokng\.[0-9]+' | sort -u || true)"
+              [ -n "$v_in_yml" ] && served="${served}${v_in_yml}"$'\n'
+            done
+            served="$(printf '%s' "$served" | grep -v '^$' | sort -V -u || true)"
+            if [ -n "$served" ]; then
+              echo "根下 latest*.yml 仍在引用的版本（一并保留）："
+              printf '  served: %s\n' $served
+              keep="$(printf '%s\n%s\n' "$keep" "$served" | grep -v '^$' | sort -V -u)"
+            fi
+
+            echo "R2 现有版本共 ${total} 个，保留集："
+            printf '  keep: %s\n' $keep
+            # 兜底：当前发布版本必须在保留集内，否则说明 token 抽取出了偏差 → 跳过清理，
+            # 宁可留下垃圾对象，也不能删掉正在服务的版本。
+            if ! printf '%s\n' "$keep" | grep -qxF "$VERSION"; then
+              echo "::warning::当前版本 ${VERSION} 不在保留集内，跳过清理（疑似版本 token 抽取异常）"
+              exit 0
+            fi
+            if [ "${total:-0}" -gt "$KEEP_VERSIONS" ]; then
+              for key in "${all_keys[@]}"; do
+                v="$(printf '%s' "$key" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-dokng\.[0-9]+' | head -1 || true)"
+                # 无版本 token（根下 latest*.yml 等）→ 永远保留。
+                [ -n "$v" ] || continue
+                if ! printf '%s\n' "$keep" | grep -qxF "$v"; then
+                  echo "  清理旧版本对象：$key"
+                  aws s3 rm "s3://${R2_BUCKET}/${key}" --endpoint-url "$endpoint" || true
+                fi
+              done
+            else
+              echo "版本数未超过保留上限，无需清理。"
+            fi
+          fi
+          echo "R2 版本清理完成。"
+
+      # [dokng] 清理本次 run 的 R2 暂存区。
+      # 刻意不加 if: always()：本步只在上面的上传与闸门全部走完后才执行。若 release job 中途
+      # 失败，暂存区必须原地留着——重跑 job 时「从 R2 暂存区取回产物」还能拿到同一批安装包，
+      # 无需重跑耗时的 package 矩阵（artifact 时代靠 retention 提供的正是这个能力）。
+      # 顺带扫掉 3 天前的陈旧暂存前缀：失败后再也没重跑的 run 会把对象永久留在桶里，
+      # 这里做一次有界的兜底回收（删除失败一律不阻断发布，故全部 || true）。
+      - name: 清理 R2 暂存区
+        if: env.R2_ACCESS_KEY_ID != ''
+        shell: bash
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          echo "删除本次 run 的暂存区：_staging/open-code/${GITHUB_RUN_ID}/"
+          aws s3 rm "s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}/" \
+            --recursive --endpoint-url "$endpoint" --only-show-errors || true
+
+          # 陈旧暂存回收：按对象 LastModified 判龄（aws s3 ls --recursive 输出 "日期 时间 大小 key"），
+          # 日期是 YYYY-MM-DD，可直接字符串比较。只删早于 cutoff 的对象，不碰当天/近两天的
+          # ——并发的其他 run 可能正在往自己的前缀里写。
+          cutoff="$(date -u -d '3 days ago' +%Y-%m-%d)"
+          echo "回收 ${cutoff} 之前的陈旧暂存对象："
+          stale=0
+          while read -r d _t _s key; do
+            [ -n "${key:-}" ] || continue
+            [[ "$d" < "$cutoff" ]] || continue
+            echo "  清理陈旧暂存：$key"
+            aws s3 rm "s3://${R2_BUCKET}/${key}" --endpoint-url "$endpoint" --only-show-errors || true
+            stale=$((stale + 1))
+          done < <(aws s3 ls "s3://${R2_BUCKET}/_staging/open-code/" --recursive --endpoint-url "$endpoint" 2>/dev/null || true)
+          echo "暂存区清理完成（陈旧对象 ${stale} 个）。"

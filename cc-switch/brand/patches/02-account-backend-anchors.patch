@@ -1,0 +1,139 @@
+# 02-account-backend-anchors —— new-api 账户后端的最小锚点
+#
+# 职责：仅保留把 brand/overlay/src-tauri/src/ 下的账户相关新文件接入上游所需的锚点改动。
+#       新文件本体（services/account.rs、commands/account.rs、deeplink_account.rs）全部
+#       由 apply-patches.sh 的 overlay 步骤复制进 upstream/，不进补丁。
+#
+# 覆盖文件（均为已存在上游文件的最小插行）：
+#   - src-tauri/src/commands/mod.rs：mod account; + pub use account::*;
+#   - src-tauri/src/services/mod.rs：pub mod account;
+#   - src-tauri/src/lib.rs（5 处）：
+#       1) mod deeplink_account;（模块声明）
+#       2) handle_deeplink_url 开头拦截 resource=account
+#       3) setup 内 drain_launch_deeplinks（冷启动补扫，见下）
+#       4) invoke_handler 注册 commands::get_account_profile /
+#          commands::get_account_models，以及 deeplink_account::take_pending_account_import
+#          （后者定义在 deeplink_account.rs 内，不经 commands 重导出，故走模块路径）
+#       5) macOS RunEvent::Opened 分支拦截（该平台独立解析一次）
+#
+# 为什么深链接要拦在上游解析之前：上游 parse_deeplink_url 的 resource 白名单只有
+#   provider/prompt/mcp/skill，account 会被判为「不支持的资源类型」，走 emit("deeplink-error")
+#   弹一条解析失败 toast。更要紧的是该错误事件的 payload 带的是**未脱敏的完整 URL**，
+#   前端 console.error 会把 apiKey 打进 devtools。拦在最前面则上游链路完全不感知，
+#   其它 resource 行为零变化——代价是必须覆盖两个入口（非 macOS 走 handle_deeplink_url，
+#   macOS 另有 RunEvent::Opened 独立解析一次）。
+#
+# 为什么需要冷启动补扫（锚点 3）：Windows/Linux 冷启动时 OS 把 URL 作为 argv 交给新进程，
+#   deep-link 插件在自己的 init 阶段就 emit 掉了（那时 on_open_url 尚未注册、webview 不
+#   存在），而 single_instance 回调只对第 2+ 个实例触发、上游也从不调 get_current——
+#   那条 URL 事实上无人接手。「应用没开着时点导入按钮」恰是本功能最典型的场景，不补这一
+#   下就是 100% 失效。补扫命中即写入模块内的 pending slot，前端挂载后主动领取。
+#
+# scheme 复用上游已注册的 ccswitch://：tauri.conf.json 由 updater 注入步骤接管（属补丁
+#   保留路径），且新增 scheme 要在三平台各自登记，收益为零。
+#
+# 依赖：overlay 提供的 account.rs ×2 + deeplink_account.rs（apply-patches.sh 保证补丁后
+#       执行 overlay 复制，编译期三者必须同时在场）。接口契约（/api/app/profile、
+#       /v1/models、Bearer 鉴权、错误语义）见 overlay 的 services/account.rs 头注释；
+#       深链接契约（参数、前端事件名、pending/去重机制）见 deeplink_account.rs 头注释。
+# 脆弱点：lib.rs 的 invoke_handler 列表为上游高频区，上下文漂移时先看该 hunk。
+# 应用（在 upstream/ 内，基线为 brand/BASE_SHA）：
+#   git -C upstream apply brand/patches/02-account-backend-anchors.patch
+diff --git a/src-tauri/src/commands/mod.rs b/src-tauri/src/commands/mod.rs
+index 08e27091..d9b13aea 100644
+--- a/src-tauri/src/commands/mod.rs
++++ b/src-tauri/src/commands/mod.rs
+@@ -1,5 +1,6 @@
+ #![allow(non_snake_case)]
+ 
++mod account;
+ mod auth;
+ mod balance;
+ mod codex_oauth;
+@@ -36,6 +37,7 @@ mod usage;
+ mod webdav_sync;
+ mod workspace;
+ 
++pub use account::*;
+ pub use auth::*;
+ pub use balance::*;
+ pub use codex_oauth::*;
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 1e6cd62f..39a9a7c1 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -11,6 +11,8 @@ mod commands;
+ mod config;
+ mod database;
+ mod deeplink;
++// [ccs] Dokng 账户导入深链接（resource=account）；实现见 overlay 的 deeplink_account.rs。
++mod deeplink_account;
+ mod error;
+ mod gemini_config;
+ mod gemini_mcp;
+@@ -233,6 +235,13 @@ fn handle_deeplink_url(
+         return false;
+     }
+ 
++    // [ccs] resource=account 的链接由品牌账户模块接管（发 "ccs-account-import"），
++    // 不进入下面的上游解析——上游 resource 白名单没有 account，会误报解析失败。
++    if crate::deeplink_account::try_handle_account_deeplink(app, url_str, focus_main_window) {
++        log::info!("✓ [ccs] 账户导入深链接已处理（来源 {source}）");
++        return true;
++    }
++
+     log::info!(
+         "✓ Deep link URL detected from {source}: {}",
+         url_for_log(url_str)
+@@ -1030,6 +1039,12 @@ pub fn run() {
+             });
+             log::info!("✓ Deep-link URL handler registered");
+ 
++            // [ccs] 冷启动补扫：Windows/Linux 冷启动时 URL 走 argv，deep-link 插件在自己的
++            // init 阶段就 emit 掉了（那时 on_open_url 尚未注册），而 single_instance 只对
++            // 第 2+ 个实例触发、上游从不调 get_current——那条 URL 无人接手。命中即写入
++            // pending slot，前端挂载后调 take_pending_account_import 领取。
++            crate::deeplink_account::drain_launch_deeplinks(app.handle());
++
+             // 创建动态托盘菜单
+             let menu = tray::create_tray_menu(app.handle(), &app_state)?;
+ 
+@@ -1389,6 +1404,12 @@ pub fn run() {
+             commands::get_xai_oauth_quota,
+             commands::get_coding_plan_quota,
+             commands::get_balance,
++            // [ccs] new-api 账户接口
++            commands::get_account_profile,
++            commands::get_account_models,
++            // [ccs] 深链接导入的 pending 领取（emit 不重放，冷启动/轻量模式唤醒时靠它兜底）。
++            // 实现在 deeplink_account 模块内，不在 commands 下。
++            deeplink_account::take_pending_account_import,
+             // New MCP via config.json (SSOT)
+             commands::get_mcp_config,
+             commands::upsert_mcp_server_in_config,
+@@ -1748,6 +1769,16 @@ pub fn run() {
+                                 }
+                             }
+ 
++                            // [ccs] Dokng 账户导入（resource=account）先行拦截，命中即不走
++                            // 上游解析：上游 resource 白名单不含 account，会误报解析失败。
++                            if crate::deeplink_account::try_handle_account_deeplink(
++                                app_handle,
++                                &url_str,
++                                true,
++                            ) {
++                                return;
++                            }
++
+                             // 解析并广播深链接事件，复用与 single_instance 相同的逻辑
+                             match crate::deeplink::parse_deeplink_url(&url_str) {
+                                 Ok(request) => {
+diff --git a/src-tauri/src/services/mod.rs b/src-tauri/src/services/mod.rs
+index 2fce3bec..b41e4f3a 100644
+--- a/src-tauri/src/services/mod.rs
++++ b/src-tauri/src/services/mod.rs
+@@ -1,3 +1,4 @@
++pub mod account;
+ pub mod balance;
+ pub mod codex_oauth_models;
+ pub mod coding_plan;

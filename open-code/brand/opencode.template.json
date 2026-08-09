@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "newapi/{env:NEWAPI_MODEL}",
+  "provider": {
+    "newapi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "内置渠道",
+      "options": {
+        "baseURL": "{env:NEWAPI_BASE_URL}",
+        "apiKey": "{env:NEWAPI_API_KEY}"
+      },
+      "models": {
+        "{env:NEWAPI_MODEL}": {
+          "name": "内置模型"
+        }
+      }
+    }
+  }
+}

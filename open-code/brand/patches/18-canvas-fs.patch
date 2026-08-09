@@ -1,0 +1,512 @@
+diff --git a/packages/app/src/pages/canvas-embed.tsx b/packages/app/src/pages/canvas-embed.tsx
+index 05f6175b26..567ce6a4a3 100644
+--- a/packages/app/src/pages/canvas-embed.tsx
++++ b/packages/app/src/pages/canvas-embed.tsx
+@@ -46,6 +46,64 @@ const CANVAS_ORIGIN = "oc://renderer"
+ // 画布路由路径：常驻宿主靠它切显隐。
+ const CANVAS_PATH = "/canvas"
+ 
++// [dokng] 画布落盘桥的消息类型（画布侧 lib/host-fs-bridge.ts 与此一一对应）。
++const CANVAS_FS_REQUEST = "dokng:canvas-fs-request"
++const CANVAS_FS_RESPONSE = "dokng:canvas-fs-response"
++
++// [dokng] 画布落盘桥：desktop preload 暴露的 canvas* 子集。
++// app 包不 import desktop 类型（跨包类型缺口，同 cx-account-api 的处理），故本地重声明。
++type CanvasFsApi = {
++  canvasFileWrite: (key: string, base64: string, mime?: string) => Promise<boolean>
++  canvasFileRead: (key: string) => Promise<string | null>
++  canvasFileDelete: (keys: string[]) => Promise<number>
++  canvasFileList: () => Promise<string[]>
++  canvasStateRead: () => Promise<string | null>
++  canvasStateWrite: (json: string) => Promise<boolean>
++}
++
++// 断言访问器：web 等无 preload 的平台返回 undefined，调用方一律可选链兜底。
++function canvasFsApi() {
++  return (window as unknown as { api?: Partial<CanvasFsApi> }).api
++}
++
++// 落盘请求的 op 白名单 → 各自的参数校验与转发。放在宿主而非画布侧：
++// 画布 iframe 是不可信输入源，能触达的 IPC 面必须在这里收敛，不能由消息内容自由指定 channel。
++async function runCanvasFsOp(op: string, args: unknown[]): Promise<unknown> {
++  const api = canvasFsApi()
++  if (!api) throw new Error("unavailable")
++  const str = (v: unknown) => (typeof v === "string" ? v : null)
++  switch (op) {
++    case "fileWrite": {
++      const key = str(args[0])
++      const base64 = str(args[1])
++      const mime = str(args[2]) ?? undefined
++      if (!key || base64 === null) return false
++      return (await api.canvasFileWrite?.(key, base64, mime)) ?? false
++    }
++    case "fileRead": {
++      const key = str(args[0])
++      if (!key) return null
++      return (await api.canvasFileRead?.(key)) ?? null
++    }
++    case "fileDelete": {
++      const keys = Array.isArray(args[0]) ? args[0].filter((k): k is string => typeof k === "string") : []
++      if (keys.length === 0) return 0
++      return (await api.canvasFileDelete?.(keys)) ?? 0
++    }
++    case "fileList":
++      return (await api.canvasFileList?.()) ?? []
++    case "stateRead":
++      return (await api.canvasStateRead?.()) ?? null
++    case "stateWrite": {
++      const json = str(args[0])
++      if (json === null) return false
++      return (await api.canvasStateWrite?.(json)) ?? false
++    }
++    default:
++      throw new Error("unsupported op")
++  }
++}
++
+ export default function CanvasHost() {
+   const platform = usePlatform()
+   const navigate = useNavigate()
+@@ -110,6 +168,8 @@ export default function CanvasHost() {
+     refreshKeys()
+ 
+     // 画布就绪握手：收到 dokng:canvas-ready 才认为可投递（画布 listener 已挂好）。
++    // 同时承载落盘桥：画布 iframe 无 window.api（preload 不进子 frame，未开
++    // nodeIntegrationInSubFrames），故读写磁盘必须 iframe → postMessage → 宿主 → IPC → 主进程。
+     const onMessage = (event: MessageEvent) => {
+       if (event.origin !== CANVAS_ORIGIN) return
+       const data = event.data as { type?: unknown } | null
+@@ -117,6 +177,27 @@ export default function CanvasHost() {
+       if (data.type === "dokng:canvas-ready") {
+         setReady(true)
+         post()
++        return
++      }
++      if (data.type === CANVAS_FS_REQUEST) {
++        const req = data as { id?: unknown; op?: unknown; args?: unknown }
++        // 只认来自画布 iframe 自身的 source，杜绝同 origin 下其他 frame 借道。
++        if (event.source !== iframeRef?.contentWindow) return
++        const id = typeof req.id === "string" ? req.id : null
++        const op = typeof req.op === "string" ? req.op : null
++        if (!id || !op) return
++        const args = Array.isArray(req.args) ? req.args : []
++        const reply = (payload: { ok: boolean; result?: unknown; error?: string }) => {
++          // 回帖同样严格限 targetOrigin，且只回给发起的那个 window。
++          const win = iframeRef?.contentWindow
++          if (!win) return
++          win.postMessage({ type: CANVAS_FS_RESPONSE, id, ...payload }, CANVAS_ORIGIN)
++        }
++        void runCanvasFsOp(op, args).then(
++          (result) => reply({ ok: true, result }),
++          // 不回传原始错误对象/路径：只给一个稳定短码，避免把 userData 绝对路径泄进画布侧。
++          () => reply({ ok: false, error: "canvas-fs-failed" }),
++        )
+       }
+     }
+     window.addEventListener("message", onMessage)
+diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
+index 96865081f7..8ced760981 100644
+--- a/packages/desktop/src/main/ipc.ts
++++ b/packages/desktop/src/main/ipc.ts
+@@ -26,6 +26,17 @@ import {
+ // [cx] 内置渠道热重载：增删 key 后重写 OPENCODE_CONFIG 文件 + POST /global/dispose，
+ // 让内核重建 instance 读到新 provider——不重启进程（切换已注册 key 走前端桥、零打断）。
+ import { reloadChannelConfig, refreshKeyModelsAndReload } from "./server"
++// [dokng] 画布落盘：图片/视频/音频字节与画布状态 JSON 落到 userData 下的固定路径，
++// 取代原先「blob 存 IndexedDB + blob: URL 存节点」的易失方案（blob: URL 重启即失效，
++// 且 IndexedDB 未申请持久化配额可被驱逐）。安全底线：key 与状态体量大，一律不打印内容。
++import {
++  canvasFileRead,
++  canvasFileWrite,
++  canvasFileDelete,
++  canvasFileList,
++  canvasStateRead,
++  canvasStateWrite,
++} from "./store-canvas-files"
+ import {
+   getPinchZoomEnabled,
+   getWindowID,
+@@ -203,6 +214,26 @@ export function registerIpcHandlers(deps: Deps) {
+     await reloadChannelConfig()
+   })
+ 
++  // [dokng] 画布落盘 IPC。画布跑在 oc://renderer 的子 iframe 里，preload 不注入子 frame
++  // （未开 nodeIntegrationInSubFrames），故画布侧无 window.api：由宿主 canvas-embed.tsx
++  // 经 postMessage 中转到这里。字节以 base64 过 IPC（结构化克隆对 Uint8Array 可行，但
++  // base64 与既有 store-* 的字符串约定一致、且避免 sandbox 下的可转移对象差异）。
++  // 一律不打印 key / 内容；错误只回布尔或 null，不外泄绝对路径。
++  ipcMain.handle("canvas-file-write", async (_event: IpcMainInvokeEvent, key: string, base64: string, mime?: string) => {
++    return canvasFileWrite(key, base64, mime)
++  })
++  ipcMain.handle("canvas-file-read", async (_event: IpcMainInvokeEvent, key: string) => {
++    return canvasFileRead(key)
++  })
++  ipcMain.handle("canvas-file-delete", async (_event: IpcMainInvokeEvent, keys: string[]) => {
++    return canvasFileDelete(Array.isArray(keys) ? keys : [])
++  })
++  ipcMain.handle("canvas-file-list", async () => canvasFileList())
++  ipcMain.handle("canvas-state-read", async () => canvasStateRead())
++  ipcMain.handle("canvas-state-write", async (_event: IpcMainInvokeEvent, json: string) => {
++    return canvasStateWrite(json)
++  })
++
+   ipcMain.handle(
+     "open-directory-picker",
+     async (_event: IpcMainInvokeEvent, opts?: { multiple?: boolean; title?: string; defaultPath?: string }) => {
+diff --git a/packages/desktop/src/main/store-canvas-files.ts b/packages/desktop/src/main/store-canvas-files.ts
+new file mode 100644
+index 0000000000..3faa409e12
+--- /dev/null
++++ b/packages/desktop/src/main/store-canvas-files.ts
+@@ -0,0 +1,249 @@
++// [dokng] 画布数据落盘（替代 IndexedDB）。
++//
++// 背景：画布（infinite-canvas，跑在 oc://renderer 的 iframe 里）原先把图片/视频/音频
++// 二进制存 IndexedDB，节点元数据里只留 URL.createObjectURL() 产生的 blob: URL —— 那是
++// 会话级的，重启即失效，靠启动时 hydrate 从 IndexedDB 重建。两个后果：
++//   1. IndexedDB 未申请 navigator.storage.persist()，属 best-effort 存储，可被浏览器回收；
++//   2. 画布 JSON 的 persist 有 400ms debounce 且无 beforeunload 兜底，而主进程走 app.exit(0)
++//      硬退出，pending 写直接丢 —— 节点没了，磁盘上的图片就成了无人引用的孤儿。
++// 改为落到 userData 下的固定路径，字节和元数据都在磁盘上，不受存储回收与退出时序影响。
++//
++// 磁盘布局（userData = app.getPath("userData") = appData/<appId>）：
++//   <userData>/canvas-files/<sanitized storageKey>.<ext>   媒体原始字节
++//   <userData>/canvas-state.json                           画布项目 / 节点 / 连线
++//
++// 安全边界（本文件是唯一的路径解析处，全部入参都来自画布 iframe，视为不可信）：
++//   - storageKey 必须匹配 STORAGE_KEY_PATTERN（`<kind>:<id>`，id 仅 [A-Za-z0-9_-]），
++//     再经 sanitize 把 ":" 换成 "__"；任何越界字符直接拒绝，不做"尽力清洗"。
++//   - 解析后再用 relative() 复核落在 filesDir 内，双重闸门（模式匹配 + 路径复核），
++//     与 windows.ts 里 oc:// 协议 handler 的做法一致。
++//   - 只允许固定扩展名集合，避免写出 .exe/.lnk 等可执行/可劫持后缀。
++//   - 一律不打印 key 与内容，错误只回 false / null，不外泄绝对路径。
++import { app } from "electron"
++import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
++import { isAbsolute, join, relative } from "node:path"
++import { randomUUID } from "node:crypto"
++
++// 画布侧 storageKey 的形态：image:xxx / video:xxx / audio:xxx / file:xxx /
++// video-reference:xxx / audio-reference:xxx（与 app-sync.ts 的 storageKeyPattern 同源）。
++const KINDS = ["image", "video", "audio", "file", "video-reference", "audio-reference"] as const
++const STORAGE_KEY_PATTERN = new RegExp(`^(${KINDS.join("|")}):[A-Za-z0-9_-]{1,128}$`)
++
++// 白名单扩展名：画布只产出这些媒体类型；未知 mime 落 .bin（惰性，不可执行）。
++const ALLOWED_EXTENSIONS = new Set([
++  "png",
++  "jpg",
++  "jpeg",
++  "webp",
++  "gif",
++  "svg",
++  "mp4",
++  "webm",
++  "mov",
++  "mp3",
++  "wav",
++  "ogg",
++  "opus",
++  "aac",
++  "flac",
++  "bin",
++])
++
++// mime → 扩展名。画布侧只有 Blob，没有文件名，故由 blob.type 推扩展名：
++// 扩展名决定 oc:// 协议返回的 Content-Type，<video>/<audio> 依赖它才能正确解码。
++const MIME_EXTENSIONS: Record<string, string> = {
++  "image/png": "png",
++  "image/jpeg": "jpg",
++  "image/jpg": "jpg",
++  "image/webp": "webp",
++  "image/gif": "gif",
++  "image/svg+xml": "svg",
++  "video/mp4": "mp4",
++  "video/webm": "webm",
++  "video/quicktime": "mov",
++  "audio/mpeg": "mp3",
++  "audio/mp3": "mp3",
++  "audio/wav": "wav",
++  "audio/x-wav": "wav",
++  "audio/ogg": "ogg",
++  "audio/opus": "opus",
++  "audio/aac": "aac",
++  "audio/flac": "flac",
++}
++
++// 单文件上限 256MB：画布单个视频不应超过这个量级，防画布侧异常把主进程内存打爆。
++const MAX_FILE_BYTES = 256 * 1024 * 1024
++
++// 画布 JSON 上限 64MB：纯元数据（不含二进制），正常量级在 KB~MB。
++const MAX_STATE_BYTES = 64 * 1024 * 1024
++
++const FILES_DIR = "canvas-files"
++const STATE_FILE = "canvas-state.json"
++
++function filesDir() {
++  return join(app.getPath("userData"), FILES_DIR)
++}
++
++function stateFile() {
++  return join(app.getPath("userData"), STATE_FILE)
++}
++
++// storageKey → 文件名主体。":" 在 Windows 上是非法文件名字符（且是 NTFS ADS 分隔符），换成 "__"。
++// 只替换 kind 与 id 之间那一个 ":"（模式已保证全串仅此一个）。
++function sanitizeKey(storageKey: string) {
++  return storageKey.replace(":", "__")
++}
++
++// 文件名主体 → storageKey。id 自身允许含 "__"，故只还原第一个 "__"，
++// 且必须落在已知 kind 上；否则视为不是我们写的文件，丢弃。
++function unsanitizeKey(base: string) {
++  for (const kind of KINDS) {
++    const prefix = `${kind}__`
++    if (base.startsWith(prefix)) return `${kind}:${base.slice(prefix.length)}`
++  }
++  return null
++}
++
++function extensionFromMime(mime: string | undefined) {
++  const ext = MIME_EXTENSIONS[(mime || "").toLowerCase().split(";")[0].trim()]
++  return ext && ALLOWED_EXTENSIONS.has(ext) ? ext : "bin"
++}
++
++// 校验并拼出绝对路径。非法入参返回 null（调用方一律当失败处理，不回退、不猜测）。
++function filePathFor(storageKey: string, extension: string) {
++  if (!STORAGE_KEY_PATTERN.test(storageKey)) return null
++  if (!ALLOWED_EXTENSIONS.has(extension)) return null
++  const dir = filesDir()
++  const file = join(dir, `${sanitizeKey(storageKey)}.${extension}`)
++  // 双重闸门：模式匹配已排除 ".." 与路径分隔符，这里再复核结果确实在 dir 内。
++  const rel = relative(dir, file)
++  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null
++  return file
++}
++
++// 同一个 key 可能以不同扩展名落盘（mime 变化 / 历史迁移），读取时按主体名前缀找现存的那个。
++async function findExistingFile(storageKey: string) {
++  if (!STORAGE_KEY_PATTERN.test(storageKey)) return null
++  const dir = filesDir()
++  const prefix = `${sanitizeKey(storageKey)}.`
++  const entries = await readdir(dir).catch(() => [] as string[])
++  const match = entries.find((entry) => entry.startsWith(prefix) && !entry.endsWith(".tmp"))
++  if (!match) return null
++  return filePathFor(storageKey, match.slice(prefix.length))
++}
++
++// 原子写：先写临时文件再 rename。rename 在同一文件系统内是原子的，
++// 避免进程被杀 / 断电时留下半截文件（重启后读到截断的图片或坏 JSON）。
++async function writeAtomic(file: string, data: Buffer) {
++  const tmp = `${file}.${randomUUID()}.tmp`
++  await writeFile(tmp, data)
++  try {
++    await rename(tmp, file)
++  } catch (error) {
++    await unlink(tmp).catch(() => {})
++    throw error
++  }
++}
++
++// 写入媒体字节。mime 用于决定扩展名（进而决定 oc:// 返回的 Content-Type）。
++// 成功返回 true；key 非法 / 超限 / IO 失败返回 false。
++export async function canvasFileWrite(storageKey: string, base64: string, mime?: string) {
++  const file = filePathFor(storageKey, extensionFromMime(mime))
++  if (!file) return false
++  let bytes: Buffer
++  try {
++    bytes = Buffer.from(base64, "base64")
++  } catch {
++    return false
++  }
++  if (bytes.byteLength === 0 || bytes.byteLength > MAX_FILE_BYTES) return false
++  try {
++    await mkdir(filesDir(), { recursive: true })
++    // 同 key 换扩展名时清掉旧的，否则 findExistingFile 可能命中过期字节。
++    const stale = await findExistingFile(storageKey)
++    await writeAtomic(file, bytes)
++    if (stale && stale !== file) await unlink(stale).catch(() => {})
++    return true
++  } catch {
++    return false
++  }
++}
++
++// 读回媒体字节（base64）。不存在或读失败返回 null。
++// 正常渲染路径不走这里 —— 画布用 oc://renderer/__canvas-file/<key> 直接让浏览器加载；
++// 这个接口留给导出 / WebDAV 同步等需要拿到字节本身的场景。
++export async function canvasFileRead(storageKey: string): Promise<string | null> {
++  const file = await findExistingFile(storageKey)
++  if (!file) return null
++  const data = await readFile(file).catch(() => null)
++  return data ? data.toString("base64") : null
++}
++
++// 删除指定 key 的文件，返回实际删除数量。
++export async function canvasFileDelete(storageKeys: string[]) {
++  let removed = 0
++  for (const storageKey of storageKeys) {
++    if (typeof storageKey !== "string") continue
++    const file = await findExistingFile(storageKey)
++    if (!file) continue
++    const ok = await unlink(file).then(
++      () => true,
++      () => false,
++    )
++    if (ok) removed += 1
++  }
++  return removed
++}
++
++// 列出磁盘上现存的 storageKey。画布侧用它做孤儿清理与"是否已迁移"判定。
++export async function canvasFileList() {
++  const entries = await readdir(filesDir()).catch(() => [] as string[])
++  const keys: string[] = []
++  for (const entry of entries) {
++    if (entry.endsWith(".tmp")) continue
++    const dot = entry.lastIndexOf(".")
++    if (dot <= 0) continue
++    const key = unsanitizeKey(entry.slice(0, dot))
++    if (key && STORAGE_KEY_PATTERN.test(key)) keys.push(key)
++  }
++  return keys
++}
++
++export async function canvasStateRead(): Promise<string | null> {
++  const data = await readFile(stateFile(), "utf8").catch(() => null)
++  return data ?? null
++}
++
++export async function canvasStateWrite(json: string) {
++  if (typeof json !== "string") return false
++  if (Buffer.byteLength(json, "utf8") > MAX_STATE_BYTES) return false
++  try {
++    await writeAtomic(stateFile(), Buffer.from(json, "utf8"))
++    return true
++  } catch {
++    return false
++  }
++}
++
++// 供 windows.ts 的 oc:// 协议 handler 解析 /__canvas-file/<tail>。
++// tail 有两种形态，都要支持：
++//   - 带扩展名（画布已知扩展名时直接拼，快路径，无目录扫描）：image__abc123.png
++//   - 只有 key（迁移后仅凭 canvasFileList 得到 key）：image:abc123 或 image__abc123
++// 返回 null 表示拒绝，handler 回 404。
++export async function resolveCanvasFilePath(tail: string): Promise<string | null> {
++  if (!tail || tail.length > 256) return null
++  // 快路径：<sanitized key>.<ext>
++  const dot = tail.lastIndexOf(".")
++  if (dot > 0) {
++    const key = unsanitizeKey(tail.slice(0, dot))
++    const ext = tail.slice(dot + 1).toLowerCase()
++    if (key) {
++      const file = filePathFor(key, ext)
++      if (file) return file
++    }
++  }
++  // 慢路径：只给了 key，扫目录定扩展名。
++  const key = tail.includes(":") ? tail : unsanitizeKey(tail)
++  if (!key) return null
++  return findExistingFile(key)
++}
+diff --git a/packages/desktop/src/main/windows.ts b/packages/desktop/src/main/windows.ts
+index 6e7b8f3ff9..e5050a4084 100644
+--- a/packages/desktop/src/main/windows.ts
++++ b/packages/desktop/src/main/windows.ts
+@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from "node:url"
+ import type { TitlebarTheme } from "../preload/types"
+ import { exportDebugLogs, write as writeLog } from "./logging"
+ import { getStore, removeStoreFile } from "./store"
++// [dokng] 画布落盘：把 oc://renderer/__canvas-file/<key> 解析到 userData/canvas-files/ 下的真实文件。
++import { resolveCanvasFilePath } from "./store-canvas-files"
+ import { PINCH_ZOOM_ENABLED_KEY, WINDOW_IDS_KEY } from "./store-keys"
+ import { createUnresponsiveSampler } from "./unresponsive"
+ import { nativeT } from "./native-translations"
+@@ -21,6 +23,8 @@ const root = dirname(fileURLToPath(import.meta.url))
+ const rendererRoot = join(root, "../renderer")
+ const rendererProtocol = "oc"
+ const rendererHost = "renderer"
++// [dokng] 画布落盘文件在 oc://renderer 下的虚拟路径前缀（不对应 out/renderer 里的真实目录）。
++const canvasFilePrefix = "/__canvas-file/"
+ const clipboardWritePermission = "clipboard-sanitized-write"
+ const notificationPermission = "notifications"
+ const rendererPermissions = new Set([clipboardWritePermission, notificationPermission])
+@@ -298,7 +302,30 @@ export function registerRendererProtocol() {
+       return new Response("Not found", { status: 404 })
+     }
+ 
+-    const file = resolve(rendererRoot, `.${decodeURIComponent(url.pathname)}`)
++    // [dokng] 画布落盘文件读取分支：oc://renderer/__canvas-file/<storageKey> → userData/canvas-files/<净化名>。
++    // 复用既有 origin（oc://renderer）而不新开 scheme/host，故画布 iframe 的 <img src> 可直接引用，
++    // 无需 blob: URL、无跨源与 CSP 问题，且走浏览器原生缓存。resolveCanvasFilePath 内部做
++    // 净化与越界校验，返回 null 即拒绝。
++    const decodedPath = decodeURIComponent(url.pathname)
++    if (decodedPath.startsWith(canvasFilePrefix)) {
++      const key = decodedPath.slice(canvasFilePrefix.length)
++      const canvasFile = await resolveCanvasFilePath(key)
++      if (!canvasFile) {
++        writeLog("protocol", "rejected canvas file key", { url: request.url }, "warn")
++        return new Response("Not found", { status: 404 })
++      }
++      try {
++        const range = request.headers.get("range")
++        return await net.fetch(pathToFileURL(canvasFile).toString(), {
++          headers: range ? { range } : undefined,
++        })
++      } catch (error) {
++        writeLog("protocol", "canvas file fetch error", { url: request.url, error }, "error")
++        return new Response("Not found", { status: 404 })
++      }
++    }
++
++    const file = resolve(rendererRoot, `.${decodedPath}`)
+     const rel = relative(rendererRoot, file)
+     if (rel.startsWith("..") || isAbsolute(rel)) {
+       writeLog("protocol", "rejected path", { url: request.url, file }, "warn")
+diff --git a/packages/desktop/src/preload/index.ts b/packages/desktop/src/preload/index.ts
+index b1e249f923..07e51a389a 100644
+--- a/packages/desktop/src/preload/index.ts
++++ b/packages/desktop/src/preload/index.ts
+@@ -79,6 +79,16 @@ const api: ElectronAPI = {
+   draftBlobPut: (data) => ipcRenderer.invoke("draft-blob-put", data),
+   draftBlobGet: (id) => ipcRenderer.invoke("draft-blob-get", id),
+ 
++  // [dokng] 画布落盘桥。宿主 canvas-embed.tsx 收到画布 iframe 的 postMessage 后调用这些，
++  // 把字节/状态写到 userData 下的固定路径。画布 iframe 自身拿不到 window.api（preload
++  // 不进子 frame），故必须经宿主中转。
++  canvasFileWrite: (key, base64, mime) => ipcRenderer.invoke("canvas-file-write", key, base64, mime),
++  canvasFileRead: (key) => ipcRenderer.invoke("canvas-file-read", key),
++  canvasFileDelete: (keys) => ipcRenderer.invoke("canvas-file-delete", keys),
++  canvasFileList: () => ipcRenderer.invoke("canvas-file-list"),
++  canvasStateRead: () => ipcRenderer.invoke("canvas-state-read"),
++  canvasStateWrite: (json) => ipcRenderer.invoke("canvas-state-write", json),
++
+   // [cx] US-009: 本地 key 列表增删改 + 切换激活（见 types.ts 说明）。
+   channelKeysList: () => ipcRenderer.invoke("channel-keys-list"),
+   channelKeysAdd: (input) => ipcRenderer.invoke("channel-keys-add", input),
+diff --git a/packages/desktop/src/preload/types.ts b/packages/desktop/src/preload/types.ts
+index e0063025cd..94b119a3a8 100644
+--- a/packages/desktop/src/preload/types.ts
++++ b/packages/desktop/src/preload/types.ts
+@@ -70,6 +70,22 @@ export type ElectronAPI = {
+   draftBlobPut: (data: ArrayBuffer) => Promise<string>
+   draftBlobGet: (id: string) => Promise<ArrayBuffer | null>
+ 
++  // [dokng] 画布落盘桥（详见 main/store-canvas-files.ts）。
++  //   canvasFileWrite: 写成功返回 true；key 非法 / 超限 / IO 失败返回 false。
++  //                    mime 用于定扩展名，进而决定 oc:// 读取时的 Content-Type
++  //                    （<video>/<audio> 依赖它才能正确解码）。
++  //   canvasFileRead:  返回 base64；不存在返回 null。渲染不走这里（直接用 oc:// URL），
++  //                    仅导出 / 同步等需要字节本身的场景用。
++  //   canvasFileDelete: 返回实际删除数量。
++  //   canvasFileList:  返回已落盘的 storageKey 列表（供画布做孤儿清理与迁移判定）。
++  //   canvasStateRead / canvasStateWrite: 画布项目状态 JSON 的整体读写（原子写）。
++  canvasFileWrite: (key: string, base64: string, mime?: string) => Promise<boolean>
++  canvasFileRead: (key: string) => Promise<string | null>
++  canvasFileDelete: (keys: string[]) => Promise<number>
++  canvasFileList: () => Promise<string[]>
++  canvasStateRead: () => Promise<string | null>
++  canvasStateWrite: (json: string) => Promise<boolean>
++
+   // [cx] US-009: 本地 key 列表增删改 + 切换激活。全部走主进程数据层（store-channel-keys），
+   // 返回值为 JSON.stringify 的最新 ChannelKeysState 字符串，renderer 解析回对象刷新 UI。
+   // 不用通用 storeSet：那会把整个对象存成字符串、破坏主进程侧 readChannelKeysState 的对象读取。

@@ -1,0 +1,79 @@
+<!--
+  [cx] 品牌字标源件（DOKNG 像素网格）—— 新会话空状态字标的可读原始件。
+  此为「原始独立徽标版」：自带 #0a0a0a 黑底 + 近黑深灰渐变字，用于单独展示 / 预览。
+
+  实际落地到 opencode（补丁 16-wordmark-brand，只在 session-new-design-view.tsx 内联）时
+  做了「融入主题」改造，与本源件的差异：
+    · 去掉黑底 <rect> 与深灰渐变，字改 fill="currentColor"（继承 text-v2-background-bg-inverse，
+      浅色主题深字 / 深色主题浅字）；
+    · 外层加 opacity 0.6 + 底部渐变淡出遮罩（同上游 WordmarkV2 的低调水印质感）。
+  字形（每个 <rect> 的坐标 / 尺寸）与本源件完全一致，一个像素都不改。
+
+  网格规格：viewBox 1024×200，每字母 9 列(72px) × 14 行(112px)，字高 112，y 起点 44。
+  字母 x 起点：D=80 O=232 K=384 N=536 G=688。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 200" width="1024" height="200">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#262626"/>
+      <stop offset="0.55" stop-color="#1a1a1a"/>
+      <stop offset="1"   stop-color="#0f0f0f"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="200" fill="#0a0a0a"/>
+  <!-- 8px 像素网格；每字母 9列(72px) x 14行(112px)，字高112，y起点=44 -->
+  <g fill="url(#g)" shape-rendering="crispEdges">
+    <!-- ============ D ============ x=80 -->
+    <g transform="translate(80,44)">
+      <rect x="0"  y="0"   width="56" height="24"/>   <!-- 上横（厚）-->
+      <rect x="0"  y="0"   width="24" height="112"/>  <!-- 左竖（厚）-->
+      <rect x="0"  y="88"  width="56" height="24"/>   <!-- 下横（厚）-->
+      <rect x="48" y="16"  width="16" height="16"/>   <!-- 右上圆角阶 -->
+      <rect x="56" y="24"  width="16" height="64"/>   <!-- 右竖 -->
+      <rect x="48" y="80"  width="16" height="16"/>   <!-- 右下圆角阶 -->
+    </g>
+    <!-- ============ O ============ x=232 -->
+    <g transform="translate(232,44)">
+      <rect x="16" y="0"   width="40" height="24"/>   <!-- 上横 -->
+      <rect x="16" y="88"  width="40" height="24"/>   <!-- 下横 -->
+      <rect x="0"  y="16"  width="24" height="80"/>   <!-- 左竖（厚）-->
+      <rect x="48" y="16"  width="24" height="80"/>   <!-- 右竖（厚）-->
+      <rect x="8"  y="8"   width="8"  height="8"/>    <!-- 四角小切块，圆润感 -->
+      <rect x="56" y="8"   width="8"  height="8"/>
+      <rect x="8"  y="96"  width="8"  height="8"/>
+      <rect x="56" y="96"  width="8"  height="8"/>
+    </g>
+    <!-- ============ K ============ x=384 -->
+    <g transform="translate(384,44)">
+      <rect x="0"  y="0"   width="24" height="112"/>  <!-- 左竖（厚）-->
+      <!-- 上斜臂（加粗阶梯）-->
+      <rect x="48" y="0"   width="24" height="24"/>
+      <rect x="32" y="16"  width="24" height="24"/>
+      <rect x="16" y="32"  width="24" height="24"/>
+      <!-- 交点 -->
+      <rect x="16" y="48"  width="24" height="20"/>
+      <!-- 下斜臂（加粗阶梯）-->
+      <rect x="32" y="64"  width="24" height="24"/>
+      <rect x="48" y="80"  width="24" height="32"/>
+    </g>
+    <!-- ============ N ============ x=536 -->
+    <g transform="translate(536,44)">
+      <rect x="0"  y="0"   width="24" height="112"/>  <!-- 左竖（厚）-->
+      <rect x="48" y="0"   width="24" height="112"/>  <!-- 右竖（厚）-->
+      <!-- 斜杠（加粗阶梯）-->
+      <rect x="16" y="16"  width="24" height="32"/>
+      <rect x="24" y="40"  width="24" height="32"/>
+      <rect x="32" y="64"  width="24" height="32"/>
+    </g>
+    <!-- ============ G ============ x=688 -->
+    <g transform="translate(688,44)">
+      <rect x="16" y="0"   width="56" height="24"/>   <!-- 上横 -->
+      <rect x="0"  y="16"  width="24" height="80"/>   <!-- 左竖（厚）-->
+      <rect x="16" y="88"  width="56" height="24"/>   <!-- 下横 -->
+      <rect x="48" y="56"  width="24" height="56"/>   <!-- 右下竖（厚）-->
+      <rect x="40" y="56"  width="32" height="20"/>   <!-- 内钩横 -->
+      <rect x="8"  y="8"   width="8"  height="8"/>    <!-- 左上圆润切块 -->
+      <rect x="8"  y="96"  width="8"  height="8"/>    <!-- 左下圆润切块 -->
+    </g>
+  </g>
+</svg>

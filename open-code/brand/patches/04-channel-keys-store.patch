@@ -1,0 +1,181 @@
+# 04-channel-keys-store —— 本地多 key 列表存储模型（US-003 / US-009）
+#
+# 职责：为「多 key 内置渠道」提供本地持久化的数据层与读写封装，供后续
+# key 列表 UI / 切换联动 / 内核注入改造（token 来源改为读本地激活 key）复用。
+#   1. store-keys.ts —— 新增 store 键常量 CHANNEL_KEYS_KEY（值为 ChannelKeysState）。
+#   2. store-channel-keys.ts（新增）—— 读写封装：
+#      - 类型 ChannelKey { id, label, key, baseURL, models? } 与 ChannelKeysState { keys, activeKeyId }。
+#      - readChannelKeysState / readActiveChannelKey / addChannelKey / removeChannelKey /
+#        updateChannelKeyLabel / setActiveChannelKey / setChannelKeyModels。
+#      - channelProviderId(keyId) —— 由 key.id 算出稳定 providerID（`newapi-<id前8位>`）。
+#        主进程 server.ts 注入多 provider、renderer 派发 cx:select-provider 切换事件都用它，
+#        两端必须同源同算法，否则切换事件匹配不到 provider。
+#      - 复用既有 electron-store（store.ts），数据写在默认 settings store，明文仅存本地。
+#      - 无 key 时读取激活项返回 null，不报错（读取做了结构校验与容错）。
+#   US-009 增补：ChannelKey 新增可选 models（切换激活 key 时拉该 key 的 /v1/models 缓存），
+#   新增 setChannelKeyModels(id, models) 落盘；读取时对 models 做规整（只留字符串、去重、
+#   脏数据归 undefined），供 server.ts 构造内核 config 时注入「可选模型」。
+#
+# 安全底线：key 明文仅存本地用户设备，绝不上传 / 绝不写日志；本模块不打印任何 key 值。
+# 依赖：独立文件，不与 01/02/03 共享文件，可在其之后按序应用。
+# 应用（在 opencode/ 内，基线为 brand/BASE_SHA，按 01→02→03→04→05 顺序）：
+#   git -C opencode apply --3way brand/patches/04-channel-keys-store.patch
+diff --git a/packages/desktop/src/main/store-channel-keys.ts b/packages/desktop/src/main/store-channel-keys.ts
+new file mode 100644
+index 000000000..deef7f087
+--- /dev/null
++++ b/packages/desktop/src/main/store-channel-keys.ts
+@@ -0,0 +1,143 @@
++// [cx] US-003: 本地 key 列表存储模型 —— 多渠道 API Key 的持久化读写封装。
++//
++// 目的：让用户导入的多个 `sk-…` API Token 持久保存在本地，重启 App 后仍在，
++// 并可管理（新增 / 删除 / 更新 label / 设为激活 / 读取激活项）。
++//
++// 存储位置与格式：
++//   - 复用 opencode 既有的 electron-store（见 store.ts）。所有 key 数据写在
++//     默认 settings store（文件名 `opencode.settings`，无扩展名，JSON 明文），
++//     位于 electron `app.getPath("userData")` 目录下（各平台的用户数据目录，
++//     如 macOS 的 ~/Library/Application Support/<appId>）。
++//   - 在该 store 内以单个键 `channelKeys`（CHANNEL_KEYS_KEY）保存整个
++//     ChannelKeysState 对象：`{ keys: [{ id, label, key, baseURL }], activeKeyId }`。
++//
++// 安全底线（不可违背，见 TODO.md 第三节）：
++//   - key 明文**仅存本地用户设备**，绝不上传、绝不写日志。
++//   - 本模块所有函数都不打印 / 记录 key 值；调用方若需日志，只可记录 id / label，
++//     严禁把 `key` 字段带进日志或网络请求（调 AI 由内核 sidecar 经 config 注入完成）。
++
++import { randomUUID } from "node:crypto"
++import { getStore } from "./store"
++import { CHANNEL_KEYS_KEY } from "./store-keys"
++
++// 单个渠道 key 条目。`key` 为 new-api 的 API Token（`sk-…`），仅本地持有。
++// [cx] US-009: 新增可选 `models` —— 切换激活 key 时拉取该 key 的 /v1/models 得到的可用
++// 模型 id 列表，落盘缓存，供 server.ts 构造内核 config 时注入「内核可选模型」。老数据无此
++// 字段时按缺省（undefined）处理，读写全程做防御性校验。
++export type ChannelKey = {
++  id: string
++  label: string
++  key: string
++  baseURL: string
++  models?: string[]
++}
++
++// 本地存储的完整结构。activeKeyId 指向 keys 中当前激活项的 id；无激活项时为 null。
++export type ChannelKeysState = {
++  keys: ChannelKey[]
++  activeKeyId: string | null
++}
++
++const EMPTY_STATE: ChannelKeysState = { keys: [], activeKeyId: null }
++
++// [cx] 多 provider：由 key.id 派生稳定的 opencode providerID。主进程（server.ts 构造 config）
++// 与 renderer（cx-account 面板派发切换事件）两侧都用此函数，保证同一 key 算出同一 providerID，
++// 桥接切换才能命中正确 provider。取 id 前 8 位即可（randomUUID 前 8 位碰撞概率可忽略），
++// 前缀 newapi- 便于识别来源。providerID 只允许 [a-z0-9-]，UUID 片段天然满足。
++export function channelProviderId(keyId: string): string {
++  return `newapi-${keyId.slice(0, 8)}`
++}
++
++// 读取整份状态。store 里没有记录（首次启动）时返回空状态，不报错。
++export function readChannelKeysState(): ChannelKeysState {
++  const raw = getStore().get(CHANNEL_KEYS_KEY)
++  if (!raw || typeof raw !== "object") return { ...EMPTY_STATE }
++  const record = raw as Partial<ChannelKeysState>
++  const keys = Array.isArray(record.keys) ? record.keys.filter(isChannelKey).map(normalizeChannelKey) : []
++  const activeKeyId =
++    typeof record.activeKeyId === "string" && keys.some((item) => item.id === record.activeKeyId)
++      ? record.activeKeyId
++      : null
++  return { keys, activeKeyId }
++}
++
++// 读取当前激活的 key 条目。无 key 或无激活项时返回 null，不报错（验收标准）。
++export function readActiveChannelKey(): ChannelKey | null {
++  const state = readChannelKeysState()
++  if (!state.activeKeyId) return null
++  return state.keys.find((item) => item.id === state.activeKeyId) ?? null
++}
++
++// 新增一个 key。返回新建条目（含生成的 id）。若这是第一个 key，自动设为激活项。
++export function addChannelKey(input: { label: string; key: string; baseURL: string }): ChannelKey {
++  const state = readChannelKeysState()
++  const entry: ChannelKey = {
++    id: randomUUID(),
++    label: input.label,
++    key: input.key,
++    baseURL: input.baseURL,
++  }
++  const keys = [...state.keys, entry]
++  const activeKeyId = state.activeKeyId ?? entry.id
++  writeChannelKeysState({ keys, activeKeyId })
++  return entry
++}
++
++// [cx] US-009: 更新指定 id 的 key 的可用模型列表（切换激活 key 后拉 /v1/models 得到）。
++// 只保留字符串型 id、去重；id 不存在时静默忽略，不报错。models 仅是可选缓存，不含敏感信息。
++export function setChannelKeyModels(id: string, models: string[]): void {
++  const state = readChannelKeysState()
++  const cleaned = Array.from(new Set(models.filter((m): m is string => typeof m === "string" && m.length > 0)))
++  const keys = state.keys.map((item) => (item.id === id ? { ...item, models: cleaned } : item))
++  writeChannelKeysState({ keys, activeKeyId: state.activeKeyId })
++}
++
++// 删除指定 id 的 key。若删的是当前激活项，激活项回退到列表首个剩余 key（无剩余则为 null）。
++export function removeChannelKey(id: string): void {
++  const state = readChannelKeysState()
++  const keys = state.keys.filter((item) => item.id !== id)
++  const activeKeyId =
++    state.activeKeyId === id ? (keys[0]?.id ?? null) : (keys.some((item) => item.id === state.activeKeyId) ? state.activeKeyId : null)
++  writeChannelKeysState({ keys, activeKeyId })
++}
++
++// 更新指定 id 的 key 的 label。id 不存在时静默忽略，不报错。
++export function updateChannelKeyLabel(id: string, label: string): void {
++  const state = readChannelKeysState()
++  const keys = state.keys.map((item) => (item.id === id ? { ...item, label } : item))
++  writeChannelKeysState({ keys, activeKeyId: state.activeKeyId })
++}
++
++// 设为激活项。id 不在列表中时静默忽略（不改变现有激活项），不报错。
++export function setActiveChannelKey(id: string): void {
++  const state = readChannelKeysState()
++  if (!state.keys.some((item) => item.id === id)) return
++  writeChannelKeysState({ keys: state.keys, activeKeyId: id })
++}
++
++// 落盘整份状态（内部使用）。
++function writeChannelKeysState(state: ChannelKeysState): void {
++  getStore().set(CHANNEL_KEYS_KEY, state)
++}
++
++function isChannelKey(value: unknown): value is ChannelKey {
++  if (!value || typeof value !== "object") return false
++  const record = value as Record<string, unknown>
++  return (
++    typeof record.id === "string" &&
++    typeof record.label === "string" &&
++    typeof record.key === "string" &&
++    typeof record.baseURL === "string"
++  )
++}
++
++// [cx] US-009: 规整单条 key 的 models 字段——只保留字符串型、去重；缺省或脏数据归 undefined。
++// 读取时统一走此函数，避免脏 models 流进 server.ts 构造 config。
++function normalizeChannelKey(entry: ChannelKey): ChannelKey {
++  if (!Array.isArray(entry.models)) {
++    if (entry.models === undefined) return entry
++    return { ...entry, models: undefined }
++  }
++  const cleaned = Array.from(new Set(entry.models.filter((m): m is string => typeof m === "string" && m.length > 0)))
++  return { ...entry, models: cleaned }
++}
+diff --git a/packages/desktop/src/main/store-keys.ts b/packages/desktop/src/main/store-keys.ts
+index 506924b74..8e727adb4 100644
+--- a/packages/desktop/src/main/store-keys.ts
++++ b/packages/desktop/src/main/store-keys.ts
+@@ -4,3 +4,5 @@ export const FIRST_LAUNCH_ONBOARDING_COMPLETE_KEY = "firstLaunchOnboardingComple
+ export const WSL_SERVERS_KEY = "wslServers"
+ export const PINCH_ZOOM_ENABLED_KEY = "pinchZoomEnabled"
+ export const WINDOW_IDS_KEY = "windowIds"
++// [cx] US-003: 本地 key 列表存储键（值为 ChannelKeysState 对象，见 store-channel-keys.ts）。
++export const CHANNEL_KEYS_KEY = "channelKeys"

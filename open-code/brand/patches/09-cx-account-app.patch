@@ -1,0 +1,2659 @@
+diff --git a/packages/app/src/components/cx-account/cx-account-api.ts b/packages/app/src/components/cx-account/cx-account-api.ts
+new file mode 100644
+index 000000000..afeb9fe9a
+--- /dev/null
++++ b/packages/app/src/components/cx-account/cx-account-api.ts
+@@ -0,0 +1,643 @@
++// [cx] 账户面板数据层（迁自 desktop 包 renderer/balance/balance-panel.tsx，US-005 → US-013）。
++//
++// 纯数据层：零 UI import（不 import solid-js / 上游组件），可离线 typecheck。承载：
++//   - new-api 只读接口对接：profile（GET /api/app/profile，Bearer sk-）/ models（/v1/models）；
++//   - 本地 key 列表读取与解析（经 desktop preload 暴露的 window.api.channelKeys*）；
++//   - dokng:// 深链解析（parseImportDeepLink）；
++//   - providerID 派生（channelProviderId，须与主进程 server.ts / store-channel-keys.ts 完全一致）；
++//   - 单位换算 / 打码 / 使用率等纯函数。
++//
++// 跨包类型缺口：app 包看不到 desktop preload 的 window.api.channelKeys* / channelConfig* 与
++// import.meta.env.NEWAPI_*（那些类型声明在 desktop 包的 preload/types.ts、env.d.ts）。本文件用
++// 局部 interface + 断言访问器（cxWindowApi() / cxEnv()）解决，不碰上游类型文件；web 端无
++// window.api，全走可选链兜底、返回空态，绝不抛出。
++
++// [cx] US-006: new-api 只读 profile 接口路径（站点根下，非 /v1 渠道端点）。走 token 鉴权中间件，
++// 由 Bearer sk- 定位 token → 返回本人 profile。见 brand/docs/api-app-profile.md。
++const APP_PROFILE_PATH = "/api/app/profile"
++
++// new-api 默认 QuotaPerUnit：500000 额度 = 1 美元（common.QuotaPerUnit 默认值）。目标站点若改了
++// 该值，展示金额会有偏差——额度原值同时可展示以便对照。
++const QUOTA_PER_UNIT = 500000
++
++// ============================================================================
++// 跨包桥接：desktop preload 注入的 window.api（app 包无其类型）与构建期注入的渠道变量。
++// ============================================================================
++
++// [cx] desktop preload 暴露的、账户面板要用的 IPC 子集（签名与 05-channel-keys-ipc 的
++// preload/types.ts 对齐）。app 包不 import desktop 类型，故本地重声明；web 端 window.api 不存在。
++interface CxChannelApi {
++  channelKeysList: () => Promise<string>
++  channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => Promise<string>
++  channelKeysRemove: (id: string) => Promise<string>
++  channelKeysUpdateLabel: (id: string, label: string) => Promise<string>
++  channelKeysSetActive: (id: string) => Promise<string>
++  channelKeysSetModels: (id: string, models: string[]) => Promise<string>
++  channelConfigRefreshKey: (id: string) => Promise<void>
++  channelConfigReload: () => Promise<void>
++  // 名字必须与上游 preload 的实际导出一致：这里是本地重声明 + Partial + 可选链调用，
++  // 上游改名不会引发类型错误也不会让补丁冲突，只会让充值链接点了没反应（静默失效）。
++  // 上游 v1.18.10→v1.18.11 就把 openLink 改成了 openExternal，升基线时务必核对此行。
++  openExternal: (url: string) => void
++}
++
++// [cx] 断言访问器：取 window.api 的账户面板子集。web 等无 preload 的平台返回 undefined，
++// 调用方全走可选链兜底。不抛出。
++export function cxChannelApi(): Partial<CxChannelApi> | undefined {
++  if (typeof window === "undefined") return undefined
++  return (window as unknown as { api?: Partial<CxChannelApi> }).api
++}
++
++// [cx] 构建期由 electron.vite renderer.define 注入的渠道变量（02 补丁）。app 包 env.d.ts 无这些
++// 声明，故此处按需断言读取；未注入时为空串。
++function cxEnv(): { NEWAPI_BASE_URL: string; NEWAPI_API_KEY: string; NEWAPI_TOPUP_URL: string } {
++  const env = import.meta.env as unknown as Record<string, string | undefined>
++  return {
++    NEWAPI_BASE_URL: env.NEWAPI_BASE_URL ?? "",
++    NEWAPI_API_KEY: env.NEWAPI_API_KEY ?? "",
++    NEWAPI_TOPUP_URL: env.NEWAPI_TOPUP_URL ?? "",
++  }
++}
++
++// ============================================================================
++// 纯工具函数
++// ============================================================================
++
++// 从渠道 baseURL（如 https://host/v1）推导 new-api 站点根，用户接口挂在站点根 /api 下。
++function deriveApiBase(baseURL: string): string {
++  const trimmed = baseURL.trim().replace(/\/+$/, "")
++  return trimmed.replace(/\/v1$/, "")
++}
++
++// [cx] US-009: 由渠道 baseURL 推导 OpenAI 兼容 /v1/models 端点。
++function deriveModelsUrl(baseURL: string): string {
++  const trimmed = baseURL.trim().replace(/\/+$/, "")
++  if (/\/v1$/.test(trimmed)) return `${trimmed}/models`
++  return `${trimmed}/v1/models`
++}
++
++// [cx] US-007/US-010: 解析充值页面 URL。优先注入变量 NEWAPI_TOPUP_URL，缺省回退到「由激活 key
++// 的 baseURL 推导的站点根」（随激活 key 变化），activeBaseURL 为空再回退构建期 NEWAPI_BASE_URL。
++// 两者都缺失返回空串（充值入口禁用并提示）。
++export function resolveSiteUrl(activeBaseURL?: string): string {
++  const env = cxEnv()
++  const baseURL = (activeBaseURL ?? "").trim() || env.NEWAPI_BASE_URL
++  return deriveApiBase(baseURL)
++}
++
++export function resolveTopupUrl(activeBaseURL?: string): string {
++  const env = cxEnv()
++  const topup = env.NEWAPI_TOPUP_URL.trim()
++  if (topup) return topup
++  return resolveSiteUrl(activeBaseURL)
++}
++
++// [cx] US-007: 在系统默认浏览器打开充值页面。renderer 是浏览器上下文，经 preload 暴露的
++// openExternal（→ 主进程 shell.openExternal）打开。客户端内不实现任何支付逻辑。
++export function openTopup(url: string): void {
++  if (!url) return
++  try {
++    cxChannelApi()?.openExternal?.(url)
++  } catch {
++    // openExternal 只是发一条 ipc 消息，正常不会抛出；即便异常也不应让面板崩溃。
++  }
++}
++
++// 额度 → 美元金额（两位小数）。
++export function formatCurrency(quotaUnits: number): string {
++  return "$" + (quotaUnits / QUOTA_PER_UNIT).toFixed(2)
++}
++
++// 模型实际消耗 token 数的人类可读格式。注意：这里的 token 指 prompt_tokens +
++// completion_tokens，不是 new-api 的 API Token / Key 记录。
++export function formatTokenCount(value: number | null): string {
++  if (value === null || !Number.isFinite(value)) return "—"
++  const count = Math.max(0, value)
++  const units = [
++    { value: 1_000_000_000, suffix: "B" },
++    { value: 1_000_000, suffix: "M" },
++    { value: 1_000, suffix: "K" },
++  ]
++  const unit = units.find((item) => count >= item.value)
++  if (!unit) return Math.round(count).toLocaleString("zh-CN")
++  const scaled = count / unit.value
++  const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2
++  return `${Number(scaled.toFixed(digits))}${unit.suffix}`
++}
++
++// [cx] US-006: 无头像时的占位首字（取用户名首字符，空则用「?」）。
++export function avatarInitial(username: string): string {
++  const trimmed = username.trim()
++  return trimmed ? trimmed[0].toUpperCase() : "?"
++}
++
++// [cx] US-008: key 打码展示（`sk-…abcd`）。仅保留可辨识前缀与末 4 位，绝不整段渲染 key 明文。
++export function maskKey(key: string): string {
++  const k = key.trim()
++  if (!k) return ""
++  if (k.length <= 7) return "…" + k.slice(-Math.min(4, k.length))
++  return `${k.slice(0, 3)}…${k.slice(-4)}`
++}
++
++// 账户已用占比（0~100，整数）。总额度为 0 时返回 0，避免除零。
++export function usedPercent(usedQuota: number, quota: number): number {
++  if (quota <= 0) return 0
++  return Math.min(100, Math.max(0, Math.round((usedQuota / quota) * 100)))
++}
++
++// [cx] US-007: per-key 使用率（0~100，整数）——已用 /（已用 + 剩余）。分母为 0 时返回 0。
++// unlimited 时该值无意义，调用点已用 unlimited 分支屏蔽。
++export function keyUsedPercent(tokenUsed: number, tokenRemain: number): number {
++  const granted = tokenUsed + tokenRemain
++  if (granted <= 0) return 0
++  return Math.min(100, Math.max(0, Math.round((tokenUsed / granted) * 100)))
++}
++
++// [cx] key 过期展示：把秒级时间戳转成人类可读文案 + 告警级别，供卡片过期提示用。
++//   - 0（永不过期）→ level "ok"，text "永不过期"
++//   - 已过期（expiresAt <= now）→ level "expired"，text "已过期"
++//   - 7 天内到期 → level "soon"，text "N 天后过期"（不足 1 天显示「今日到期」）
++//   - 更远 → level "ok"，text 本地日期（YYYY-MM-DD）
++// level 供渲染层决定是否用告警色；纯函数、不依赖时区库，用本地时间。
++export function formatExpiry(expiresAt: number): { text: string; level: "ok" | "soon" | "expired" } {
++  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return { text: "永不过期", level: "ok" }
++  const nowSec = Math.floor(Date.now() / 1000)
++  if (expiresAt <= nowSec) return { text: "已过期", level: "expired" }
++  const daysLeft = Math.ceil((expiresAt - nowSec) / 86400)
++  if (daysLeft <= 7) {
++    return { text: daysLeft <= 1 ? "今日到期" : `${daysLeft} 天后过期`, level: "soon" }
++  }
++  const d = new Date(expiresAt * 1000)
++  const yyyy = d.getFullYear()
++  const mm = String(d.getMonth() + 1).padStart(2, "0")
++  const dd = String(d.getDate()).padStart(2, "0")
++  return { text: `${yyyy}-${mm}-${dd} 到期`, level: "ok" }
++}
++
++// [cx] key 状态文案：new-api TokenStatus（1 启用 / 2 禁用 / 3 过期 / 4 耗尽）。
++// 仅在非启用态需要在卡片上打徽标；启用态返回空串（调用方据此不渲染徽标）。
++export function keyStatusLabel(status: number): string {
++  switch (status) {
++    case 2:
++      return "已禁用"
++    case 3:
++      return "已过期"
++    case 4:
++      return "额度耗尽"
++    default:
++      return ""
++  }
++}
++
++// [cx] 多 provider：由 key.id 派生稳定的 opencode providerID。**必须与主进程 server.ts /
++// store-channel-keys.ts 的 channelProviderId 完全一致**（`newapi-<id前8位>`），否则派发的
++// cx:select-provider 事件匹配不到 provider，切换不生效——硬约束。
++export function channelProviderId(keyId: string): string {
++  return `newapi-${keyId.slice(0, 8)}`
++}
++
++// ============================================================================
++// 类型
++// ============================================================================
++
++// [cx] US-006: profile 就绪态承载的字段。额度类均为 new-api 原始 quota 整数，换算在渲染层做。
++type ProfileData = {
++  username: string
++  displayName: string
++  avatar: string
++  // 账户额度来自 user.Quota（剩余）与 user.UsedQuota（累计），不能受当前 Key 是否不限额影响。
++  accountRemainingQuota: number
++  accountUsedQuota: number
++  accountTotalQuota: number
++  accountQuotaUsedToday: number | null
++  // 实际模型 token 数 = logs.prompt_tokens + logs.completion_tokens；与 API Key 记录严格区分。
++  accountTokensUsedToday: number | null
++  accountPromptTokensToday: number | null
++  accountCompletionTokensToday: number | null
++  keyRemainingQuota: number
++  keyUsedQuota: number
++  keyQuotaUsedToday: number | null
++  keyTokensUsedToday: number | null
++  keyPromptTokensToday: number | null
++  keyCompletionTokensToday: number | null
++  keyUnlimitedQuota: boolean
++  // 当前 key 生效的定价分组，及该分组是否走二开的动态倍率（auto 分组恒 false）。
++  keyGroup: string
++  keyDynamicRatio: boolean
++  // 当前 key 的状态（1 启用 / 2 禁用 / 3 过期 / 4 耗尽）与过期时间（秒；0 表示永不过期）。
++  keyStatus: number
++  keyExpiresAt: number
++  // 当前 key 的模型白名单：未启用时 keyModelLimits 为空数组、表示不限模型。
++  keyModelLimitsEnabled: boolean
++  keyModelLimits: string[]
++  requestCountToday: number | null
++  // [cx] 该 key 在 new-api 侧的 token.Name。若本地没填名称，UI 直接用此字段展示，新增时也会回填本地。
++  tokenName: string
++}
++
++// [cx] US-006: /api/app/profile 响应信封（见 brand/docs/api-app-profile.md 第 3 节）。字段全部
++// 可选，做防御性解析；契约未强约束 success 信封，故按 HTTP status 分支，data 缺失时把整个 body
++// 当作扁平 profile 兜底。
++type ProfilePayload = {
++  username?: string
++  display_name?: string
++  avatar?: string
++  account_remaining_quota?: number
++  account_used_quota?: number
++  account_total_quota?: number
++  account_quota_used_today?: number
++  account_tokens_used_today?: number
++  account_prompt_tokens_today?: number
++  account_completion_tokens_today?: number
++  key_name?: string
++  key_remaining_quota?: number
++  key_used_quota?: number
++  key_quota_used_today?: number
++  key_tokens_used_today?: number
++  key_prompt_tokens_today?: number
++  key_completion_tokens_today?: number
++  key_unlimited_quota?: boolean
++  key_group?: string
++  key_dynamic_ratio?: boolean
++  key_status?: number
++  key_expires_at?: number
++  key_model_limits_enabled?: boolean
++  key_model_limits?: string[]
++  request_count_today?: number
++  // 旧版二开字段兼容：新后端应优先返回上面的 account_* / key_* 明确命名。
++  quota?: number
++  used_quota?: number
++  used_today?: number
++  token_name?: string
++  token_remain?: number
++  token_used?: number
++  token_used_today?: number
++  unlimited?: boolean
++}
++
++type ProfileResponse = ProfilePayload & {
++  success?: boolean
++  message?: string
++  data?: ProfilePayload
++}
++
++// [cx] US-008: 单 key 的 profile 拉取结果。无凭据的 key 不会进列表，故只有 loading/error/ready。
++export type KeyProfileState =
++  | { status: "loading" }
++  | { status: "error"; message: string }
++  | ({ status: "ready" } & ProfileData)
++
++// [cx] US-008/US-009: 已解析的可用 key 条目（本地 store 或构建期回退）。key 为明文仅本地持有，
++// 展示前必经 maskKey 打码。builtin=true 表示构建期注入的内置渠道合成条目（不可增删改切换）。
++export type ResolvedKey = {
++  id: string
++  label: string
++  key: string
++  baseURL: string
++  isActive: boolean
++  builtin: boolean
++  models: string[]
++}
++
++// 本地 store 里的原始条目（与主进程 store-channel-keys.ts 的 ChannelKey 对齐）。
++type StoredChannelKey = {
++  id: string
++  label: string
++  key: string
++  baseURL: string
++  models?: string[]
++}
++
++function isStoredChannelKey(value: unknown): value is StoredChannelKey {
++  if (!value || typeof value !== "object") return false
++  const r = value as Record<string, unknown>
++  return (
++    typeof r.id === "string" &&
++    typeof r.label === "string" &&
++    typeof r.key === "string" &&
++    typeof r.baseURL === "string"
++  )
++}
++
++function normalizeModels(value: unknown): string[] {
++  if (!Array.isArray(value)) return []
++  return value.filter((m): m is string => typeof m === "string" && m.length > 0)
++}
++
++export type ChannelState = { keys: StoredChannelKey[]; activeKeyId: string | null }
++
++// [cx] US-013: 深链解析结果——待确认导入的 key 信息（key 为明文，仅内存持有，展示打码）。
++export type ImportRequest = { key: string; label: string; baseURL: string }
++
++// ============================================================================
++// 本地 key 列表读取与解析
++// ============================================================================
++
++// [cx] US-009: 读本地 key 列表状态。经专用 IPC channelKeysList 拿 JSON 字符串再解析；任何
++// 异常/脏数据都吞掉返回空状态，绝不抛出。web 端无 window.api 时同样返回空状态。
++export async function loadChannelState(): Promise<ChannelState> {
++  try {
++    const raw = await cxChannelApi()?.channelKeysList?.()
++    if (!raw) return { keys: [], activeKeyId: null }
++    const parsed = JSON.parse(raw) as { keys?: unknown; activeKeyId?: unknown }
++    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.keys)) {
++      return { keys: [], activeKeyId: null }
++    }
++    const keys = parsed.keys.filter(isStoredChannelKey).map((k) => ({ ...k, models: normalizeModels(k.models) }))
++    const activeKeyId =
++      typeof parsed.activeKeyId === "string" && keys.some((k) => k.id === parsed.activeKeyId)
++        ? parsed.activeKeyId
++        : null
++    return { keys, activeKeyId }
++  } catch {
++    return { keys: [], activeKeyId: null }
++  }
++}
++
++// [cx] US-008/US-009: 把 store 状态解析成面板要展示的 key 列表。本地有 key 时全部展示（含缺
++// baseURL 的条目：查询用地址回退构建期变量），并标注激活项；本地无 key 时回退到构建期注入的内置
++// 渠道合成单条（builtin，不可管理），保证面板仍可用。
++export function resolveKeyList(state: ChannelState): ResolvedKey[] {
++  const env = cxEnv()
++  const fallbackBase = env.NEWAPI_BASE_URL
++  if (state.keys.length > 0) {
++    return state.keys.map((k) => ({
++      id: k.id,
++      // 保留空 label，让 profile 返回的 token.Name 能成为展示名；不要过早固化成占位文案。
++      label: k.label.trim(),
++      key: k.key,
++      baseURL: k.baseURL || fallbackBase,
++      isActive: k.id === state.activeKeyId,
++      builtin: false,
++      models: normalizeModels(k.models),
++    }))
++  }
++  const apiKey = env.NEWAPI_API_KEY
++  if (fallbackBase && apiKey) {
++    return [
++      {
++        id: "__builtin__",
++        label: "内置渠道",
++        key: apiKey,
++        baseURL: fallbackBase,
++        isActive: true,
++        builtin: true,
++        models: [],
++      },
++    ]
++  }
++  return []
++}
++
++// ============================================================================
++// new-api 网络请求（全部 try/catch，永不抛出）
++// ============================================================================
++
++// [cx] US-006/US-008: 按指定 key/baseURL 拉 profile。任何异常都转成 error 态返回，永不抛出。
++// 凭据由参数传入（逐 key 查询）——不同 key 可能是不同账户。
++export async function fetchProfileWith(baseURL: string, apiKey: string): Promise<KeyProfileState> {
++  if (!baseURL || !apiKey) return { status: "error", message: "缺少渠道凭据" }
++  try {
++    const url = deriveApiBase(baseURL) + APP_PROFILE_PATH
++    const res = await fetch(url, {
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++        Accept: "application/json",
++      },
++      // [cx] 弱网时 fetch 可能长时间挂起，面板会一直停在「加载中」；统一 15s 超时兜底。
++      signal: AbortSignal.timeout(15_000),
++    })
++    if (!res.ok) return { status: "error", message: `请求返回 HTTP ${res.status}` }
++
++    const body = (await res.json()) as ProfileResponse
++    if (body.success === false) {
++      return { status: "error", message: body.message || "接口返回失败" }
++    }
++    const p = body.data ?? body
++    const accountUsedQuota = p.account_used_quota ?? p.used_quota ?? 0
++    const accountTotalQuota = p.account_total_quota ?? p.quota ?? 0
++    const accountRemainingQuota = p.account_remaining_quota ?? Math.max(0, accountTotalQuota - accountUsedQuota)
++    return {
++      status: "ready",
++      username: p.username ?? "",
++      displayName: p.display_name ?? "",
++      avatar: p.avatar ?? "",
++      accountRemainingQuota,
++      accountUsedQuota,
++      accountTotalQuota: accountTotalQuota || accountRemainingQuota + accountUsedQuota,
++      accountQuotaUsedToday:
++        typeof p.account_quota_used_today === "number"
++          ? p.account_quota_used_today
++          : typeof p.used_today === "number"
++            ? p.used_today
++            : null,
++      accountTokensUsedToday: typeof p.account_tokens_used_today === "number" ? p.account_tokens_used_today : null,
++      accountPromptTokensToday:
++        typeof p.account_prompt_tokens_today === "number" ? p.account_prompt_tokens_today : null,
++      accountCompletionTokensToday:
++        typeof p.account_completion_tokens_today === "number" ? p.account_completion_tokens_today : null,
++      keyRemainingQuota: p.key_remaining_quota ?? p.token_remain ?? 0,
++      keyUsedQuota: p.key_used_quota ?? p.token_used ?? 0,
++      keyQuotaUsedToday:
++        typeof p.key_quota_used_today === "number"
++          ? p.key_quota_used_today
++          : typeof p.token_used_today === "number"
++            ? p.token_used_today
++            : null,
++      keyTokensUsedToday: typeof p.key_tokens_used_today === "number" ? p.key_tokens_used_today : null,
++      keyPromptTokensToday: typeof p.key_prompt_tokens_today === "number" ? p.key_prompt_tokens_today : null,
++      keyCompletionTokensToday:
++        typeof p.key_completion_tokens_today === "number" ? p.key_completion_tokens_today : null,
++      keyUnlimitedQuota: p.key_unlimited_quota ?? p.unlimited ?? false,
++      // 分组与动态倍率：缺失给安全默认（空分组 / 非动态）。
++      keyGroup: typeof p.key_group === "string" ? p.key_group : "",
++      keyDynamicRatio: p.key_dynamic_ratio === true,
++      // 状态默认按「启用」(1)，过期时间默认 0（永不过期）——旧后端不返回时不误报异常态。
++      keyStatus: typeof p.key_status === "number" ? p.key_status : 1,
++      keyExpiresAt: typeof p.key_expires_at === "number" ? p.key_expires_at : 0,
++      // 模型白名单：仅当后端明确 enabled 且返回数组时才视为启用，否则按「不限模型」。
++      keyModelLimitsEnabled: p.key_model_limits_enabled === true,
++      keyModelLimits: Array.isArray(p.key_model_limits)
++        ? p.key_model_limits.filter((m): m is string => typeof m === "string" && m.length > 0)
++        : [],
++      requestCountToday: typeof p.request_count_today === "number" ? p.request_count_today : null,
++      tokenName: typeof p.key_name === "string" ? p.key_name : typeof p.token_name === "string" ? p.token_name : "",
++    }
++  } catch (error) {
++    // [cx] 具体错误只进 console（多为英文/技术信息）；UI 一律中文兜底文案，不直出 error.message。
++    console.error("[cx-account] profile 请求失败:", error)
++    return {
++      status: "error",
++      message: error instanceof Error && error.name === "TimeoutError" ? "请求超时，请稍后重试" : "网络请求失败，请检查网络后重试",
++    }
++  }
++}
++
++// [cx] 新增 key 未填名称时，用该 key 在 new-api 侧的 token 名称（token.Name，经 /api/app/profile
++// 的 token_name 返回）作为本地 label 的一次性来源。拉取失败 / 名称为空时返回空串——调用方据此
++// 决定回退（如「未命名 key」）。此处只在新增那一刻取一次，后续本地 label 不再与远端同步。
++export async function fetchTokenName(baseURL: string, apiKey: string): Promise<string> {
++  const profile = await fetchProfileWith(baseURL, apiKey)
++  if (profile.status !== "ready") return ""
++  return profile.tokenName.trim()
++}
++
++// [cx] US-009: 拉取某 key 的可用模型列表（OpenAI 兼容 /v1/models，Bearer sk-）。返回模型 id
++// 数组；任何异常/非 200/脏响应都返回空数组，永不抛出。切换激活 key 后落盘，server.ts 注入内核。
++export async function fetchModelsWith(baseURL: string, apiKey: string): Promise<string[]> {
++  if (!baseURL || !apiKey) return []
++  try {
++    const res = await fetch(deriveModelsUrl(baseURL), {
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++        Accept: "application/json",
++      },
++      // [cx] 同 fetchProfileWith：15s 超时，避免弱网下无限挂起。
++      signal: AbortSignal.timeout(15_000),
++    })
++    if (!res.ok) return []
++    const body = (await res.json()) as { data?: unknown } | unknown[]
++    const list = Array.isArray(body)
++      ? body
++      : Array.isArray((body as { data?: unknown }).data)
++        ? (body as { data: unknown[] }).data
++        : []
++    const ids = list
++      .map((m) => (typeof m === "string" ? m : m && typeof m === "object" ? (m as { id?: unknown }).id : undefined))
++      .filter((id): id is string => typeof id === "string" && id.length > 0)
++    return Array.from(new Set(ids))
++  } catch {
++    return []
++  }
++}
++
++// ============================================================================
++// [cx] US-013: dokng:// 深链一键导入解析
++//
++// 深链格式（约定）：dokng://import-key?key=sk-xxx&label=我的渠道&baseURL=https://host/v1
++//   - key（必填）：new-api 的 API Token（sk-…）。校验非空。
++//   - label（可选）：展示名。
++//   - baseURL（可选）：渠道地址，缺省用内置地址。校验须为可解析 http(s)，否则丢弃回退内置。
++// host 兼容 import-key / 空 host（dokng://?key=…）两种写法。
++//
++// 安全（US-013 验收 #3）：解析成功不静默写入，由调用方弹确认框展示 label / 打码 key / baseURL，
++// 用户确认后才 channelKeysAdd 写入，避免恶意深链偷偷灌 key。
++// ============================================================================
++
++// [cx] US-013: 从单条 dokng:// URL 解析导入请求。校验：dokng: 协议 + key 非空。baseURL 若提供须为
++// 可解析 http(s)，否则丢弃该字段（回退内置）而非整体失败。解析失败返回 null，不抛出。
++export function parseImportDeepLink(raw: string): ImportRequest | null {
++  if (typeof raw !== "string" || !raw.trim()) return null
++  let url: URL
++  try {
++    url = new URL(raw.trim())
++  } catch {
++    return null
++  }
++  if (url.protocol !== "dokng:") return null
++  const params = url.searchParams
++  const key = (params.get("key") ?? "").trim()
++  if (!key) return null
++  const label = (params.get("label") ?? "").trim()
++  let baseURL = (params.get("baseURL") ?? params.get("baseurl") ?? "").trim()
++  if (baseURL) {
++    try {
++      const parsed = new URL(baseURL)
++      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") baseURL = ""
++    } catch {
++      baseURL = "" // baseURL 非法——丢弃，回退内置地址，不因此整体失败。
++    }
++  }
++  return { key, label, baseURL }
++}
++
++// [cx] US-013: 深链导入确认框展示用的渠道地址（空则回退构建期内置 / 文案兜底）。
++export function importDisplayBase(request: ImportRequest): string {
++  return request.baseURL || cxEnv().NEWAPI_BASE_URL || "内置渠道地址"
++}
++
++// [cx] 导入请求的「有效渠道地址」——用于向 new-api 发请求（取 token 名称等）。与
++// importDisplayBase 不同，这里不带「内置渠道地址」文案兜底：空则回退构建期内置 NEWAPI_BASE_URL，
++// 仍为空时返回空串（调用方 fetch 会因缺 baseURL 直接返回空/错误，不抛出）。
++export function importEffectiveBaseURL(request: ImportRequest): string {
++  return request.baseURL || cxEnv().NEWAPI_BASE_URL
++}
++
++// ============================================================================
++// [cx] profile 快照缓存（stale-while-revalidate）
++//
++// 目的：账户面板每次打开都要逐 key 请求 /api/app/profile，网络慢时用户先看到「加载中…」空态
++// 好几秒。此处把上次成功拉到的 ready profile 落 localStorage，下次打开面板时先用缓存瞬时填充
++// 卡片（陈旧但可读），后台再拉最新数据覆盖——即 stale-while-revalidate，消除「点开先白屏」。
++//
++// 边界：
++//   · 只缓存 ready 态——loading/error 无展示价值，不写入也不读出。
++//   · 按 key.id 存，随 key 删除清理（pruneCachedProfiles）。
++//   · 缓存内只有 profile 展示字段，不含 key/baseURL 明文，符合「明文只本地内存持有」约束。
++//   · 带写入时间戳，超过 TTL 视为过期不再用于填充（避免展示过时太久的数据；仍会后台刷新）。
++//   · localStorage 不可用（web SSR / 隐私模式 / 写满）时全部降级为 no-op，绝不抛出。
++// ============================================================================
++
++const PROFILE_CACHE_KEY = "cx-account:profile-cache:v1"
++const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000 // 24h：超过则不再用于瞬时填充（仍后台刷新）
++
++type ReadyProfile = Extract<KeyProfileState, { status: "ready" }>
++type CachedProfileEntry = { savedAt: number; profile: ReadyProfile }
++
++function readProfileCacheFile(): Record<string, CachedProfileEntry> {
++  try {
++    if (typeof localStorage === "undefined") return {}
++    const raw = localStorage.getItem(PROFILE_CACHE_KEY)
++    if (!raw) return {}
++    const parsed = JSON.parse(raw) as unknown
++    if (!parsed || typeof parsed !== "object") return {}
++    return parsed as Record<string, CachedProfileEntry>
++  } catch {
++    return {}
++  }
++}
++
++function writeProfileCacheFile(file: Record<string, CachedProfileEntry>): void {
++  try {
++    if (typeof localStorage === "undefined") return
++    localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(file))
++  } catch {
++    // localStorage 写满 / 隐私模式禁用 —— 静默降级，不影响面板。
++  }
++}
++
++// [cx] 读取所有未过期的缓存 profile（供面板打开时瞬时填充）。返回 id → ready 态映射；
++// 空 / 过期 / 脏数据一律跳过，异常返回 {}，绝不抛出。
++export function readCachedProfiles(): Record<string, KeyProfileState> {
++  const file = readProfileCacheFile()
++  const now = Date.now()
++  const out: Record<string, KeyProfileState> = {}
++  for (const [id, entry] of Object.entries(file)) {
++    if (!entry || typeof entry.savedAt !== "number") continue
++    if (now - entry.savedAt > PROFILE_CACHE_TTL_MS) continue
++    if (entry.profile && entry.profile.status === "ready") out[id] = entry.profile
++  }
++  return out
++}
++
++// [cx] 写入某 key 的最新 ready profile 到缓存（仅 ready 态；loading/error 忽略）。
++export function saveCachedProfile(id: string, state: KeyProfileState): void {
++  if (state.status !== "ready") return
++  const file = readProfileCacheFile()
++  file[id] = { savedAt: Date.now(), profile: state }
++  writeProfileCacheFile(file)
++}
++
++// [cx] 按存活 key.id 清理缓存（key 删除后丢弃其快照，避免无限增长与展示已删 key 的旧数据）。
++export function pruneCachedProfiles(validIds: string[]): void {
++  const file = readProfileCacheFile()
++  const valid = new Set(validIds)
++  let changed = false
++  for (const id of Object.keys(file)) {
++    if (!valid.has(id)) {
++      delete file[id]
++      changed = true
++    }
++  }
++  if (changed) writeProfileCacheFile(file)
++}
+diff --git a/packages/app/src/components/cx-account/cx-account-dialog.tsx b/packages/app/src/components/cx-account/cx-account-dialog.tsx
+new file mode 100644
+index 000000000..0073fb3cf
+--- /dev/null
++++ b/packages/app/src/components/cx-account/cx-account-dialog.tsx
+@@ -0,0 +1,863 @@
++// [cx] 账户面板（迁自 desktop 包 renderer/balance/balance-panel.tsx，US-005 → US-013）。
++//
++// 本文件是账户面板从 desktop 包迁入 @opencode-ai/app 包的落地：改用原生 v2 组件
++// （@opencode-ai/ui/v2 的 Dialog / ButtonV2 / TextInputV2 / IconButtonV2 / Tag）+
++// useDialog() 外壳，配色全走 v2 语义变量（cx-account.css），跟随明暗主题、与原生设置页视觉统一。
++// 不再自绘悬浮层 / 不再硬编码颜色（旧 desktop 面板 84 处硬编码金色内联样式已全部退役）。
++//
++// 数据层在 cx-account-api.ts（纯函数 + new-api 请求 + 本地 key 列表 + 跨包 window.api 桥接）。
++// 接线（侧边栏账户按钮 dialog.show、dokng:// 深链）在 07 补丁的 layout.tsx；本文件只导出面板组件。
++//
++// 低冲突：独立目录 packages/app/src/components/cx-account/，全部 Cx 前缀，对上游现有文件零改动。
++
++import { createSignal, onMount, For, Show, Switch, Match } from "solid-js"
++import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
++import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
++import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
++import { Tag } from "@opencode-ai/ui/v2/badge-v2"
++import { Icon } from "@opencode-ai/ui/v2/icon"
++import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
++import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
++import "./cx-account.css"
++import {
++  avatarInitial,
++  channelProviderId,
++  fetchModelsWith,
++  fetchProfileWith,
++  fetchTokenName,
++  formatCurrency,
++  formatExpiry,
++  formatTokenCount,
++  keyStatusLabel,
++  keyUsedPercent,
++  loadChannelState,
++  maskKey,
++  openTopup,
++  pruneCachedProfiles,
++  readCachedProfiles,
++  resolveKeyList,
++  resolveSiteUrl,
++  resolveTopupUrl,
++  saveCachedProfile,
++  usedPercent,
++  cxChannelApi,
++  type KeyProfileState,
++  type ResolvedKey,
++} from "./cx-account-api"
++
++// [cx] US-008/US-009: 单条 key 列表项。按各自 key 独立展示 profile（loading/error/ready）；点击整行
++// 切换激活，选中态由背景与强调边框表达，操作区只保留编辑 label / 删除（builtin 条目不可管理）。
++function KeyCard(props: {
++  entry: ResolvedKey
++  state: KeyProfileState | undefined
++  switching: boolean
++  onActivate: (entry: ResolvedKey) => void
++  onSaveLabel: (id: string, label: string) => void
++  onRemove: (id: string) => void
++}) {
++  const state = () => props.state ?? ({ status: "loading" } as KeyProfileState)
++  const [editing, setEditing] = createSignal(false)
++  const [labelDraft, setLabelDraft] = createSignal("")
++  const [confirmingDelete, setConfirmingDelete] = createSignal(false)
++
++  const readyProfile = () => {
++    const current = state()
++    return current.status === "ready" ? current : undefined
++  }
++  const displayLabel = () => props.entry.label.trim() || readyProfile()?.tokenName.trim() || "未命名 key"
++  // [cx] 分组名跟在 sk**** 身份行末尾（不再单独占一行 meta 徽标）；无分组返回空串。
++  const groupTag = () => readyProfile()?.keyGroup?.trim() || ""
++
++  // 徽标（状态/分组/动态倍率/过期）从身份列渲染，不再作为独立网格列，避免撑破卡片列布局。
++  // 统一收敛为一个数组，JSX 用 <For> 渲染；每项带 data-slot 与可选 data-level。
++  const metaTags = (): Array<{ slot: string; text: string; level?: string }> => {
++    const p = readyProfile()
++    if (!p) return []
++    const tags: Array<{ slot: string; text: string; level?: string }> = []
++    const status = keyStatusLabel(p.keyStatus)
++    if (status) tags.push({ slot: "cx-status-tag", text: status, level: "danger" })
++    // [cx] 分组标签已移到身份行（跟在 sk**** 后，见 groupTag()），此处不再作为 meta 徽标渲染。
++    if (p.keyDynamicRatio) tags.push({ slot: "cx-dynamic-tag", text: "动态倍率" })
++    const exp = formatExpiry(p.keyExpiresAt)
++    if (exp.level !== "ok") tags.push({ slot: "cx-expiry-tag", text: exp.text, level: exp.level })
++    return tags
++  }
++
++  function startEdit() {
++    setLabelDraft(displayLabel() === "未命名 key" ? "" : displayLabel())
++    setEditing(true)
++  }
++  function saveEdit() {
++    props.onSaveLabel(props.entry.id, labelDraft().trim())
++    setEditing(false)
++  }
++
++  const manageable = () => !props.entry.builtin
++  const clickable = () => manageable() && !props.entry.isActive && !props.switching
++
++  return (
++    <article
++      data-slot="cx-key-card"
++      data-active={props.entry.isActive ? "" : undefined}
++      data-clickable={clickable() ? "" : undefined}
++      aria-current={props.entry.isActive ? "true" : undefined}
++      aria-label={clickable() ? `切换到 ${displayLabel()}` : undefined}
++      role={clickable() ? "button" : undefined}
++      tabIndex={clickable() ? 0 : undefined}
++      onClick={() => {
++        // 仅在「非激活、可管理、未切换中、未处于内联编辑」时，点击列表项切换激活。
++        if (clickable() && !editing()) props.onActivate(props.entry)
++      }}
++      onKeyDown={(event) => {
++        if (!clickable() || editing() || (event.key !== "Enter" && event.key !== " ")) return
++        event.preventDefault()
++        props.onActivate(props.entry)
++      }}
++    >
++      {/* [cx] 删除入口移到卡片右上角：常态显示叉，点击后原地展开确认（✓/✕）。 */}
++      <Show when={manageable() && !editing()}>
++        <div data-slot="cx-key-delete-corner" onClick={(e) => e.stopPropagation()}>
++          <Show
++            when={confirmingDelete()}
++            fallback={
++              <TooltipV2 value="删除 Key" placement="top">
++                <IconButtonV2
++                  aria-label="删除 Key"
++                  variant="neutral"
++                  size="small"
++                  onClick={() => setConfirmingDelete(true)}
++                  icon={<Icon name="xmark-small" size="small" />}
++                />
++              </TooltipV2>
++            }
++          >
++            <TooltipV2 value="确认删除" placement="top">
++              <IconButtonV2
++                data-slot="cx-delete-confirm-button"
++                aria-label="确认删除"
++                variant="neutral"
++                size="small"
++                onClick={() => {
++                  setConfirmingDelete(false)
++                  props.onRemove(props.entry.id)
++                }}
++                icon={<Icon name="check" size="small" />}
++              />
++            </TooltipV2>
++            <TooltipV2 value="取消删除" placement="top">
++              <IconButtonV2
++                aria-label="取消删除"
++                variant="neutral"
++                size="small"
++                onClick={() => setConfirmingDelete(false)}
++                icon={<Icon name="close" size="small" />}
++              />
++            </TooltipV2>
++          </Show>
++        </div>
++      </Show>
++
++      <header data-slot="cx-key-card-head">
++        <div data-slot="cx-key-card-title">
++          <Show
++            when={editing()}
++            fallback={
++              <>
++                <div data-slot="cx-key-label">{displayLabel()}</div>
++                {/* [cx] sk**** 与分组标签同一行：分组不再单独占一行，紧跟打码 key 之后。 */}
++                <div data-slot="cx-key-masked-row">
++                  <span data-slot="cx-key-masked">{maskKey(props.entry.key)}</span>
++                  <Show when={groupTag()}>
++                    {(g) => <Tag data-slot="cx-group-tag">{g()}</Tag>}
++                  </Show>
++                </div>
++              </>
++            }
++          >
++            {/* 内联编辑 label —— 点击输入区不触发列表项切换。 */}
++            <div onClick={(e) => e.stopPropagation()}>
++              <TextInputV2
++                value={labelDraft()}
++                placeholder="key 名称"
++                onInput={(e) => setLabelDraft(e.currentTarget.value)}
++                aria-label="编辑 key 名称"
++              />
++            </div>
++          </Show>
++          {/* 状态 / 分组 / 倍率 / 过期 徽标行，随身份列渲染，不占独立网格列。 */}
++          <Show when={!editing() && metaTags().length > 0}>
++            <div data-slot="cx-key-meta">
++              <For each={metaTags()}>
++                {(tag) => (
++                  <Tag data-slot={tag.slot} data-level={tag.level}>
++                    {tag.text}
++                  </Tag>
++                )}
++              </For>
++            </div>
++          </Show>
++        </div>
++      </header>
++
++      <Switch>
++        <Match when={props.switching && !props.entry.isActive}>
++          <div data-slot="cx-key-state">切换中…</div>
++        </Match>
++
++        <Match when={state().status === "loading"}>
++          <div data-slot="cx-key-state">加载中…</div>
++        </Match>
++
++        <Match
++          when={state().status === "error" ? (state() as Extract<KeyProfileState, { status: "error" }>) : undefined}
++          keyed
++        >
++          {(err) => <div data-slot="cx-key-state">获取失败：{err.message}</div>}
++        </Match>
++
++        <Match
++          when={state().status === "ready" ? (state() as Extract<KeyProfileState, { status: "ready" }>) : undefined}
++          keyed
++        >
++          {(ready) => {
++            // 有效模型数：白名单启用时取白名单长度，否则视为「全部」（不限模型）。
++            // 优先用后端 profile 的白名单，回退到本地缓存的 models 数。
++            const modelText = () =>
++              ready.keyModelLimitsEnabled ? String(ready.keyModelLimits.length) : props.entry.models.length || "全部"
++            return (
++              <>
++                {/* [cx] 输入/输出：独立块（自成一列，排在身份与「今日 Tokens」之间），上下两行、
++                    无「输入/输出」标题——↑ 输入一行、↓ 输出一行，行高统一不挤压。 */}
++                <div data-slot="cx-token-io-col">
++                  <span>↑{formatTokenCount(ready.keyPromptTokensToday)}</span>
++                  <span>↓{formatTokenCount(ready.keyCompletionTokensToday)}</span>
++                </div>
++                {/* [cx] 指标 4 格一组（今日 Tokens / 今日费用 / 累计费用 / 模型），宽度随内容变化不再等宽。 */}
++                <div data-slot="cx-token-stats">
++                  <div data-slot="cx-token-stat">
++                    <span>今日 Tokens</span>
++                    <strong>{formatTokenCount(ready.keyTokensUsedToday)}</strong>
++                  </div>
++                  <div data-slot="cx-token-stat">
++                    <span>今日费用</span>
++                    <strong>{ready.keyQuotaUsedToday === null ? "—" : formatCurrency(ready.keyQuotaUsedToday)}</strong>
++                  </div>
++                  <div data-slot="cx-token-stat">
++                    <span>累计费用</span>
++                    <strong>{formatCurrency(ready.keyUsedQuota)}</strong>
++                  </div>
++                  <div data-slot="cx-token-stat">
++                    <span>模型</span>
++                    <strong>{modelText()}</strong>
++                  </div>
++                </div>
++
++                <div data-slot="cx-key-quota">
++                  <Show when={!ready.keyUnlimitedQuota} fallback={<Tag data-slot="cx-unlimited-tag">额度不限</Tag>}>
++                    <div data-slot="cx-key-bar-row">
++                      <span>
++                        额度 {keyUsedPercent(ready.keyUsedQuota, ready.keyRemainingQuota)}% · 剩余{" "}
++                        {formatCurrency(ready.keyRemainingQuota)}
++                      </span>
++                      <div data-slot="cx-key-bar-track">
++                        <div
++                          data-slot="cx-key-bar-fill"
++                          style={{ width: `${keyUsedPercent(ready.keyUsedQuota, ready.keyRemainingQuota)}%` }}
++                        />
++                      </div>
++                    </div>
++                  </Show>
++                </div>
++              </>
++            )
++          }}
++        </Match>
++      </Switch>
++
++      {/* [cx] US-009: 编辑操作固定在行末列。删除入口已移到卡片右上角（见 header 上方）。
++          编辑态时行末显示保存 / 取消；非编辑态只显示编辑名称按钮。 */}
++      <Show when={manageable()}>
++        <div data-slot="cx-key-actions" onClick={(e) => e.stopPropagation()}>
++          <Show
++            when={editing()}
++            fallback={
++              <TooltipV2 value="编辑名称" placement="top">
++                <IconButtonV2
++                  aria-label="编辑名称"
++                  variant="neutral"
++                  size="small"
++                  onClick={startEdit}
++                  icon={<Icon name="edit" size="small" />}
++                />
++              </TooltipV2>
++            }
++          >
++            <TooltipV2 value="保存名称" placement="top">
++              <IconButtonV2
++                aria-label="保存名称"
++                variant="contrast"
++                size="small"
++                onClick={saveEdit}
++                icon={<Icon name="check" size="small" />}
++              />
++            </TooltipV2>
++            <TooltipV2 value="取消编辑" placement="top">
++              <IconButtonV2
++                aria-label="取消编辑"
++                variant="neutral"
++                size="small"
++                onClick={() => setEditing(false)}
++                icon={<Icon name="close" size="small" />}
++              />
++            </TooltipV2>
++          </Show>
++        </div>
++      </Show>
++    </article>
++  )
++}
++
++// [cx] US-009: 新增 key 表单。粘贴 sk-…（必填）+ 可选 label。key 明文只在内存流转，
++// 提交经 channelKeysAdd 写入本地 store；不打印、不写日志。
++// [cx] FR-3.5: 不暴露 baseURL 输入——新增 key 的 baseURL 固定为空串，由构建期内置
++// NEWAPI_BASE_URL 回退兜底；底层数据契约（channelKeysAdd 的 baseURL 参数）保持不变。
++// [cx] US-011: startOpen —— 首启无 key 引导时直接展开表单（引导即进入新增流程），无需再点一次。
++function AddKeyForm(props: {
++  onAdd: (input: { label: string; key: string; baseURL: string }) => Promise<void>
++  startOpen?: boolean
++  open?: boolean
++  onOpenChange?: (open: boolean) => void
++}) {
++  const [localOpen, setLocalOpen] = createSignal(props.startOpen ?? false)
++  const open = () => props.open ?? localOpen()
++  const setOpen = (value: boolean) => {
++    setLocalOpen(value)
++    props.onOpenChange?.(value)
++  }
++  const [key, setKey] = createSignal("")
++  const [label, setLabel] = createSignal("")
++  const [error, setError] = createSignal("")
++  const [saving, setSaving] = createSignal(false)
++
++  function reset() {
++    setKey("")
++    setLabel("")
++    setError("")
++  }
++
++  async function submit() {
++    const k = key().trim()
++    if (!k) {
++      setError("请粘贴 API Key（sk-…）")
++      return
++    }
++    setSaving(true)
++    setError("")
++    try {
++      // [cx] FR-3.5: baseURL 输入不暴露给用户，固定为空串——底层 channelKeysAdd 收到空 baseURL
++      // 时走构建期内置 NEWAPI_BASE_URL 回退（见 cx-account-api / 主进程 store）。数据契约不变。
++      await props.onAdd({ label: label().trim(), key: k, baseURL: "" })
++      reset()
++      setOpen(false)
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : "添加失败，请稍后重试")
++    } finally {
++      setSaving(false)
++    }
++  }
++
++  return (
++    <Show
++      when={open()}
++      fallback={
++        <ButtonV2 variant="neutral" size="normal" icon="plus" class="cx-add-key-trigger" onClick={() => setOpen(true)}>
++          新增 key
++        </ButtonV2>
++      }
++    >
++      <div data-slot="cx-add-form">
++        <TextInputV2
++          value={key()}
++          type="password"
++          autocomplete="off"
++          autofocus
++          placeholder="API Key（sk-…，必填）"
++          onInput={(e) => setKey(e.currentTarget.value)}
++          onKeyDown={(e) => {
++            if (e.key === "Enter" && !saving()) void submit()
++          }}
++          aria-label="API Key"
++        />
++        <TextInputV2
++          value={label()}
++          placeholder="名称（可选）"
++          onInput={(e) => setLabel(e.currentTarget.value)}
++          aria-label="key 名称"
++        />
++        <Show when={error()}>
++          <div data-slot="cx-form-error">{error()}</div>
++        </Show>
++        <div data-slot="cx-form-actions">
++          <ButtonV2 variant="contrast" size="normal" class="cx-flex-1" disabled={saving()} onClick={submit}>
++            {saving() ? "保存中…" : "添加"}
++          </ButtonV2>
++          <ButtonV2
++            variant="neutral"
++            size="normal"
++            onClick={() => {
++              reset()
++              setOpen(false)
++            }}
++          >
++            取消
++          </ButtonV2>
++        </div>
++      </div>
++    </Show>
++  )
++}
++
++// [cx] 账户面板主体。经 useDialog().show(() => <CxDialogAccount/>) 弹出（接线在 07 的 layout.tsx）。
++// 用 v2 Dialog(size=large) 外壳组织账户摘要、token 统计与响应式紧凑 key 列表。
++export function CxDialogAccount() {
++  const [initializing, setInitializing] = createSignal(true)
++  const [keys, setKeys] = createSignal<ResolvedKey[]>([])
++  const [profiles, setProfiles] = createSignal<Record<string, KeyProfileState>>({})
++  const [refreshingIds, setRefreshingIds] = createSignal<Set<string>>(new Set())
++  const [switchingId, setSwitchingId] = createSignal<string | null>(null)
++  const [addingKey, setAddingKey] = createSignal(false)
++  const [notice, setNotice] = createSignal("")
++  const requestVersions = new Map<string, number>()
++
++  const activeEntry = () => keys().find((k) => k.isActive) ?? keys()[0]
++  const activeProfile = (): KeyProfileState | undefined => {
++    const entry = activeEntry()
++    return entry ? profiles()[entry.id] : undefined
++  }
++  const accountProfile = (): Extract<KeyProfileState, { status: "ready" }> | undefined => {
++    const active = activeProfile()
++    if (active?.status === "ready") return active
++    return Object.values(profiles()).find(
++      (profile): profile is Extract<KeyProfileState, { status: "ready" }> => profile.status === "ready",
++    )
++  }
++  const tokenSummary = () => {
++    const ready = Object.values(profiles()).filter(
++      (profile): profile is Extract<KeyProfileState, { status: "ready" }> => profile.status === "ready",
++    )
++    return {
++      loaded: ready.length,
++      unlimited: ready.filter((profile) => profile.keyUnlimitedQuota).length,
++    }
++  }
++
++  const topupUrl = () => resolveTopupUrl(activeEntry()?.baseURL)
++  const siteUrl = () => resolveSiteUrl(activeEntry()?.baseURL)
++  const anyLoading = () => refreshingIds().size > 0
++
++  async function loadProfile(entry: ResolvedKey, options: { preserve?: boolean } = {}): Promise<void> {
++    const version = (requestVersions.get(entry.id) ?? 0) + 1
++    requestVersions.set(entry.id, version)
++    setRefreshingIds((prev) => new Set(prev).add(entry.id))
++    if (!options.preserve || !profiles()[entry.id]) {
++      setProfiles((prev) => ({ ...prev, [entry.id]: { status: "loading" } }))
++    }
++    const result = await fetchProfileWith(entry.baseURL, entry.key)
++    if (requestVersions.get(entry.id) !== version || !keys().some((item) => item.id === entry.id)) return
++    setProfiles((prev) => {
++      // [cx] stale-while-revalidate 关键：后台刷新（preserve）失败时，别把已展示的 ready（陈旧）
++      // 卡片打成「获取失败」——陈旧数据比红色报错更有用，也才是缓存的意义。仅当没有可保留的 ready
++      // 数据时（首次加载 / 非 preserve）才落 error。ready 结果永远直接覆盖。
++      const existing = prev[entry.id]
++      if (result.status === "error" && options.preserve && existing?.status === "ready") return prev
++      return { ...prev, [entry.id]: result }
++    })
++    // [cx] 成功拉到就落缓存，供下次打开面板瞬时填充（stale-while-revalidate）；error/loading 不写。
++    saveCachedProfile(entry.id, result)
++    setRefreshingIds((prev) => {
++      const next = new Set(prev)
++      next.delete(entry.id)
++      return next
++    })
++  }
++
++  function refreshAll(): void {
++    for (const entry of keys()) void loadProfile(entry, { preserve: true })
++  }
++
++  async function reloadKeys(
++    options: { loadMissing?: boolean; preserveCached?: boolean } = {},
++  ): Promise<ResolvedKey[]> {
++    const state = await loadChannelState()
++    const next = resolveKeyList(state)
++    const valid = new Set(next.map((entry) => entry.id))
++    setKeys(next)
++    setProfiles((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => valid.has(id))))
++    // [cx] 同步清理已删 key 的缓存快照，避免缓存无限增长 / 下次误填已删 key 的旧数据。
++    pruneCachedProfiles(next.map((entry) => entry.id))
++    setInitializing(false)
++    if (options.loadMissing) {
++      for (const entry of next) {
++        // preserveCached：缓存已把该 key 填成 ready（陈旧），此处仍要后台刷新，但用 preserve 语义
++        // 保住已填的卡片、不闪回「加载中…」；只有真正缺数据的 key 才走普通 loading 态加载。
++        if (options.preserveCached) void loadProfile(entry, { preserve: true })
++        else if (!profiles()[entry.id]) void loadProfile(entry)
++      }
++    }
++    return next
++  }
++
++  onMount(() => {
++    // [cx] stale-while-revalidate：先用上次落盘的缓存瞬时填充卡片（陈旧但可读），消除「点开先白屏
++    // 几秒」；随后 reloadKeys(loadMissing) 后台逐 key 拉最新数据覆盖。loadProfile 带 preserve 语义，
++    // 已有缓存填充时不会先把卡片打回「加载中…」，而是原地静默刷新。
++    const cached = readCachedProfiles()
++    if (Object.keys(cached).length > 0) setProfiles(cached)
++    void reloadKeys({ loadMissing: true, preserveCached: true })
++  })
++
++  // [cx] 新增 key —— 写入本地列表 → 主进程拉模型 + 热重载（provider 出现），不重启进程。
++  // [cx] 未填名称时：新增后用该 key 在 new-api 侧的 token 名称（/api/app/profile 的 token_name）
++  // 一次性回填本地 label（后续不再与远端同步）；取名失败 / 远端也没名字时保持「未命名 key」占位。
++  async function handleAdd(input: { label: string; key: string; baseURL: string }): Promise<void> {
++    setNotice("")
++    const addKey = cxChannelApi()?.channelKeysAdd
++    if (!addKey) throw new Error("当前环境无法保存 Key，请在桌面客户端中重试")
++
++    // channelKeysAdd 返回最新 ChannelKeysState 的 JSON，解析出新条目 id（按明文 key 反向匹配）。
++    let addedId: string | undefined
++    try {
++      const raw = await addKey(input)
++      const state = JSON.parse(raw) as { keys?: Array<{ id: string; key: string }> }
++      const list = Array.isArray(state.keys) ? state.keys : []
++      addedId = [...list].reverse().find((k) => k.key === input.key)?.id
++    } catch {
++      throw new Error("Key 保存失败，请检查桌面客户端状态后重试")
++    }
++    if (!addedId) throw new Error("未能确认新增的 Key，请重试")
++    const confirmedId = addedId
++
++    // [cx] 只同步本地 key 元数据，保留既有 profile 缓存（其它 key 不重拉）。
++    await reloadKeys()
++    setAddingKey(false)
++
++    // 本地写入成功后立即结束提交，让表单即时收起；远端名称、模型和 profile 在后台同步，
++    // 避免网络慢时用户点击「添加」长时间看不到反馈。
++    setNotice(`已添加 ${input.label.trim() || "新 Key"}，账户数据正在同步。`)
++    const entrySnapshot = keys().find((k) => k.id === confirmedId)
++    void (async () => {
++      if (!input.label.trim() && entrySnapshot) {
++        const remoteName = await fetchTokenName(entrySnapshot.baseURL, entrySnapshot.key)
++        if (remoteName) {
++          try {
++            await cxChannelApi()?.channelKeysUpdateLabel?.(confirmedId, remoteName)
++            await reloadKeys()
++          } catch {
++            // 回填失败不阻断：卡片仍显示「未命名 key」占位，可手动改名。
++          }
++        }
++      }
++
++      try {
++        await cxChannelApi()?.channelConfigRefreshKey?.(confirmedId)
++      } catch {
++        // 热重载失败不阻断；下次启动时文件配置仍会生效。
++      }
++      const refreshedEntry = keys().find((k) => k.id === confirmedId) ?? entrySnapshot
++      if (refreshedEntry) void loadProfile(refreshedEntry)
++    })()
++  }
++
++  // [cx] US-009: 保存 label —— 只更新本地列表，不重拉 profile（账户/token 数据未变）。
++  async function handleSaveLabel(id: string, label: string): Promise<void> {
++    try {
++      await cxChannelApi()?.channelKeysUpdateLabel?.(id, label)
++    } catch {
++      // 忽略：不让面板崩溃。
++    }
++    await reloadKeys()
++  }
++
++  // [cx] 删除 key（二次确认在卡片内完成）。删激活项时主进程侧激活回退首项/置空。
++  async function handleRemove(id: string): Promise<void> {
++    try {
++      await cxChannelApi()?.channelKeysRemove?.(id)
++    } catch {
++      // 忽略：不让面板崩溃。
++    }
++    // [cx] reloadKeys 已按存活 key 过滤 profile 缓存，无需额外清理。
++    await reloadKeys()
++    try {
++      await cxChannelApi()?.channelConfigReload?.()
++    } catch {
++      // 热重载失败不阻断；下次启动时文件配置仍会生效。
++    }
++  }
++
++  // [cx] 点击卡片切换激活 key —— 零重启。派发 cx:select-provider 事件，由 07 的桥接组件
++  // 接住 → useLocal().model.set 切到该 provider。providerID 规则须与 server.ts 完全一致。
++  async function handleActivate(entry: ResolvedKey): Promise<void> {
++    if (entry.builtin || entry.isActive || switchingId()) return
++    setSwitchingId(entry.id)
++    setNotice("")
++    try {
++      await cxChannelApi()?.channelKeysSetActive?.(entry.id)
++      // 拉该 key 的可用模型并落盘（供 provider 的可选模型）。失败返回空数组，不阻断切换。
++      const models = await fetchModelsWith(entry.baseURL, entry.key)
++      if (models.length > 0) {
++        try {
++          await cxChannelApi()?.channelKeysSetModels?.(entry.id, models)
++        } catch {
++          // 忽略：模型缓存写入失败不阻断切换。
++        }
++      }
++      const providerId = channelProviderId(entry.id)
++      // 默认 model：优先刚拉到的 models 首个；否则用 entry 已缓存的 models 首个；都没有则不派发
++      // 事件（仅更新激活项，避免切到一个没有 model 的 provider）。
++      const modelId = models.length > 0 ? models[0] : entry.models?.[0]
++      if (modelId) {
++        window.dispatchEvent(
++          new CustomEvent("cx:select-provider", { detail: { providerID: providerId, modelID: modelId } }),
++        )
++      }
++      // [cx] 只同步本地 active/models 元数据，保留全部 profile 缓存（账户级数据同源，不重拉）。
++      const next = await reloadKeys()
++      // 目标 key 若尚无 profile 缓存（例如刚导入未拉过），才补一次请求。
++      const target = next.find((k) => k.id === entry.id)
++      if (target && !profiles()[entry.id]) void loadProfile(target)
++    } catch {
++      setNotice("切换失败，请检查本地配置后重试。")
++    } finally {
++      setSwitchingId(null)
++    }
++  }
++
++  return (
++    <Dialog size="x-large" class="cx-account-dialog">
++      <DialogHeader closeLabel="关闭">
++        <DialogTitle>账户</DialogTitle>
++      </DialogHeader>
++      <DialogBody class="cx-account-body">
++        <Switch>
++          <Match when={initializing()}>
++            <div data-slot="cx-state-box">正在加载…</div>
++          </Match>
++
++          {/* [cx] US-011: 首启无 key 引导。 */}
++          <Match when={keys().length === 0}>
++            <div data-slot="cx-onboard">
++              <div data-slot="cx-onboard-icon">
++                <Icon name="plus" />
++              </div>
++              <div data-slot="cx-onboard-title">连接你的 Dokng 账户</div>
++              <div data-slot="cx-onboard-desc">
++                先在 Dokng 控制台创建 API Key，再将它粘贴到下方。Key 只保存在本机，并会自动读取账户余额与可用模型。
++              </div>
++              <Show when={siteUrl()}>
++                <ButtonV2 variant="neutral" size="normal" class="cx-site-button" onClick={() => openTopup(siteUrl())}>
++                  前往 Dokng 获取 API Key
++                  <Icon name="outline-square-arrow" size="small" />
++                </ButtonV2>
++              </Show>
++              <div data-slot="cx-onboard-divider">
++                <span>已有 API Key</span>
++              </div>
++              <AddKeyForm onAdd={handleAdd} startOpen />
++            </div>
++          </Match>
++
++          {/* [cx] 账户工作台：摘要、真实指标与 key 管理。 */}
++          <Match when={keys().length > 0}>
++            <div data-slot="cx-dashboard">
++              <div data-slot="cx-dashboard-head">
++                <Switch>
++                  <Match when={(activeProfile()?.status ?? "loading") === "loading"}>
++                    <div data-slot="cx-account-head" data-loading="">
++                      <div data-slot="cx-account-avatar-fallback">…</div>
++                      <div data-slot="cx-account-copy">
++                        <div data-slot="cx-account-name">正在读取账户</div>
++                        <div data-slot="cx-account-subtitle">正在连接当前激活的 key</div>
++                      </div>
++                    </div>
++                  </Match>
++                  <Match when={(activeProfile()?.status ?? "loading") === "error"}>
++                    <div data-slot="cx-account-head">
++                      <div data-slot="cx-account-avatar-fallback" data-error="">
++                        !
++                      </div>
++                      <div data-slot="cx-account-copy">
++                        <div data-slot="cx-account-name">账户数据不可用</div>
++                        <div data-slot="cx-account-subtitle">key 仍可管理，刷新后将重新请求</div>
++                      </div>
++                    </div>
++                  </Match>
++                  <Match
++                    when={
++                      activeProfile()?.status === "ready"
++                        ? (activeProfile() as Extract<KeyProfileState, { status: "ready" }>)
++                        : undefined
++                    }
++                    keyed
++                  >
++                    {(ready) => (
++                      <div data-slot="cx-account-head">
++                        <Show
++                          when={ready.avatar}
++                          fallback={
++                            <div data-slot="cx-account-avatar-fallback">
++                              {avatarInitial(ready.displayName || ready.username)}
++                            </div>
++                          }
++                        >
++                          <img src={ready.avatar} alt="头像" data-slot="cx-account-avatar" />
++                        </Show>
++                        <div data-slot="cx-account-copy">
++                          <div data-slot="cx-account-name">{ready.displayName || ready.username || "未命名用户"}</div>
++                          <div data-slot="cx-account-subtitle">
++                            {ready.displayName && ready.username ? `@${ready.username} · ` : ""}当前使用{" "}
++                            {activeEntry()?.label || ready.tokenName || "未命名 key"}
++                          </div>
++                        </div>
++                        <Tag data-slot="cx-connection-tag">已连接</Tag>
++                      </div>
++                    )}
++                  </Match>
++                </Switch>
++                <div data-slot="cx-dashboard-actions">
++                  <TooltipV2 value="刷新全部账户数据" placement="bottom">
++                    <IconButtonV2
++                      aria-label="刷新全部账户数据"
++                      variant="neutral"
++                      size="normal"
++                      disabled={anyLoading()}
++                      onClick={refreshAll}
++                      icon={<Icon name="reset" size="small" />}
++                    />
++                  </TooltipV2>
++                  <Show when={siteUrl()}>
++                    <ButtonV2 variant="neutral" size="normal" onClick={() => openTopup(siteUrl() + "/dashboard")}>
++                      控制台
++                      <Icon name="outline-square-arrow" size="small" />
++                    </ButtonV2>
++                  </Show>
++                  <ButtonV2
++                    variant="contrast"
++                    size="normal"
++                    disabled={!topupUrl()}
++                    onClick={() => openTopup(topupUrl())}
++                  >
++                    充值
++                  </ButtonV2>
++                </div>
++              </div>
++
++              {/* [cx] 账户余额与真实模型 Token 用量总览。始终渲染以固定布局，数据未就绪时展示占位，
++                   避免「打开时缺失、数据回来才撑出」导致的抖动。API Key 数量只作为同步状态，绝不当作 token 消耗。 */}
++              {(() => {
++                const ready = accountProfile()
++                const pct = ready ? usedPercent(ready.accountUsedQuota, ready.accountTotalQuota) : 0
++                return (
++                  <section data-slot="cx-summary" aria-label="账户用量总览" data-pending={ready ? undefined : ""}>
++                    <div data-slot="cx-usage-visual">
++                      <div
++                        data-slot="cx-usage-ring"
++                        style={`--cx-used: ${pct}`}
++                        role="img"
++                        aria-label={ready ? `账户额度已使用 ${pct}%` : "账户额度加载中"}
++                      >
++                        <div data-slot="cx-usage-ring-inner">
++                          <strong>{ready ? `${pct}%` : "—"}</strong>
++                          <span>账户额度已用</span>
++                        </div>
++                      </div>
++                      <div data-slot="cx-usage-copy">
++                        <span>可用余额</span>
++                        <strong>{ready ? formatCurrency(ready.accountRemainingQuota) : "—"}</strong>
++                        <small>账户总额 {ready ? formatCurrency(ready.accountTotalQuota) : "—"}</small>
++                      </div>
++                    </div>
++
++                    <div data-slot="cx-overview-metrics">
++                      <div data-slot="cx-overview-head">
++                        <span>用量概览</span>
++                        <small>
++                          已同步 {tokenSummary().loaded} / {keys().length} 个 Key
++                          <Show when={tokenSummary().unlimited > 0}> · {tokenSummary().unlimited} 个额度不限</Show>
++                        </small>
++                      </div>
++                      <div data-slot="cx-overview-grid">
++                        <div data-slot="cx-overview-item">
++                          <span>今日 Tokens</span>
++                          <strong>{ready ? formatTokenCount(ready.accountTokensUsedToday) : "—"}</strong>
++                        </div>
++                        <div data-slot="cx-overview-item">
++                          <span>输入 / 输出</span>
++                          <strong>
++                            {ready
++                              ? `${formatTokenCount(ready.accountPromptTokensToday)} / ${formatTokenCount(ready.accountCompletionTokensToday)}`
++                              : "—"}
++                          </strong>
++                        </div>
++                        <div data-slot="cx-overview-item">
++                          <span>今日费用</span>
++                          <strong>
++                            {ready
++                              ? ready.accountQuotaUsedToday === null
++                                ? "—"
++                                : formatCurrency(ready.accountQuotaUsedToday)
++                              : "—"}
++                          </strong>
++                        </div>
++                        <div data-slot="cx-overview-item">
++                          <span>累计费用</span>
++                          <strong>{ready ? formatCurrency(ready.accountUsedQuota) : "—"}</strong>
++                        </div>
++                      </div>
++                    </div>
++                  </section>
++                )
++              })()}
++
++              <Show when={notice()}>
++                <div data-slot="cx-notice">{notice()}</div>
++              </Show>
++
++              <div data-slot="cx-key-col">
++                <div data-slot="cx-key-col-head">
++                  <div data-slot="cx-key-col-copy">
++                    <span data-slot="cx-key-col-title">API Keys</span>
++                    <span data-slot="cx-key-count">{keys().length}</span>
++                    <div data-slot="cx-key-col-tip">管理凭据、查看实际 Token 用量与模型能力</div>
++                  </div>
++                  {/* [cx] 新增按钮放在标题行右侧；展开表单在标题下、紧凑列表上方。 */}
++                  <ButtonV2 variant="neutral" size="small" icon="plus" onClick={() => setAddingKey((prev) => !prev)}>
++                    新增 key
++                  </ButtonV2>
++                </div>
++                <Show when={addingKey()}>
++                  <div data-slot="cx-key-col-form">
++                    <AddKeyForm onAdd={handleAdd} open onOpenChange={setAddingKey} />
++                  </div>
++                </Show>
++                <div data-slot="cx-key-list">
++                  <For each={keys()}>
++                    {(entry) => (
++                      <KeyCard
++                        entry={entry}
++                        state={profiles()[entry.id]}
++                        switching={switchingId() === entry.id}
++                        onActivate={(e) => void handleActivate(e)}
++                        onSaveLabel={(id, label) => void handleSaveLabel(id, label)}
++                        onRemove={(id) => void handleRemove(id)}
++                      />
++                    )}
++                  </For>
++                </div>
++              </div>
++            </div>
++          </Match>
++        </Switch>
++      </DialogBody>
++    </Dialog>
++  )
++}
+diff --git a/packages/app/src/components/cx-account/cx-account-import.tsx b/packages/app/src/components/cx-account/cx-account-import.tsx
+new file mode 100644
+index 000000000..2a4abd208
+--- /dev/null
++++ b/packages/app/src/components/cx-account/cx-account-import.tsx
+@@ -0,0 +1,173 @@
++// [cx] US-013: dokng:// 深链一键导入确认框（迁自 desktop 包 balance-panel.tsx 的 ImportDialog）。
++//
++// 网站点击「一键导入」→ 系统唤起 App（dokng:// 协议，06 补丁在主进程注册）→ opencode 既有 deep-link
++// 分发把 URL 送到渲染层 → 07 补丁的 layout.tsx handleDeepLinks 解析出 dokng:// 后动态 import 本组件
++// 弹确认框。安全（US-013 验收 #3）：解析成功不静默写入，先展示 label / 打码 key / baseURL，
++// 用户确认后才 channelKeysAdd 写入本地列表，避免恶意深链偷偷灌 key。
++//
++// 用原生 v2 Dialog 外壳，配色走 v2 语义变量（cx-account.css），与账户面板视觉一致。
++// 自闭合：用同作用域 useDialog().close() 关闭，不接 onClose prop——layout.tsx 直接
++// dialog.show(() => <CxDialogImport request={req} />)，无需注入关闭回调。
++
++import { createSignal } from "solid-js"
++import { Switch, Match } from "solid-js"
++import { useDialog } from "@opencode-ai/ui/context/dialog"
++import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
++import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
++import "./cx-account.css"
++import {
++  cxChannelApi,
++  fetchTokenName,
++  importDisplayBase,
++  importEffectiveBaseURL,
++  maskKey,
++  type ImportRequest,
++} from "./cx-account-api"
++
++// [cx] US-013: 导入确认框内容。展示待导入信息 → 确认写入 → 可选「设为激活」。
++// 用同作用域 useDialog().close() 自闭合（写入 / 取消 / 完成后关闭）。
++function CxDialogImport(props: { request: ImportRequest }) {
++  const dialog = useDialog()
++  const close = () => dialog.close()
++  type Phase =
++    | { status: "confirm" }
++    | { status: "saving" }
++    | { status: "done"; id: string }
++    | { status: "activating" }
++    | { status: "error"; message: string }
++  const [phase, setPhase] = createSignal<Phase>({ status: "confirm" })
++
++  async function confirmImport() {
++    setPhase({ status: "saving" })
++    try {
++      // channelKeysAdd 返回最新 ChannelKeysState 的 JSON。解析出新条目 id（用于「设为激活」）。
++      const raw = await cxChannelApi()?.channelKeysAdd?.({
++        label: props.request.label,
++        key: props.request.key,
++        baseURL: props.request.baseURL,
++      })
++      const state = raw ? (JSON.parse(raw) as { keys?: Array<{ id: string; key: string }> }) : { keys: [] }
++      const list = Array.isArray(state.keys) ? state.keys : []
++      // 新增条目排在末尾；按明文 key 匹配取回 id（key 仅内存比对，不外传）。
++      const added = [...list].reverse().find((k) => k.key === props.request.key)
++      const addedId = added?.id ?? ""
++
++      // [cx] 深链未带 label 时：用该 key 在 new-api 侧的 token 名称（/api/app/profile 的
++      // token_name）一次性回填本地 label（后续不再与远端同步）。失败 / 远端也无名称则保持占位。
++      if (addedId && !props.request.label.trim()) {
++        const remoteName = await fetchTokenName(importEffectiveBaseURL(props.request), props.request.key)
++        if (remoteName) {
++          try {
++            await cxChannelApi()?.channelKeysUpdateLabel?.(addedId, remoteName)
++          } catch {
++            // 回填失败不阻断：卡片显示「未命名 key」占位，可手动改名。
++          }
++        }
++      }
++
++      setPhase({ status: "done", id: addedId })
++    } catch {
++      setPhase({ status: "error", message: "导入失败，请重试或手动在账户面板添加。" })
++    }
++  }
++
++  // [cx] US-013: 导入成功后可直接设为激活。setActive → channelConfigRefreshKey（主进程拉该 key
++  // 的 /v1/models 落盘 + 重写 OPENCODE_CONFIG + 热重载），该 key 即成为可用 provider——不重启进程。
++  async function activateNow(id: string) {
++    if (!id) {
++      close()
++      return
++    }
++    setPhase({ status: "activating" })
++    try {
++      await cxChannelApi()?.channelKeysSetActive?.(id)
++      await cxChannelApi()?.channelConfigRefreshKey?.(id)
++    } catch {
++      // 设为激活/重载失败——不崩溃，直接关闭（用户可在面板手动切换）。
++    }
++    close()
++  }
++
++  return (
++    <Dialog size="normal" fit>
++      <DialogHeader closeLabel="关闭">
++        <DialogTitle>导入 key</DialogTitle>
++      </DialogHeader>
++      <DialogBody class="cx-account-body">
++        <Switch>
++          <Match when={phase().status === "done" || phase().status === "activating"}>
++            <div data-slot="cx-import-done">
++              <div data-slot="cx-onboard-title">✅ 导入成功</div>
++              <p data-slot="cx-import-done-text">
++                「{props.request.label || maskKey(props.request.key) || "新 key"}」已加入本地列表。是否立即设为激活
++                key？
++              </p>
++              <div data-slot="cx-form-actions">
++                <ButtonV2
++                  variant="contrast"
++                  size="normal"
++                  class="cx-flex-1"
++                  disabled={phase().status === "activating"}
++                  onClick={() => {
++                    const p = phase()
++                    if (p.status === "done") void activateNow(p.id)
++                  }}
++                >
++                  {phase().status === "activating" ? "设置中…" : "设为激活"}
++                </ButtonV2>
++                <ButtonV2 variant="neutral" size="normal" onClick={close}>
++                  暂不
++                </ButtonV2>
++              </div>
++            </div>
++          </Match>
++
++          <Match when={phase().status === "error"}>
++            <div data-slot="cx-state-box">
++              <div data-slot="cx-form-error">{(phase() as { status: "error"; message: string }).message}</div>
++              <ButtonV2 variant="neutral" size="normal" class="cx-flex-1" onClick={close}>
++                关闭
++              </ButtonV2>
++            </div>
++          </Match>
++
++          <Match when={phase().status === "confirm" || phase().status === "saving"}>
++            <p data-slot="cx-import-notice">
++              收到一条导入请求。请确认以下 key 信息无误后再导入——请勿导入来源不明的 key。
++            </p>
++            <div data-slot="cx-import-rows">
++              <div data-slot="cx-import-row">
++                <span data-slot="cx-import-row-label">名称</span>
++                <span data-slot="cx-import-row-value">{props.request.label || "（未命名）"}</span>
++              </div>
++              <div data-slot="cx-import-row">
++                <span data-slot="cx-import-row-label">API Key</span>
++                <span data-slot="cx-import-row-value">{maskKey(props.request.key)}</span>
++              </div>
++              <div data-slot="cx-import-row" data-last="">
++                <span data-slot="cx-import-row-label">渠道地址</span>
++                <span data-slot="cx-import-row-value">{importDisplayBase(props.request)}</span>
++              </div>
++            </div>
++            <div data-slot="cx-form-actions">
++              <ButtonV2
++                variant="contrast"
++                size="normal"
++                class="cx-flex-1"
++                disabled={phase().status === "saving"}
++                onClick={confirmImport}
++              >
++                {phase().status === "saving" ? "导入中…" : "确认导入"}
++              </ButtonV2>
++              <ButtonV2 variant="neutral" size="normal" onClick={close}>
++                取消
++              </ButtonV2>
++            </div>
++          </Match>
++        </Switch>
++      </DialogBody>
++    </Dialog>
++  )
++}
++
++export { CxDialogImport }
+diff --git a/packages/app/src/components/cx-account/cx-account.css b/packages/app/src/components/cx-account/cx-account.css
+new file mode 100644
+index 000000000..f073cd07f
+--- /dev/null
++++ b/packages/app/src/components/cx-account/cx-account.css
+@@ -0,0 +1,956 @@
++/* [cx] 账户工作台：完全复用 OpenCode v2 语义 token，不引入品牌外配色。 */
++@import "@opencode-ai/ui/v2/button-v2.css";
++@import "@opencode-ai/ui/v2/icon-button-v2.css";
++@import "@opencode-ai/ui/v2/text-input-v2.css";
++@import "@opencode-ai/ui/v2/tooltip-v2.css";
++
++/* [cx] 账户弹窗固定高度；三个区域（账户头 / 用量总览 / Keys）打开即定位，
++   仅 Keys 列表在内部滚动，key 增多不会向上挤压覆盖上方区域。 */
++[data-slot="dialog-content"].cx-account-dialog {
++  overflow: hidden;
++}
++
++[data-slot="dialog-content"] [data-slot="dialog-body"].cx-account-body {
++  flex: 1;
++  min-height: 0;
++  padding: 0 24px 24px;
++  overflow: hidden;
++}
++
++.cx-account-body [data-slot="cx-dashboard"] {
++  display: flex;
++  min-width: 0;
++  min-height: 0;
++  flex: 1;
++  flex-direction: column;
++  gap: 14px;
++}
++
++.cx-account-body [data-slot="cx-dashboard-head"] {
++  display: flex;
++  min-width: 0;
++  flex-shrink: 0;
++  align-items: center;
++  justify-content: space-between;
++  gap: 24px;
++  padding: 16px 20px;
++  border-radius: 8px;
++  background: var(--v2-background-bg-layer-02);
++  box-shadow: inset 0 0 0 0.5px var(--v2-border-border-muted);
++}
++
++.cx-account-body [data-slot="cx-account-head"] {
++  display: flex;
++  min-width: 0;
++  flex: 1;
++  align-items: center;
++  gap: 12px;
++}
++
++.cx-account-body [data-slot="cx-account-avatar"],
++.cx-account-body [data-slot="cx-account-avatar-fallback"] {
++  width: 40px;
++  height: 40px;
++  flex-shrink: 0;
++  border: 0.5px solid var(--v2-border-border-base);
++  border-radius: 8px;
++}
++
++.cx-account-body [data-slot="cx-account-avatar"] {
++  object-fit: cover;
++}
++
++.cx-account-body [data-slot="cx-account-avatar-fallback"] {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  background: var(--v2-background-bg-layer-02);
++  color: var(--v2-text-text-muted);
++  font-size: 15px;
++  font-weight: 640;
++}
++
++.cx-account-body [data-slot="cx-account-avatar-fallback"][data-error] {
++  background: var(--v2-state-bg-danger);
++  color: var(--v2-state-fg-danger);
++}
++
++.cx-account-body [data-slot="cx-account-copy"] {
++  display: flex;
++  min-width: 0;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.cx-account-body [data-slot="cx-account-name"] {
++  overflow: hidden;
++  color: var(--v2-text-text-base);
++  font-size: 15px;
++  font-weight: 640;
++  line-height: 1;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-account-subtitle"] {
++  overflow: hidden;
++  color: var(--v2-text-text-muted);
++  font-size: 11px;
++  font-weight: 440;
++  line-height: 1;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-connection-tag"] {
++  flex-shrink: 0;
++}
++
++.cx-account-body [data-slot="cx-dashboard-actions"] {
++  display: flex;
++  flex-shrink: 0;
++  align-items: center;
++  gap: 8px;
++}
++
++/* [cx] 余额 + Token 融合总览：左侧环形额度图，右侧同一数据网格。 */
++.cx-account-body [data-slot="cx-summary"] {
++  display: grid;
++  min-width: 0;
++  flex-shrink: 0;
++  grid-template-columns: minmax(260px, 0.8fr) minmax(360px, 1.4fr);
++  overflow: hidden;
++  border-radius: 10px;
++  background: var(--v2-background-bg-layer-01);
++  box-shadow: inset 0 0 0 0.5px var(--v2-border-border-muted);
++}
++
++.cx-account-body [data-slot="cx-usage-visual"] {
++  display: flex;
++  min-width: 0;
++  align-items: center;
++  gap: 18px;
++  padding: 18px 20px;
++  background: var(--v2-background-bg-layer-02);
++}
++
++.cx-account-body [data-slot="cx-usage-ring"] {
++  --cx-used: 0;
++  position: relative;
++  display: grid;
++  width: 96px;
++  height: 96px;
++  flex: 0 0 96px;
++  place-items: center;
++  border-radius: 50%;
++  background: conic-gradient(
++    var(--v2-background-bg-accent) calc(var(--cx-used) * 1%),
++    var(--v2-background-bg-layer-04) 0
++  );
++}
++
++.cx-account-body [data-slot="cx-usage-ring"]::after {
++  position: absolute;
++  inset: 8px;
++  border-radius: inherit;
++  background: var(--v2-background-bg-layer-02);
++  content: "";
++}
++
++.cx-account-body [data-slot="cx-usage-ring-inner"] {
++  position: relative;
++  z-index: 1;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 4px;
++}
++
++.cx-account-body [data-slot="cx-usage-ring-inner"] > strong {
++  color: var(--v2-text-text-base);
++  font-size: 20px;
++  font-weight: 640;
++  font-variant-numeric: tabular-nums;
++}
++
++.cx-account-body [data-slot="cx-usage-ring-inner"] > span,
++.cx-account-body [data-slot="cx-usage-copy"] > span,
++.cx-account-body [data-slot="cx-usage-copy"] > small {
++  color: var(--v2-text-text-muted);
++  font-size: 10px;
++}
++
++.cx-account-body [data-slot="cx-usage-copy"] {
++  display: flex;
++  min-width: 0;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.cx-account-body [data-slot="cx-usage-copy"] > strong {
++  overflow: hidden;
++  color: var(--v2-text-text-base);
++  font-size: 24px;
++  font-weight: 640;
++  line-height: 1.1;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-overview-metrics"] {
++  min-width: 0;
++  padding: 16px 20px;
++}
++
++.cx-account-body [data-slot="cx-overview-head"] {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: 12px;
++  margin-bottom: 12px;
++}
++
++.cx-account-body [data-slot="cx-overview-head"] > span {
++  color: var(--v2-text-text-base);
++  font-size: 12px;
++  font-weight: 530;
++}
++
++.cx-account-body [data-slot="cx-overview-head"] > small {
++  overflow: hidden;
++  color: var(--v2-text-text-muted);
++  font-size: 10px;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-overview-grid"] {
++  display: grid;
++  grid-template-columns: repeat(4, minmax(0, 1fr));
++}
++
++.cx-account-body [data-slot="cx-overview-item"] {
++  display: flex;
++  min-width: 0;
++  flex-direction: column;
++  gap: 7px;
++  padding: 3px 14px;
++  border-left: 0.5px solid var(--v2-border-border-base);
++}
++
++.cx-account-body [data-slot="cx-overview-item"]:first-child {
++  padding-left: 0;
++  border-left: 0;
++}
++
++.cx-account-body [data-slot="cx-overview-item"] > span {
++  overflow: hidden;
++  color: var(--v2-text-text-muted);
++  font-size: 10px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-overview-item"] > strong {
++  overflow: hidden;
++  color: var(--v2-text-text-base);
++  font-size: 15px;
++  font-weight: 590;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-notice"] {
++  position: absolute;
++  z-index: 2;
++  right: 36px;
++  bottom: 34px;
++  max-width: 360px;
++  padding: 10px 12px;
++  border: 0.5px solid var(--v2-border-border-base);
++  border-radius: 7px;
++  background: var(--v2-background-bg-layer-03);
++  box-shadow: var(--v2-elevation-overlay);
++  color: var(--v2-text-text-base);
++  font-size: 12px;
++}
++
++.cx-account-body [data-slot="cx-key-col"] {
++  display: flex;
++  min-width: 0;
++  min-height: 0;
++  flex: 1;
++  flex-direction: column;
++  border-radius: 10px;
++  background: var(--v2-background-bg-layer-01);
++  box-shadow: inset 0 0 0 0.5px var(--v2-border-border-muted);
++}
++
++.cx-account-body [data-slot="cx-key-col-head"] {
++  display: flex;
++  flex-shrink: 0;
++  align-items: center;
++  justify-content: space-between;
++  gap: 16px;
++  padding: 11px 14px;
++  border-bottom: 0.5px solid var(--v2-border-border-base);
++}
++
++.cx-account-body [data-slot="cx-key-col-copy"] {
++  min-width: 0;
++}
++
++.cx-account-body [data-slot="cx-key-col-title"] {
++  color: var(--v2-text-text-base);
++  font-size: 13px;
++  font-weight: 530;
++}
++
++.cx-account-body [data-slot="cx-key-col-form"] {
++  flex-shrink: 0;
++  padding: 10px 14px 0;
++}
++
++.cx-account-body [data-slot="cx-key-count"] {
++  display: inline-flex;
++  min-width: 18px;
++  height: 18px;
++  align-items: center;
++  justify-content: center;
++  margin-left: 8px;
++  border-radius: 99px;
++  background: var(--v2-background-bg-layer-03);
++  color: var(--v2-text-text-muted);
++  font-size: 10px;
++  font-variant-numeric: tabular-nums;
++}
++
++.cx-account-body [data-slot="cx-key-col-tip"] {
++  display: inline;
++  margin-left: 10px;
++  color: var(--v2-text-text-muted);
++  font-size: 10px;
++}
++
++/* [cx] key 列表既是滚动容器，也是卡片响应式的「尺寸容器」。卡片断点用 @container
++   按本列表实宽触发，而非 viewport——因为 dialog 宽度是 min(100vw-32, 980px)，与
++   viewport 不是一回事：用 viewport 断点会在某段窗口宽度下（4 列还没堆叠、但固定的
++   306px 指标列已放不下）横向溢出。container-type: inline-size 只约束行内轴，不影响
++   flex:1 撑高与竖直滚动。 */
++.cx-account-body [data-slot="cx-key-list"] {
++  display: grid;
++  min-height: 0;
++  flex: 1;
++  grid-template-columns: minmax(0, 1fr);
++  align-content: start;
++  gap: 6px;
++  padding: 8px 10px 10px;
++  overflow-y: auto;
++  container-type: inline-size;
++  container-name: cx-keys;
++}
++
++/* 桌面宽度下一行完整呈现一个 Key：身份、输入/输出、指标、额度和操作横向排布（5 大块）。
++   只有身份列可伸缩（1fr），其余列全固定宽度——每个 KeyCard 是独立 grid，
++   若用 auto 让列宽跟随各行内容（如指标列在 loading/error 行塌缩、操作列编辑态多一个按钮），
++   行与行的列边界就会错位。故：
++     · 身份列 1fr（最小 140px），承载 label + sk**** 和分组标签同行；
++     · 输入/输出列固定 64px（上下两行 ↑输入 / ↓输出，无标题，↑↓ 前缀自明）；
++     · 指标列固定 236px（今日 Tokens / 今日费用 / 累计费用 / 模型 四格，格宽随内容不等宽）；
++     · 额度列 160–190px；操作列固定 44px（编辑态两个 20px 按钮 + 4px 间隙）。
++   右上角删除入口用绝对定位，故右侧留出 padding 让其不压住操作区。 */
++.cx-account-body [data-slot="cx-key-card"] {
++  position: relative;
++  display: grid;
++  min-width: 0;
++  min-height: 64px;
++  grid-template-columns: minmax(140px, 1fr) 64px 236px minmax(160px, 190px) 44px;
++  align-items: center;
++  gap: 16px;
++  padding: 10px 34px 10px 12px;
++  border-radius: 7px;
++  background: var(--v2-background-bg-layer-02);
++  box-shadow: inset 0 0 0 0.5px var(--v2-border-border-muted);
++  outline: none;
++  transition:
++    background-color 120ms ease,
++    box-shadow 120ms ease;
++}
++
++.cx-account-body [data-slot="cx-key-card"][data-clickable] {
++  cursor: pointer;
++}
++
++.cx-account-body [data-slot="cx-key-card"][data-clickable]:hover {
++  background: var(--v2-background-bg-layer-03);
++}
++
++.cx-account-body [data-slot="cx-key-card"][data-clickable]:focus-visible {
++  box-shadow: inset 0 0 0 1px var(--v2-border-border-focus);
++}
++
++/* 激活态不再依赖按钮或标签：强调背景 + 左侧色条让当前 Key 一眼可辨。 */
++.cx-account-body [data-slot="cx-key-card"][data-active] {
++  background: var(--v2-background-bg-layer-03);
++  box-shadow:
++    inset 3px 0 0 var(--v2-background-bg-accent),
++    inset 0 0 0 0.5px var(--v2-border-border-focus);
++}
++
++/* [cx] 删除入口固定在卡片右上角，绝对定位不占网格列（卡片右侧已留 34px padding）。
++   点击原地展开确认（✓/✕），确认按钮同处渲染。
++   注意：TSX 里 data-slot 是 cx-key-delete-corner，选择器必须与之一致，
++   否则该 div 退化成普通网格子项、占掉一列，把整行挤乱。 */
++.cx-account-body [data-slot="cx-key-delete-corner"] {
++  position: absolute;
++  top: 6px;
++  right: 6px;
++  z-index: 1;
++  display: flex;
++  gap: 4px;
++  opacity: 0.72;
++  transition: opacity 120ms ease;
++}
++
++.cx-account-body [data-slot="cx-key-card"]:hover [data-slot="cx-key-delete-corner"],
++.cx-account-body [data-slot="cx-key-card"]:focus-within [data-slot="cx-key-delete-corner"],
++.cx-account-body [data-slot="cx-key-card"][data-active] [data-slot="cx-key-delete-corner"] {
++  opacity: 1;
++}
++
++.cx-account-body [data-slot="cx-key-card-head"],
++.cx-account-body [data-slot="cx-key-actions"] {
++  display: flex;
++  min-width: 0;
++  align-items: center;
++}
++
++.cx-account-body [data-slot="cx-key-card-head"] {
++  gap: 8px;
++}
++
++.cx-account-body [data-slot="cx-key-card-title"] {
++  min-width: 0;
++  flex: 1;
++}
++
++.cx-account-body [data-slot="cx-key-label"] {
++  overflow: hidden;
++  color: var(--v2-text-text-base);
++  font-size: 13px;
++  font-weight: 530;
++  line-height: 16px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* [cx] sk**** 与分组标签同一行：打码 key 与分组徽标横排，分组不再单独占一行。 */
++.cx-account-body [data-slot="cx-key-masked-row"] {
++  display: flex;
++  min-width: 0;
++  align-items: center;
++  gap: 6px;
++  margin-top: 4px;
++}
++
++.cx-account-body [data-slot="cx-key-masked"] {
++  overflow: hidden;
++  color: var(--v2-text-text-faint);
++  font-family: var(--font-mono, monospace);
++  font-size: 11px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* [cx] 输入/输出独立列（卡片第 2 列，64px）：上下两行 ↑输入 / ↓输出，无标题，行高统一。 */
++.cx-account-body [data-slot="cx-token-io-col"] {
++  display: flex;
++  min-width: 0;
++  height: 40px;
++  flex-direction: column;
++  justify-content: center;
++  gap: 2px;
++  color: var(--v2-text-text-base);
++  font-size: 12px;
++  font-variant-numeric: tabular-nums;
++}
++
++.cx-account-body [data-slot="cx-token-io-col"] > span {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* [cx] 单行 Key 项内的紧凑指标组：4 格（今日 Tokens / 今日费用 / 累计费用 / 模型）不等宽，
++   列宽随各格内容自适应（auto），短内容不再被强行拉到固定宽度、整组更紧凑。
++   固定高度保证每格两行（标题 + 值）时行高统一。「输入/输出」已拆到独立列（见 cx-key-io），
++   不再占本组格位。 */
++.cx-account-body [data-slot="cx-token-stats"] {
++  display: grid;
++  grid-template-columns: repeat(4, minmax(0, auto));
++  gap: 6px;
++  min-height: 40px;
++  align-items: center;
++  justify-content: start;
++}
++
++.cx-account-body [data-slot="cx-token-stat"] {
++  display: flex;
++  min-width: 0;
++  height: 40px;
++  flex-direction: column;
++  justify-content: center;
++  gap: 2px;
++  padding-left: 8px;
++  border-left: 0.5px solid var(--v2-border-border-base);
++}
++
++.cx-account-body [data-slot="cx-token-stat"]:first-child {
++  padding-left: 0;
++  border-left: 0;
++}
++
++.cx-account-body [data-slot="cx-token-stat"] > span {
++  overflow: hidden;
++  color: var(--v2-text-text-muted);
++  font-size: 9px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-token-stat"] > strong {
++  overflow: hidden;
++  color: var(--v2-text-text-base);
++  font-size: 12px;
++  font-weight: 590;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-key-quota"] {
++  min-width: 0;
++}
++
++.cx-account-body [data-slot="cx-key-bar-row"] {
++  display: flex;
++  min-width: 0;
++  flex-direction: column;
++  gap: 5px;
++}
++
++.cx-account-body [data-slot="cx-key-bar-row"] > span {
++  overflow: hidden;
++  color: var(--v2-text-text-muted);
++  font-size: 10px;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-key-bar-track"] {
++  width: 100%;
++  height: 3px;
++  overflow: hidden;
++  border-radius: 99px;
++  background: var(--v2-background-bg-layer-04);
++}
++
++.cx-account-body [data-slot="cx-key-bar-fill"] {
++  height: 100%;
++  border-radius: inherit;
++  background: var(--v2-background-bg-accent);
++}
++
++.cx-account-body [data-slot="cx-key-state"] {
++  min-width: 0;
++  grid-column: 2 / 5;
++  overflow: hidden;
++  color: var(--v2-text-text-faint);
++  font-size: 11px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-key-actions"] {
++  justify-content: flex-end;
++  gap: 4px;
++  opacity: 0.72;
++  white-space: nowrap;
++  transition: opacity 120ms ease;
++}
++
++.cx-account-body [data-slot="cx-key-card"]:hover [data-slot="cx-key-actions"],
++.cx-account-body [data-slot="cx-key-card"]:focus-within [data-slot="cx-key-actions"],
++.cx-account-body [data-slot="cx-key-card"][data-active] [data-slot="cx-key-actions"] {
++  opacity: 1;
++}
++
++.cx-account-body [data-slot="cx-delete-confirm-button"] {
++  background: var(--v2-state-bg-danger);
++  color: var(--v2-state-fg-danger);
++}
++
++.cx-account-body [data-slot="cx-form-error"] {
++  color: var(--v2-state-fg-danger);
++  font-size: 11px;
++}
++
++.cx-account-body [data-slot="cx-unlimited-tag"] {
++  width: fit-content;
++  margin: 0;
++}
++
++/* [cx] key 徽标行：状态 / 分组 / 动态倍率 / 过期。小徽标横向排列，可换行。 */
++.cx-account-body [data-slot="cx-key-meta"] {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++  margin-bottom: 12px;
++}
++
++.cx-account-body [data-slot="cx-key-meta"]:empty {
++  display: none;
++  margin-bottom: 0;
++}
++
++/* 分组徽标：中性色，标注当前 key 生效的定价分组。 */
++.cx-account-body [data-slot="cx-group-tag"] {
++  margin: 0;
++}
++
++/* 动态倍率徽标：accent 色，强调该 key 走渠道动态倍率而非固定倍率。 */
++.cx-account-body [data-slot="cx-dynamic-tag"] {
++  margin: 0;
++  background: var(--v2-background-bg-accent);
++  color: var(--v2-text-text-on-accent, var(--v2-text-text-base));
++}
++
++/* 状态徽标（禁用 / 过期 / 耗尽）与过期告警徽标：按 level 上色。
++   danger（已禁用 / 已过期 / 耗尽）走危险色；soon（临近过期）走警示色。 */
++.cx-account-body [data-slot="cx-status-tag"],
++.cx-account-body [data-slot="cx-expiry-tag"] {
++  margin: 0;
++}
++
++.cx-account-body [data-slot="cx-status-tag"][data-level="danger"],
++.cx-account-body [data-slot="cx-expiry-tag"][data-level="expired"] {
++  background: var(--v2-state-bg-danger);
++  color: var(--v2-state-fg-danger);
++}
++
++.cx-account-body [data-slot="cx-expiry-tag"][data-level="soon"] {
++  background: var(--v2-state-bg-warning, var(--v2-background-bg-layer-04));
++  color: var(--v2-state-fg-warning, var(--v2-text-text-base));
++}
++
++/* [cx] 「输入 / 输出」独立列的值。用 span 承载（非 strong），但需覆盖上面的
++   `cx-token-stat > span`（9px 标题样式）——故选择器带 [data-slot] 提高特异性，
++   还原成与 strong 相近的值样式：略小字号容纳「↑x ↓y」两段，等宽数字、单行裁剪。 */
++.cx-account-body [data-slot="cx-token-stat"] > span[data-slot="cx-token-io"] {
++  overflow: hidden;
++  color: var(--v2-text-text-base);
++  font-size: 11px;
++  font-weight: 560;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-add-form"] {
++  display: grid;
++  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
++  gap: 10px;
++  padding: 16px 20px;
++}
++
++.cx-account-body [data-slot="cx-add-form"] [data-slot="cx-form-error"],
++.cx-account-body [data-slot="cx-add-form"] [data-slot="cx-form-actions"] {
++  grid-column: 1 / -1;
++}
++
++.cx-account-body .cx-add-key-trigger {
++  width: fit-content;
++  margin: 12px 20px;
++}
++
++.cx-account-body [data-slot="cx-form-actions"] {
++  display: flex;
++  gap: 8px;
++}
++
++.cx-account-body .cx-flex-1 {
++  flex: 1;
++}
++
++.cx-account-body [data-slot="cx-state-box"] {
++  padding: 48px 24px;
++  color: var(--v2-text-text-muted);
++  font-size: 13px;
++  text-align: center;
++}
++
++.cx-account-body [data-slot="cx-onboard"] {
++  max-width: 480px;
++  margin: 24px auto 0;
++  padding: 24px;
++  border-radius: 8px;
++  background: var(--v2-background-bg-layer-01);
++  box-shadow: inset 0 0 0 0.5px var(--v2-border-border-muted);
++  text-align: center;
++}
++
++.cx-account-body [data-slot="cx-onboard-icon"] {
++  display: flex;
++  width: 36px;
++  height: 36px;
++  align-items: center;
++  justify-content: center;
++  margin: 0 auto 14px;
++  border-radius: 8px;
++  background: var(--v2-background-bg-layer-03);
++  color: var(--v2-icon-icon-base);
++}
++
++.cx-account-body [data-slot="cx-onboard-title"] {
++  margin-bottom: 8px;
++  color: var(--v2-text-text-base);
++  font-size: 15px;
++  font-weight: 640;
++}
++
++.cx-account-body [data-slot="cx-onboard-desc"],
++.cx-account-body [data-slot="cx-import-notice"],
++.cx-account-body [data-slot="cx-import-done-text"] {
++  margin-bottom: 16px;
++  color: var(--v2-text-text-muted);
++  font-size: 13px;
++  line-height: 1.5;
++}
++
++.cx-account-body .cx-site-button {
++  margin-bottom: 18px;
++}
++
++.cx-account-body [data-slot="cx-onboard-divider"] {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  margin-bottom: 4px;
++  color: var(--v2-text-text-faint);
++  font-size: 10px;
++  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-onboard-divider"]::before,
++.cx-account-body [data-slot="cx-onboard-divider"]::after {
++  height: 0.5px;
++  flex: 1;
++  background: var(--v2-border-border-base);
++  content: "";
++}
++
++.cx-account-body [data-slot="cx-onboard"] [data-slot="cx-add-form"] {
++  /* [cx] 引导态弹窗固定窄（cx-onboard max-width 480px），两列网格会让 key 输入与名称输入
++     挤在一行并重叠——引导语境只填一个 key，强制单列纵向堆叠，清晰且绝不重叠。 */
++  grid-template-columns: 1fr;
++  padding: 12px 0 0;
++}
++
++.cx-account-body [data-slot="cx-onboard"] [data-slot="cx-add-form"] > * {
++  grid-column: 1;
++}
++
++.cx-account-body [data-slot="cx-import-row"] {
++  display: flex;
++  justify-content: space-between;
++  gap: 20px;
++  padding: 12px 0;
++  border-bottom: 0.5px solid var(--v2-border-border-base);
++  font-size: 13px;
++}
++
++.cx-account-body [data-slot="cx-import-row"]:last-child,
++.cx-account-body [data-slot="cx-import-row"][data-last] {
++  border-bottom: 0;
++}
++
++.cx-account-body [data-slot="cx-import-row-label"] {
++  flex-shrink: 0;
++  color: var(--v2-text-text-muted);
++}
++
++.cx-account-body [data-slot="cx-import-row-value"] {
++  min-width: 0;
++  overflow-wrap: anywhere;
++  color: var(--v2-text-text-base);
++  text-align: right;
++  font-variant-numeric: tabular-nums;
++}
++
++.cx-account-body [data-slot="cx-import-done"] {
++  text-align: center;
++}
++
++/* [cx] 卡片响应式按 key 列表「实宽」（@container）分档，不按 viewport：
++     · 5 列横排最小宽 ≈ 140 + 64 + 236 + 160 + 44 + 4×16(gap) = 708px；
++   故容器 ≤778px 进收紧档、≤707px 堆叠（见下方 @container 块），
++   区间连续无重叠，任何列宽下都不会横向溢出。 */
++@container cx-keys (max-width: 778px) {
++  /* 收紧档：仍是 5 列横排，只收窄列间距与额度列，io/指标/操作列不变，行间边界对齐。 */
++  .cx-account-body [data-slot="cx-key-card"] {
++    grid-template-columns: minmax(120px, 1fr) 60px 220px minmax(130px, 160px) 44px;
++    gap: 10px;
++  }
++}
++
++/* 堆叠档：key 列实宽 < 708px（收紧档也塞不下）时，改为「身份+操作」一行、
++   io / 指标 / 额度 / 状态各自整行的两列堆叠布局，彻底不再横排，避免指标组溢出。
++   区间与收紧档（≤778px）衔接：708–778 收紧、≤707 堆叠，连续无空档。 */
++@container cx-keys (max-width: 707px) {
++  .cx-account-body [data-slot="cx-key-card"] {
++    grid-template-columns: minmax(0, 1fr) 44px;
++    gap: 8px 12px;
++  }
++
++  .cx-account-body [data-slot="cx-key-card-head"] {
++    grid-row: 1;
++    grid-column: 1;
++  }
++
++  /* io 列堆叠时并入指标行上方（第 2 行整行），↑↓ 改横向排列省高度。 */
++  .cx-account-body [data-slot="cx-token-io-col"] {
++    grid-row: 2;
++    grid-column: 1 / -1;
++    flex-direction: row;
++    gap: 12px;
++  }
++
++  .cx-account-body [data-slot="cx-token-stats"] {
++    grid-row: 3;
++    grid-column: 1 / -1;
++  }
++
++  .cx-account-body [data-slot="cx-key-quota"] {
++    grid-row: 4;
++    grid-column: 1 / -1;
++  }
++
++  .cx-account-body [data-slot="cx-key-state"] {
++    grid-row: 2;
++    grid-column: 1 / -1;
++  }
++
++  .cx-account-body [data-slot="cx-key-actions"] {
++    grid-row: 1;
++    grid-column: 2;
++  }
++}
++
++/* 更窄档：堆叠后指标组仍是固定 384px（5×72+4×6），当 key 列实宽塞不下整行 384px 时
++   降到 2 列，避免指标组自身横向溢出。按容器实宽触发，与 viewport 无关。
++   2 列时左列为第 1/3/5 项（nth-child(odd)），清其左边框与左内边距。 */
++@container cx-keys (max-width: 420px) {
++  .cx-account-body [data-slot="cx-token-stats"] {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    gap: 8px 0;
++  }
++
++  .cx-account-body [data-slot="cx-token-stat"] {
++    width: auto;
++  }
++
++  .cx-account-body [data-slot="cx-token-stat"]:nth-child(odd) {
++    padding-left: 0;
++    border-left: 0;
++  }
++}
++
++@media (max-width: 720px) {
++  .cx-account-body {
++    padding: 0 16px 16px;
++  }
++
++  .cx-account-body [data-slot="cx-dashboard-head"] {
++    align-items: flex-start;
++    gap: 12px;
++  }
++
++  .cx-account-body [data-slot="cx-account-head"] {
++    flex-wrap: wrap;
++  }
++
++  .cx-account-body [data-slot="cx-connection-tag"] {
++    display: none;
++  }
++
++  .cx-account-body [data-slot="cx-summary"] {
++    grid-template-columns: 1fr;
++  }
++
++  .cx-account-body [data-slot="cx-usage-visual"] {
++    padding: 14px 16px;
++  }
++
++  .cx-account-body [data-slot="cx-usage-ring"] {
++    width: 76px;
++    height: 76px;
++    flex-basis: 76px;
++  }
++
++  .cx-account-body [data-slot="cx-overview-grid"] {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    gap: 12px 0;
++  }
++
++  .cx-account-body [data-slot="cx-overview-item"]:nth-child(3) {
++    padding-left: 0;
++    border-left: 0;
++  }
++
++  .cx-account-body [data-slot="cx-add-form"] {
++    grid-template-columns: 1fr;
++  }
++
++  .cx-account-body [data-slot="cx-add-form"] > * {
++    grid-column: 1;
++  }
++}
++
++@media (max-width: 480px) {
++  /* 窄屏改为整体自然滚动：各区不再固定高度、Keys 列表不再独立滚动，避免双滚动条。 */
++  [data-slot="dialog-content"] [data-slot="dialog-body"].cx-account-body {
++    overflow-y: auto;
++  }
++
++  .cx-account-body [data-slot="cx-dashboard"] {
++    display: flex;
++    height: auto;
++    min-height: 100%;
++    flex-direction: column;
++  }
++
++  .cx-account-body [data-slot="cx-key-col"] {
++    flex: none;
++    min-height: 0;
++  }
++
++  .cx-account-body [data-slot="cx-key-list"] {
++    overflow-y: visible;
++  }
++
++  .cx-account-body [data-slot="cx-dashboard-head"] {
++    flex-direction: column;
++  }
++
++  .cx-account-body [data-slot="cx-dashboard-actions"] {
++    width: 100%;
++  }
++
++  .cx-account-body [data-slot="cx-dashboard-actions"] [data-component="button-v2"] {
++    flex: 1;
++  }
++}

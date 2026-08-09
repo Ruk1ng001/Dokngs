@@ -1,0 +1,14 @@
+{
+  "_doc": [
+    "Tauri 自更新注入配置：由 scripts/inject-updater.py 在补丁重放阶段写入 upstream/src-tauri/tauri.conf.json 的 plugins.updater。",
+    "pubkey 为本项目自有 minisign 公钥（tauri signer generate 生成）；与之配对的私钥不在本仓库，由出包 CI 持有：",
+    "  私钥全文 -> CI Secret TAURI_SIGNING_PRIVATE_KEY；私钥密码 -> CI Secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD（本密钥对为空密码，可不设）。",
+    "警告：私钥或密码一旦丢失将无法再签名更新包，已装用户自更新永久失效；换密钥对时必须同步替换此处 pubkey 与 CI Secret 私钥。",
+    "endpoints 指向自建 R2（dl.dokng.com）：open-code(Electron) 在 dl.dokng.com/open-code/，cc-switch(Tauri) 在 dl.dokng.com/cc-switch/，共桶不同目录互不覆盖。",
+    "R2 布局：cc-switch/latest.json 留根（禁缓存），产物下沉 cc-switch/<version>/（immutable 长缓存）。"
+  ],
+  "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwMzZGMzVENTkzN0FDRDgKUldUWXJEZFpYZk0yZ0hSalNRd2FpeldXdkU1Q3VNTUlCNlF4cXI0T1ZCN1EwTytsTFcxalhWSHEK",
+  "endpoints": [
+    "https://dl.dokng.com/cc-switch/latest.json"
+  ]
+}

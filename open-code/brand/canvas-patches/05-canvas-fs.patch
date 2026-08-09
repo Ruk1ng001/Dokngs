@@ -1,0 +1,554 @@
+diff --git a/web/src/lib/host-fs-bridge.ts b/web/src/lib/host-fs-bridge.ts
+new file mode 100644
+index 0000000..f0384a5
+--- /dev/null
++++ b/web/src/lib/host-fs-bridge.ts
+@@ -0,0 +1,206 @@
++// [dokng] 宿主磁盘桥：画布 ↔ opencode 主进程的文件读写通道。
++//
++// 为什么需要这一层：画布跑在 opencode 桌面壳的 <iframe>（oc://renderer/canvas/）里，
++// 而 electron preload 只注入 BrowserWindow 主 frame（未开 nodeIntegrationInSubFrames），
++// 所以画布侧**没有 window.api**，不能直接 invoke IPC。链路必须是：
++//   画布 → postMessage → 宿主 canvas-embed.tsx → window.api → IPC → 主进程 store-canvas-files.ts
++//
++// 落盘替代了原先的 IndexedDB：
++//   1. IndexedDB 未申请 navigator.storage.persist()，属 best-effort 存储，可被浏览器回收；
++//   2. 节点里存的是 URL.createObjectURL() 的 blob: URL，会话级、重启即失效；
++//   3. 画布 JSON 的 persist 有 debounce 而主进程走 app.exit(0) 硬退出，pending 写会丢。
++// 改为磁盘后，字节与元数据都在 userData 下的固定路径，重启即在。
++//
++// standalone web（window.parent === window）下桥不可用：所有方法返回"未落盘"语义
++// （false / null / 空数组），调用方据此回退到原 IndexedDB 路径，故本模块在纯 web 下无副作用。
++
++// 与宿主 canvas-embed.tsx 的常量一一对应，改一处必须同步改另一处。
++const HOST_ORIGIN = "oc://renderer";
++const FS_REQUEST = "dokng:canvas-fs-request";
++const FS_RESPONSE = "dokng:canvas-fs-response";
++
++// 单次请求超时：写大视频经 base64 过 IPC 可能偏慢，给足 60s；超时按失败处理并回退。
++const REQUEST_TIMEOUT_MS = 60_000;
++
++// 宿主协议分支前缀：oc://renderer/__canvas-file/<sanitized key>.<ext>
++// 复用宿主 origin，故 <img src> / <video src> 可直接引用磁盘文件——
++// 无需 blob: URL、无跨源与 CSP 问题，且走浏览器原生缓存。
++const FILE_URL_PREFIX = "oc://renderer/__canvas-file/";
++
++export const IS_EMBEDDED = typeof window !== "undefined" && window.parent !== window;
++
++type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: number };
++
++const pending = new Map<string, Pending>();
++let listenerBound = false;
++let seq = 0;
++
++function bindListener() {
++    if (listenerBound || typeof window === "undefined") return;
++    listenerBound = true;
++    window.addEventListener("message", (event: MessageEvent) => {
++        // 严格校验来源：只认宿主 origin 且确实来自父窗口的回帖。
++        if (event.origin !== HOST_ORIGIN || event.source !== window.parent) return;
++        const data = event.data as { type?: unknown; id?: unknown; ok?: unknown; result?: unknown } | null;
++        if (!data || typeof data !== "object" || data.type !== FS_RESPONSE) return;
++        const id = typeof data.id === "string" ? data.id : null;
++        if (!id) return;
++        const entry = pending.get(id);
++        if (!entry) return;
++        pending.delete(id);
++        window.clearTimeout(entry.timer);
++        if (data.ok === true) entry.resolve(data.result);
++        else entry.reject(new Error("宿主落盘失败"));
++    });
++}
++
++// 发一次请求并等回帖。宿主不可用 / 超时 / 宿主报错都 reject，由各 call* 包装成回退语义。
++function request(op: string, args: unknown[]): Promise<unknown> {
++    if (!IS_EMBEDDED) return Promise.reject(new Error("未嵌入宿主"));
++    bindListener();
++    const parent = window.parent;
++    const id = `fs-${Date.now().toString(36)}-${(seq += 1).toString(36)}`;
++    return new Promise<unknown>((resolve, reject) => {
++        const timer = window.setTimeout(() => {
++            pending.delete(id);
++            reject(new Error("宿主落盘超时"));
++        }, REQUEST_TIMEOUT_MS);
++        pending.set(id, { resolve, reject, timer });
++        parent.postMessage({ type: FS_REQUEST, id, op, args }, HOST_ORIGIN);
++    });
++}
++
++// 二进制经 IPC 用 base64 传（与既有 store-* 的字符串约定一致，且避开 sandbox 下可转移对象的差异）。
++// 分块转换：大文件下 String.fromCharCode(...bytes) 会因参数过多爆栈。
++function bytesToBase64(bytes: Uint8Array) {
++    const CHUNK = 0x8000;
++    let binary = "";
++    for (let i = 0; i < bytes.length; i += CHUNK) {
++        binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
++    }
++    return btoa(binary);
++}
++
++function base64ToBytes(base64: string) {
++    const binary = atob(base64);
++    const bytes = new Uint8Array(binary.length);
++    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
++    return bytes;
++}
++
++// 写入一个媒体 Blob。成功返回 true；未嵌入宿主 / 失败返回 false（调用方回退 IndexedDB）。
++export async function writeHostFile(storageKey: string, blob: Blob) {
++    if (!IS_EMBEDDED) return false;
++    try {
++        const bytes = new Uint8Array(await blob.arrayBuffer());
++        const ok = await request("fileWrite", [storageKey, bytesToBase64(bytes), blob.type || ""]);
++        // 缓存维护放在这里而非交给调用方：漏调会让刚落盘的图在 resolve 时判定为"未落盘"而回退。
++        if (ok === true) noteHostFile(storageKey, true);
++        return ok === true;
++    } catch {
++        return false;
++    }
++}
++
++// 读回媒体字节。不存在 / 失败返回 null。
++// 注意：正常渲染不走这里——渲染直接用 hostFileUrl() 让浏览器加载磁盘文件。
++// 本函数只服务于确实需要字节本身的场景（导出、WebDAV 同步、图生图取原图）。
++export async function readHostFile(storageKey: string, mimeType = "application/octet-stream") {
++    if (!IS_EMBEDDED) return null;
++    try {
++        const base64 = await request("fileRead", [storageKey]);
++        if (typeof base64 !== "string" || !base64) return null;
++        return new Blob([base64ToBytes(base64)], { type: mimeType });
++    } catch {
++        return null;
++    }
++}
++
++export async function deleteHostFiles(storageKeys: string[]) {
++    if (!IS_EMBEDDED || storageKeys.length === 0) return 0;
++    try {
++        const removed = await request("fileDelete", [storageKeys]);
++        // 无论主进程实际删了几个，这些 key 都不该再被当作"已落盘"。
++        storageKeys.forEach((key) => noteHostFile(key, false));
++        return typeof removed === "number" ? removed : 0;
++    } catch {
++        return 0;
++    }
++}
++
++export async function listHostFiles() {
++    if (!IS_EMBEDDED) return [];
++    try {
++        const keys = await request("fileList", []);
++        return Array.isArray(keys) ? keys.filter((k): k is string => typeof k === "string") : [];
++    } catch {
++        return [];
++    }
++}
++
++export async function readHostState() {
++    if (!IS_EMBEDDED) return null;
++    try {
++        const json = await request("stateRead", []);
++        return typeof json === "string" ? json : null;
++    } catch {
++        return null;
++    }
++}
++
++export async function writeHostState(json: string) {
++    if (!IS_EMBEDDED) return false;
++    try {
++        const ok = await request("stateWrite", [json]);
++        return ok === true;
++    } catch {
++        return false;
++    }
++}
++
++// storageKey → 可直接放进 src 的 URL。":" 换 "__" 与主进程 sanitizeKey 一致；
++// 不带扩展名，宿主协议分支会扫目录定扩展名（进而定 Content-Type）。
++export function hostFileUrl(storageKey: string) {
++    return `${FILE_URL_PREFIX}${encodeURIComponent(storageKey.replace(":", "__"))}`;
++}
++
++// —— 磁盘 key 缓存 ——
++// resolveImageUrl / resolveMediaUrl 会被大量节点并发调用，每次都问一遍宿主会放大 postMessage
++// 往返。这里缓存一次目录列表，写入/删除时增量维护。image-storage 与 file-storage 共用同一份
++// （磁盘目录本身是共用的，各自维护会出现一方的写入在另一方缓存里缺失）。
++let keysCache: Set<string> | null = null;
++let keysLoading: Promise<Set<string>> | null = null;
++
++async function hostFileKeys() {
++    if (keysCache) return keysCache;
++    if (!keysLoading) {
++        keysLoading = listHostFiles()
++            .then((keys) => {
++                keysCache = new Set(keys);
++                return keysCache;
++            })
++            .finally(() => {
++                keysLoading = null;
++            });
++    }
++    return keysLoading;
++}
++
++// 该 key 是否已落盘。未嵌入宿主时恒为 false（调用方回退 IndexedDB）。
++export async function hasHostFile(storageKey: string) {
++    if (!IS_EMBEDDED) return false;
++    return (await hostFileKeys()).has(storageKey);
++}
++
++// 写入/删除后同步缓存，避免刚落盘的 key 在缓存里缺失而回退到 fallback。
++export function noteHostFile(storageKey: string, exists: boolean) {
++    if (!keysCache) return;
++    if (exists) keysCache.add(storageKey);
++    else keysCache.delete(storageKey);
++}
++
++// 磁盘上现存的全部 key（供孤儿清理）。未嵌入宿主返回空集合。
++export async function hostFileKeySet() {
++    if (!IS_EMBEDDED) return new Set<string>();
++    return hostFileKeys();
++}
+diff --git a/web/src/services/file-storage.ts b/web/src/services/file-storage.ts
+index fce89d4..127be65 100644
+--- a/web/src/services/file-storage.ts
++++ b/web/src/services/file-storage.ts
+@@ -1,5 +1,8 @@
+ import localforage from "localforage";
+ import { nanoid } from "nanoid";
++// [dokng] 落盘桥：嵌入 opencode 桌面壳时把视频/音频/文件字节写到 userData/canvas-files/，
++// 不再依赖可被回收的 IndexedDB 与会话级 blob: URL。standalone web 下桥不可用，自动回退原逻辑。
++import { deleteHostFiles, hasHostFile, hostFileKeySet, hostFileUrl, IS_EMBEDDED, readHostFile, writeHostFile } from "@/lib/host-fs-bridge";
+ 
+ export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
+ 
+@@ -9,15 +12,29 @@ const objectUrls = new Map<string, string>();
+ export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
+     const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+     const storageKey = `${prefix}:${nanoid()}`;
+-    await store.setItem(storageKey, blob);
+-    const url = URL.createObjectURL(blob);
+-    objectUrls.set(storageKey, url);
+-    const meta = blob.type.startsWith("video/") ? await readVideoMeta(url) : blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
++    // [dokng] 嵌入宿主时先落盘：成功则节点里存的是 oc:// 持久 URL（重启即在），不再写 IndexedDB。
++    // 落盘失败（宿主不可用 / standalone web）回退原 IndexedDB + blob: 路径。
++    const persisted = await writeHostFile(storageKey, blob);
++    if (!persisted) await store.setItem(storageKey, blob);
++    // 探测时长/尺寸用临时 blob: URL（本地解码，不必等磁盘可读）；落盘成功时它不进节点数据。
++    const probeUrl = URL.createObjectURL(blob);
++    const meta = blob.type.startsWith("video/") ? await readVideoMeta(probeUrl) : blob.type.startsWith("audio/") ? await readAudioMeta(probeUrl) : {};
++    let url: string;
++    if (persisted) {
++        URL.revokeObjectURL(probeUrl);
++        url = hostFileUrl(storageKey);
++    } else {
++        url = probeUrl;
++        objectUrls.set(storageKey, url);
++    }
+     return { url, storageKey, bytes: blob.size, mimeType: blob.type || "application/octet-stream", ...meta };
+ }
+ 
+ export async function resolveMediaUrl(storageKey?: string, fallback = "") {
+     if (!storageKey) return fallback;
++    // [dokng] 磁盘优先：已落盘的直接返回 oc:// 直链。协议分支透传 range 请求，
++    // 故 <video> 可正常拖进度条，且无需先把整个文件读进内存。
++    if (await hasHostFile(storageKey)) return hostFileUrl(storageKey);
+     const cached = objectUrls.get(storageKey);
+     if (cached) return cached;
+     const blob = await store.getItem<Blob>(storageKey);
+@@ -28,10 +45,23 @@ export async function resolveMediaUrl(storageKey?: string, fallback = "") {
+ }
+ 
+ export async function getMediaBlob(storageKey: string) {
++    // [dokng] 磁盘优先：落盘后 IndexedDB 里已无这份字节，导出 / 同步需从磁盘读回。
++    if (await hasHostFile(storageKey)) {
++        const blob = await readHostFile(storageKey);
++        if (blob) return blob;
++    }
+     return store.getItem<Blob>(storageKey);
+ }
+ 
+ export async function setMediaBlob(storageKey: string, blob: Blob) {
++    // [dokng] 与 uploadMediaFile 同策：优先落盘并返回 oc:// 持久 URL，失败回退 IndexedDB + blob:。
++    if (await writeHostFile(storageKey, blob)) {
++        // 换了字节，旧的 blob: 缓存必须失效，否则界面仍播放旧内容。
++        const stale = objectUrls.get(storageKey);
++        if (stale) URL.revokeObjectURL(stale);
++        objectUrls.delete(storageKey);
++        return hostFileUrl(storageKey);
++    }
+     await store.setItem(storageKey, blob);
+     const url = URL.createObjectURL(blob);
+     objectUrls.set(storageKey, url);
+@@ -39,8 +69,11 @@ export async function setMediaBlob(storageKey: string, blob: Blob) {
+ }
+ 
+ export async function deleteStoredMedia(keys: Iterable<string>) {
++    const list = Array.from(new Set(keys));
++    // [dokng] 磁盘上的副本一并删除，否则落盘文件永不回收。
++    if (list.length > 0) await deleteHostFiles(list);
+     await Promise.all(
+-        Array.from(new Set(keys)).map(async (key) => {
++        list.map(async (key) => {
+             const url = objectUrls.get(key);
+             if (url) URL.revokeObjectURL(url);
+             objectUrls.delete(key);
+@@ -51,11 +84,19 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
+ 
+ export async function cleanupUnusedMedia(usedData: unknown) {
+     const usedKeys = collectMediaStorageKeys(usedData);
+-    const unused: string[] = [];
++    const unused = new Set<string>();
+     await store.iterate((_value, key) => {
+-        if (!usedKeys.has(key)) unused.push(key);
++        if (!usedKeys.has(key)) unused.add(key);
+     });
+-    await Promise.all(unused.map((key) => store.removeItem(key)));
++    // [dokng] 磁盘侧同样清理孤儿。跳过 image: 前缀——那部分由 image-storage 的
++    // cleanupUnusedImages 负责，两边共用同一目录，各自只清自己那部分，否则会互删。
++    if (IS_EMBEDDED) {
++        for (const key of await hostFileKeySet()) {
++            if (!key.startsWith("image:") && !usedKeys.has(key)) unused.add(key);
++        }
++    }
++    // 原实现只 removeItem 不撤 blob: URL；改走 deleteStoredMedia 统一清理（含磁盘副本）。
++    await deleteStoredMedia(unused);
+ }
+ 
+ export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()) {
+diff --git a/web/src/services/image-storage.ts b/web/src/services/image-storage.ts
+index 1dce06e..dec5e82 100644
+--- a/web/src/services/image-storage.ts
++++ b/web/src/services/image-storage.ts
+@@ -3,6 +3,9 @@ import localforage from "localforage";
+ import { nanoid } from "nanoid";
+ import i18n from "@/i18n";
+ import { readImageMeta } from "@/lib/image-utils";
++// [dokng] 落盘桥：嵌入 opencode 桌面壳时把图片字节写到 userData/canvas-files/，
++// 不再依赖可被回收的 IndexedDB 与会话级 blob: URL。standalone web 下桥不可用，自动回退原逻辑。
++import { deleteHostFiles, hasHostFile, hostFileKeySet, hostFileUrl, IS_EMBEDDED, readHostFile, writeHostFile } from "@/lib/host-fs-bridge";
+ 
+ export type UploadedImage = {
+     url: string;
+@@ -19,15 +22,28 @@ const objectUrls = new Map<string, string>();
+ export async function uploadImage(input: string | Blob): Promise<UploadedImage> {
+     const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+     const storageKey = `image:${nanoid()}`;
+-    await store.setItem(storageKey, blob);
+-    const url = URL.createObjectURL(blob);
+-    objectUrls.set(storageKey, url);
+-    const meta = await readImageMeta(url);
++    // [dokng] 嵌入宿主时先落盘：成功则节点里存的是 oc:// 持久 URL（重启即在），不再写 IndexedDB。
++    // 落盘失败（宿主不可用 / standalone web）回退原 IndexedDB + blob: 路径。
++    const persisted = await writeHostFile(storageKey, blob);
++    if (!persisted) await store.setItem(storageKey, blob);
++    // 读尺寸仍用临时 blob: URL（本地解码，不必等磁盘可读）；落盘成功时它不进节点数据。
++    const probeUrl = URL.createObjectURL(blob);
++    const meta = await readImageMeta(probeUrl);
++    let url: string;
++    if (persisted) {
++        URL.revokeObjectURL(probeUrl);
++        url = hostFileUrl(storageKey);
++    } else {
++        url = probeUrl;
++        objectUrls.set(storageKey, url);
++    }
+     return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type || meta.mimeType };
+ }
+ 
+ export async function resolveImageUrl(storageKey?: string, fallback = "") {
+     if (!storageKey) return fallback;
++    // [dokng] 磁盘优先：已落盘的直接返回 oc:// 直链，浏览器自己加载并缓存，无需 hydrate 重建。
++    if (await hasHostFile(storageKey)) return hostFileUrl(storageKey);
+     const cached = objectUrls.get(storageKey);
+     if (cached) return cached;
+     const blob = await store.getItem<Blob>(storageKey);
+@@ -38,10 +54,23 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
+ }
+ 
+ export async function getImageBlob(storageKey: string) {
++    // [dokng] 磁盘优先：落盘后 IndexedDB 里已无这份字节，图生图 / 导出需从磁盘读回。
++    if (await hasHostFile(storageKey)) {
++        const blob = await readHostFile(storageKey, "image/png");
++        if (blob) return blob;
++    }
+     return store.getItem<Blob>(storageKey);
+ }
+ 
+ export async function setImageBlob(storageKey: string, blob: Blob) {
++    // [dokng] 与 uploadImage 同策：优先落盘并返回 oc:// 持久 URL，失败回退 IndexedDB + blob:。
++    if (await writeHostFile(storageKey, blob)) {
++        // 换了字节，旧的 blob: 缓存必须失效，否则界面仍显示旧图。
++        const stale = objectUrls.get(storageKey);
++        if (stale) URL.revokeObjectURL(stale);
++        objectUrls.delete(storageKey);
++        return hostFileUrl(storageKey);
++    }
+     await store.setItem(storageKey, blob);
+     const url = URL.createObjectURL(blob);
+     objectUrls.set(storageKey, url);
+@@ -55,8 +84,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
+ }
+ 
+ export async function deleteStoredImages(keys: Iterable<string>) {
++    const list = Array.from(new Set(keys));
++    // [dokng] 磁盘上的副本一并删除，否则落盘文件永不回收。
++    if (list.length > 0) await deleteHostFiles(list);
+     await Promise.all(
+-        Array.from(new Set(keys)).map(async (key) => {
++        list.map(async (key) => {
+             const url = objectUrls.get(key);
+             if (url) URL.revokeObjectURL(url);
+             objectUrls.delete(key);
+@@ -67,10 +99,17 @@ export async function deleteStoredImages(keys: Iterable<string>) {
+ 
+ export async function cleanupUnusedImages(usedData: unknown) {
+     const usedKeys = collectImageStorageKeys(usedData);
+-    const unused: string[] = [];
++    const unused = new Set<string>();
+     await store.iterate((_value, key) => {
+-        if (!usedKeys.has(key)) unused.push(key);
++        if (!usedKeys.has(key)) unused.add(key);
+     });
++    // [dokng] 磁盘侧同样清理孤儿。只删 image: 前缀的 key——video/audio/file 由 file-storage
++    // 的 cleanupUnusedMedia 负责，两边共用同一目录，各自只清自己那部分，否则会互删。
++    if (IS_EMBEDDED) {
++        for (const key of await hostFileKeySet()) {
++            if (key.startsWith("image:") && !usedKeys.has(key)) unused.add(key);
++        }
++    }
+     await deleteStoredImages(unused);
+ }
+ 
+diff --git a/web/src/stores/canvas/use-canvas-store.ts b/web/src/stores/canvas/use-canvas-store.ts
+index 89eca3d..8418eff 100644
+--- a/web/src/stores/canvas/use-canvas-store.ts
++++ b/web/src/stores/canvas/use-canvas-store.ts
+@@ -4,6 +4,8 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
+ import { nanoid } from "nanoid";
+ import i18n from "@/i18n";
+ import { localForageStorage } from "@/lib/localforage-storage";
++// [dokng] 落盘桥：嵌入 opencode 桌面壳时画布状态写到 userData/canvas-state.json。
++import { IS_EMBEDDED, readHostState, writeHostState } from "@/lib/host-fs-bridge";
+ import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+ import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
+ 
+@@ -36,14 +38,82 @@ type CanvasStore = {
+ const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
+ const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
+ type PersistedCanvasState = Pick<CanvasStore, "projects">;
++
++// [dokng] 画布状态落盘。
++//
++// 原实现的缺陷：setItem 有 400ms debounce，且没有任何 pagehide / beforeunload 兜底。opencode
++// 主进程退出走 app.exit(0)（硬退出，不等 renderer 收尾），窗口里的 pending 写直接丢——表现就是
++// "生成图片后关掉软件再打开，画布是空的 / 图加载不出来"（节点没了，磁盘上的图片成了孤儿）。
++//
++// 现实现：
++//   1. debounce 缩到 120ms，并在 pagehide / visibilitychange(hidden) / beforeunload 时立即
++//      flush pending 写，正常关窗与切后台路径不再丢；
++//   2. 嵌入宿主时写 userData/canvas-state.json（主进程侧临时文件 + rename 原子落盘），
++//      不再依赖可被浏览器回收的 IndexedDB（画布从未申请 navigator.storage.persist()）；
++//   3. flush 阶段只把 postMessage 投出去、不等回帖（文档正在销毁，等不到），宿主收到即转 IPC。
++//
++// 残留风险：SIGKILL / 断电这类不给任何事件的终止，最多丢最后 120ms 的编辑。图片字节不受影响——
++// uploadImage 的落盘是 await 的，函数返回时字节已在磁盘上。
++const SAVE_DEBOUNCE_MS = 120;
++
+ let saveTimer: ReturnType<typeof setTimeout> | null = null;
+ let queuedPersistState: PersistedCanvasState | null = null;
++// 待写内容（已序列化）。flush 时直接取用，避免在 pagehide 阶段还要做序列化。
++let pendingWrite: { name: string; json: string } | null = null;
++
++function doWrite(name: string, json: string) {
++    if (IS_EMBEDDED) {
++        // 嵌入宿主：写磁盘。失败（宿主异常）回退 IndexedDB，不静默丢数据。
++        void writeHostState(json).then((ok) => {
++            if (!ok) void localForageStorage.setItem(name, json);
++        });
++        return;
++    }
++    void localForageStorage.setItem(name, json);
++}
++
++// 立刻写出 pending 内容（页面即将隐藏/卸载时调用）。幂等，可重复触发。
++function flushPendingWrite() {
++    if (saveTimer) {
++        clearTimeout(saveTimer);
++        saveTimer = null;
++    }
++    if (!pendingWrite) return;
++    const { name, json } = pendingWrite;
++    pendingWrite = null;
++    doWrite(name, json);
++}
++
++if (typeof window !== "undefined") {
++    // pagehide 覆盖关窗与导航；visibilitychange(hidden) 覆盖切后台（部分路径下 pagehide 不保证
++    // 触发）；beforeunload 兜最后一道。三者都只是"提前 flush"，多次触发无副作用。
++    window.addEventListener("pagehide", flushPendingWrite);
++    window.addEventListener("beforeunload", flushPendingWrite);
++    document.addEventListener("visibilitychange", () => {
++        if (document.visibilityState === "hidden") flushPendingWrite();
++    });
++}
+ 
+ const canvasStorage: PersistStorage<CanvasStore> = {
+     getItem: async (name) => {
+-        const value = await localForageStorage.getItem(name);
+-        if (!value) return null;
+-        const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
++        // [dokng] 读取优先磁盘；磁盘没有（老用户首次升级）再读 IndexedDB，读到后立刻写一份到
++        // 磁盘，使既有画布无缝接上，无需单独的迁移入口。
++        let raw: string | null = null;
++        if (IS_EMBEDDED) raw = await readHostState();
++        let needMigrate = false;
++        if (!raw) {
++            raw = await localForageStorage.getItem(name);
++            needMigrate = Boolean(raw) && IS_EMBEDDED;
++        }
++        if (!raw) return null;
++        let parsed: StorageValue<CanvasStore>;
++        try {
++            parsed = JSON.parse(raw) as StorageValue<CanvasStore>;
++        } catch {
++            // 坏 JSON 当作无数据，避免整个 store 起不来（原实现会直接抛出）。
++            return null;
++        }
++        if (needMigrate) void writeHostState(raw);
+         queuedPersistState = parsed.state as PersistedCanvasState;
+         return parsed;
+     },
+@@ -51,13 +121,28 @@ const canvasStorage: PersistStorage<CanvasStore> = {
+         const nextState = value.state as PersistedCanvasState;
+         if (queuedPersistState && queuedPersistState.projects === nextState.projects) return;
+         queuedPersistState = nextState;
++        pendingWrite = { name, json: JSON.stringify(value) };
+         if (saveTimer) clearTimeout(saveTimer);
+         saveTimer = setTimeout(() => {
+             saveTimer = null;
+-            void localForageStorage.setItem(name, JSON.stringify(value));
+-        }, 400);
++            const write = pendingWrite;
++            pendingWrite = null;
++            if (write) doWrite(write.name, write.json);
++        }, SAVE_DEBOUNCE_MS);
++    },
++    removeItem: (name) => {
++        // 丢弃未写出的内容，否则 flush 会把已删除的状态又写回去。
++        pendingWrite = null;
++        if (saveTimer) {
++            clearTimeout(saveTimer);
++            saveTimer = null;
++        }
++        queuedPersistState = null;
++        // 磁盘副本一并清空，否则下次启动 getItem 又从 canvas-state.json 把已删数据读回来。
++        // 写空串而非删文件：getItem 对空内容按"无数据"处理，语义一致且少一个 IPC 面。
++        if (IS_EMBEDDED) void writeHostState("");
++        return localForageStorage.removeItem(name);
+     },
+-    removeItem: (name) => localForageStorage.removeItem(name),
+ };
+ 
+ export const useCanvasStore = create<CanvasStore>()(

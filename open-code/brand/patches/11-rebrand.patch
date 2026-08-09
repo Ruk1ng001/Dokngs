@@ -1,0 +1,78 @@
+diff --git a/packages/app/src/context/language.tsx b/packages/app/src/context/language.tsx
+index 8772fd3111..6a817d711e 100644
+--- a/packages/app/src/context/language.tsx
++++ b/packages/app/src/context/language.tsx
+@@ -32,6 +32,33 @@ type PluralKey =
+   | "session.revertDock.summary"
+ type Source = { dict: Record<string, string> }
+ 
++// [cx] 品牌名替换：在唯一翻译出口统一替换用户可见的 OpenCode 文案，同时保护真实服务名、
++// 域名和配置文件名。PRODUCT_NAME 由 desktop 构建配置注入，未配置时保持上游名称。
++const PRODUCT_NAME =
++  typeof import.meta.env.PRODUCT_NAME === "string" && import.meta.env.PRODUCT_NAME.length > 0
++    ? import.meta.env.PRODUCT_NAME
++    : "OpenCode"
++
++const REBRAND_PROTECTED = ["OpenCode Zen", "OpenCode Go", "opencode.ai", "opencode.json"]
++
++function rebrand(text: string): string {
++  if (PRODUCT_NAME === "OpenCode" || (!text.includes("OpenCode") && !text.includes("opencode"))) return text
++  let out = text
++  const holders: string[] = []
++  REBRAND_PROTECTED.forEach((word, i) => {
++    if (!out.includes(word)) return
++    const holder = `CXP${i}`
++    holders[i] = word
++    out = out.split(word).join(holder)
++  })
++  out = out.split("OpenCode").join(PRODUCT_NAME)
++  holders.forEach((word, i) => {
++    if (word === undefined) return
++    out = out.split(`CXP${i}`).join(word)
++  })
++  return out
++}
++
+ function cookie(locale: Locale) {
+   return `oc_locale=${encodeURIComponent(locale)}; Path=/; Max-Age=31536000; SameSite=Lax`
+ }
+@@ -259,10 +286,12 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
+       initialValue: dicts.get(initial) ?? base,
+     })
+ 
+-    const t = i18n.translator(() => dict() ?? base, i18n.resolveTemplate) as (
++    const translate = i18n.translator(() => dict() ?? base, i18n.resolveTemplate) as (
+       key: keyof Dictionary,
+       params?: Record<string, string | number | boolean>,
+     ) => string
++    const t = ((key: keyof Dictionary, params?: Record<string, string | number | boolean>) =>
++      rebrand(translate(key, params))) as typeof translate
+ 
+     const plural = (key: PluralKey, count: number, params?: Record<string, string | number | boolean>) => {
+       const category = pluralCategory(intl(), count)
+@@ -291,7 +320,9 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
+       const current = dict()
+       if (!current) return
+       props.onNativeTranslations(
+-        createDesktopNativeBundle(locale(), (key) => current[key] ?? DESKTOP_NATIVE_ENGLISH[key]),
++        // [cx] 原生菜单/对话框文案不走 translator，必须在这里补一次 rebrand()，否则
++        // desktop.menu.app 等字面量里的 "OpenCode" 会绕过品牌替换直达 nativeT()。
++        createDesktopNativeBundle(locale(), (key) => rebrand(current[key] ?? DESKTOP_NATIVE_ENGLISH[key])),
+       )
+     })
+ 
+diff --git a/packages/app/src/env.d.ts b/packages/app/src/env.d.ts
+index 5754df7683..e17a3d37e7 100644
+--- a/packages/app/src/env.d.ts
++++ b/packages/app/src/env.d.ts
+@@ -6,6 +6,10 @@ interface ImportMetaEnv {
+   readonly VITE_SENTRY_DSN?: string
+   readonly VITE_SENTRY_ENVIRONMENT?: string
+   readonly VITE_SENTRY_RELEASE?: string
++
++  // [cx] 品牌名，经 desktop electron.vite renderer.define 在构建期注入（来自 brand/brand.json
++  // 的 productName）。用于 i18n 文案与桌面菜单的品牌名替换；未注入时代码回退 "OpenCode"。
++  readonly PRODUCT_NAME?: string
+ }
+ 
+ interface ImportMeta {

@@ -1,0 +1,87 @@
+      <svg
+        data-slot="cx-splash"
+        class="w-20 h-20"
+        viewBox="0 0 48 48"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <defs>
+          <linearGradient id="cx-bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#f8fafc" />
+            <stop offset=".5" stop-color="#eff6ff" />
+            <stop offset="1" stop-color="#e0e7ff" />
+          </linearGradient>
+          <linearGradient id="cx-main" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#06b6d4" />
+            <stop offset=".5" stop-color="#3b82f6" />
+            <stop offset="1" stop-color="#8b5cf6" />
+          </linearGradient>
+          <linearGradient id="cx-sheen" x1="8" y1="6" x2="40" y2="42" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#ffffff" stop-opacity=".92" />
+            <stop offset=".5" stop-color="#ffffff" stop-opacity=".18" />
+            <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
+          </linearGradient>
+          <radialGradient id="cx-glow" cx="0.34" cy="0.28" r="0.8">
+            <stop stop-color="#38bdf8" stop-opacity=".2" />
+            <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
+          </radialGradient>
+          <filter id="cx-soft" x="-35%" y="-35%" width="170%" height="170%">
+            <feGaussianBlur stdDeviation=".8" result="b" />
+            <feMerge>
+              <feMergeNode in="b" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+        </defs>
+
+        {/* 底板 */}
+        <rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#cx-bg)" stroke="#c7d2fe" />
+        <rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#cx-glow)" />
+        <rect x="2.4" y="2.4" width="43.2" height="43.2" rx="13.1" fill="url(#cx-sheen)" opacity=".55" />
+        <rect x="2.8" y="2.8" width="42.4" height="42.4" rx="12.7" fill="none" stroke="#ffffff" stroke-opacity=".5" stroke-width=".75" />
+
+        {/* 同心环 */}
+        <circle cx="24" cy="24" r="17.6" fill="none" stroke="#e0e7ff" stroke-width=".85" stroke-dasharray="1.5 2.3" />
+        <circle cx="24" cy="24" r="15.35" fill="none" stroke="#c7d2fe" stroke-width="1" opacity=".68" />
+        <circle cx="24" cy="24" r="13.35" fill="none" stroke="#ddd6fe" stroke-width="1.1" opacity=".82" />
+
+        {/* 爪印层：4 条弧 + 节点，开屏时轻微摆动（cx-splash-paws）。 */}
+        <g data-slot="cx-splash-paws">
+          <path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#cx-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#cx-soft)" />
+          <path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#cx-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#cx-soft)" />
+          <path d="M11.8 15 A15.05 15.05 0 0 1 17.7 9.2" fill="none" stroke="#67e8f9" stroke-width="1.1" stroke-linecap="round" opacity=".5" />
+          <path d="M36.2 33 A15.05 15.05 0 0 1 30.3 38.8" fill="none" stroke="#c4b5fd" stroke-width="1.1" stroke-linecap="round" opacity=".5" />
+          <g filter="url(#cx-soft)">
+            <circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4" />
+            <circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6" />
+          </g>
+          <circle cx="38.05" cy="17.05" r="1" fill="#ecfeff" />
+          <circle cx="9.95" cy="30.95" r="1" fill="#f5f3ff" />
+          <circle cx="17.7" cy="9.2" r=".9" fill="#22d3ee" opacity=".65" />
+          <circle cx="30.3" cy="38.8" r=".9" fill="#a78bfa" opacity=".65" />
+        </g>
+
+        {/* 狗脸：眉弧 + 两侧腮弧（静止） */}
+        <path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#cx-main)" stroke-width="2.25" stroke-linecap="round" />
+        <path d="M15.6 22 C13.1 22 13.4 26.6 15.3 27.8" fill="none" stroke="url(#cx-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4" />
+        <path d="M32.4 22 C34.9 22 34.6 26.6 32.7 27.8" fill="none" stroke="url(#cx-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4" />
+
+        {/* 双眼：周期眨眼（cx-splash-eye）。高光跟随本组一起眨。 */}
+        <g data-slot="cx-splash-eye">
+          <circle cx="20.2" cy="22.1" r="1.5" fill="#06b6d4" />
+          <circle cx="20.2" cy="22.1" r=".52" fill="#ffffff" opacity=".75" />
+        </g>
+        <g data-slot="cx-splash-eye">
+          <circle cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6" />
+          <circle cx="27.8" cy="22.1" r=".52" fill="#ffffff" opacity=".75" />
+        </g>
+
+        {/* 嘴 */}
+        <ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#cx-main)" />
+        <ellipse cx="24" cy="27.35" rx="1.35" ry=".6" fill="#ffffff" opacity=".65" />
+
+        {/* 微点 + 侧边线 */}
+        <circle cx="14.8" cy="12.4" r=".7" fill="#22d3ee" opacity=".55" />
+        <circle cx="33.2" cy="35.6" r=".7" fill="#a78bfa" opacity=".55" />
+        <path d="M9 24h1.8M37.2 24h1.8" stroke="#93c5fd" stroke-width=".8" stroke-linecap="round" opacity=".35" />
+      </svg>

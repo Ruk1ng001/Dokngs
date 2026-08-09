@@ -1,0 +1,23 @@
+# 10-default-locale-zh —— 品牌层可配置的首启默认 locale（US-003）
+#
+# 默认值来自 brand/brand.json，经 02 补丁在构建期注入 DEFAULT_LOCALE；品牌配置缺失时
+# 由构建配置回退为 zh。本补丁仅修改 desktop renderer 入口的无存储兜底。
+diff --git a/packages/desktop/src/renderer/index.tsx b/packages/desktop/src/renderer/index.tsx
+index 966fb0c0b..005c2fa7f 100644
+--- a/packages/desktop/src/renderer/index.tsx
++++ b/packages/desktop/src/renderer/index.tsx
+@@ -330,7 +330,13 @@ function DesktopRoot(props: { windowState: DesktopWindowState }) {
+     const current = await platform.storage?.("opencode.global.dat").getItem("language")
+     const legacy = current ? undefined : await platform.storage?.().getItem("language.v1")
+     const raw = current ?? legacy
+-    if (!raw) return
++    // [cx] US-003: 本地无语言存储时使用品牌层构建期注入的默认 locale。
++    // DEFAULT_LOCALE 在品牌配置缺失时由 electron.vite.config.ts 回退为 zh；已存储时不覆盖。
++    if (!raw) {
++      const locale = normalizeLocale(import.meta.env.DEFAULT_LOCALE)
++      if (locale !== "en") await loadLocaleDict(locale)
++      return locale satisfies Locale
++    }
+     const locale = raw.match(/"locale"\s*:\s*"([^"]+)"/)?.[1]
+     if (!locale) return
+     const next = normalizeLocale(locale)

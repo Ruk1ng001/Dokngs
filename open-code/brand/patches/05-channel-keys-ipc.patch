@@ -1,0 +1,141 @@
+# 05-channel-keys-ipc —— key 管理 IPC 通道（US-009）
+#
+# 职责：把 04 的本地 key 数据层（store-channel-keys）经专用 IPC 暴露给 renderer，
+# 支撑「增删改 key + 手动切换激活 key」的账户面板 UI（01 补丁 balance-panel）。
+#   1. main/ipc.ts —— import 04 的 store-channel-keys，新增 channel-keys-* handler：
+#      channel-keys-list / -add / -remove / -update-label / -set-active / -set-models。
+#      每个 handler 走主进程数据层增删改后，返回 JSON.stringify 的最新 ChannelKeysState
+#      字符串（与 store-get 对非字符串 JSON.stringify 的约定一致），renderer 解析回对象刷新 UI。
+#   2. preload/types.ts —— ElectronAPI 增补 channelKeys* 方法签名。
+#   3. preload/index.ts —— 经 ipcRenderer.invoke 桥接上述 IPC。
+#
+# 为什么不复用通用 store-set：通用 store-set 会把整个 channelKeys 对象存成 JSON 字符串，
+# 破坏主进程侧 readChannelKeysState 的「对象读取」（04 用 getStore().get 期望对象）。故为
+# key 管理开专用 IPC，写入统一走 04 的数据层，保证主/渲染两侧对同一份对象态的读写一致。
+#
+# 切换激活 key 的「重启内核」：复用既有 window.api.relaunch（stopSidecars → app.relaunch，
+# US-002 结论：内核 config 启动期一次性注入，换 key 必须重启 sidecar 才生效），不新增重启 IPC。
+#
+# 安全底线：key 管理 handler 一律不打印任何入参（尤其 sk- 明文），仅透传给数据层。
+# 依赖：引用 04 的 store-channel-keys（按 NN 序 04→05 应用，git apply 只做文本操作不校验 import，
+#      typecheck 在全部补丁应用后才跑）。独立于 01/02/03 的文件。
+# 应用（在 opencode/ 内，基线为 brand/BASE_SHA，按 01→02→03→04→05 顺序）：
+#   git -C opencode apply --3way brand/patches/05-channel-keys-ipc.patch
+diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
+index d8abfc1ceb..96865081f7 100644
+--- a/packages/desktop/src/main/ipc.ts
++++ b/packages/desktop/src/main/ipc.ts
+@@ -11,6 +11,21 @@ import { runDesktopMenuAction } from "./desktop-menu-actions"
+ import { setForceFocus } from "./debug"
+ import { assertAttachmentBudget, createPickedFileAuthorizations } from "./attachment-picker"
+ import { getStore, removeStoreFileIfEmpty } from "./store"
++// [cx] US-009: 本地多 key 列表的增删改 / 切换激活 —— 直接复用主进程数据层（同本文件直接
++// import getStore 的风格）。renderer 不能用通用 store-set 写 channelKeys（那会把对象存成
++// 字符串，破坏主进程 readChannelKeysState 的对象读取），故为 key 管理开专用 IPC 通道。
++// 安全底线：本文件对 key 管理 handler 一律不打印任何入参（尤其 sk- 明文），仅透传给数据层。
++import {
++  readChannelKeysState,
++  addChannelKey,
++  removeChannelKey,
++  updateChannelKeyLabel,
++  setActiveChannelKey,
++  setChannelKeyModels,
++} from "./store-channel-keys"
++// [cx] 内置渠道热重载：增删 key 后重写 OPENCODE_CONFIG 文件 + POST /global/dispose，
++// 让内核重建 instance 读到新 provider——不重启进程（切换已注册 key 走前端桥、零打断）。
++import { reloadChannelConfig, refreshKeyModelsAndReload } from "./server"
+ import {
+   getPinchZoomEnabled,
+   getWindowID,
+@@ -149,6 +164,45 @@ export function registerIpcHandlers(deps: Deps) {
+     return data ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : null
+   })
+ 
++  // [cx] US-009: 本地 key 列表的增删改 + 切换激活。全部走主进程数据层（store-channel-keys）。
++  // 返回值统一为 JSON.stringify 后的最新 ChannelKeysState 字符串，renderer 解析回对象刷新 UI
++  // （与 store-get 对非字符串 JSON.stringify 的约定一致）。不打印任何入参（含 sk- 明文）。
++  ipcMain.handle("channel-keys-list", () => JSON.stringify(readChannelKeysState()))
++  ipcMain.handle(
++    "channel-keys-add",
++    (_event: IpcMainInvokeEvent, input: { label: string; key: string; baseURL: string }) => {
++      addChannelKey({ label: input.label ?? "", key: input.key ?? "", baseURL: input.baseURL ?? "" })
++      return JSON.stringify(readChannelKeysState())
++    },
++  )
++  ipcMain.handle("channel-keys-remove", (_event: IpcMainInvokeEvent, id: string) => {
++    removeChannelKey(id)
++    return JSON.stringify(readChannelKeysState())
++  })
++  ipcMain.handle("channel-keys-update-label", (_event: IpcMainInvokeEvent, id: string, label: string) => {
++    updateChannelKeyLabel(id, label ?? "")
++    return JSON.stringify(readChannelKeysState())
++  })
++  ipcMain.handle("channel-keys-set-active", (_event: IpcMainInvokeEvent, id: string) => {
++    setActiveChannelKey(id)
++    return JSON.stringify(readChannelKeysState())
++  })
++  ipcMain.handle("channel-keys-set-models", (_event: IpcMainInvokeEvent, id: string, models: string[]) => {
++    setChannelKeyModels(id, Array.isArray(models) ? models : [])
++    return JSON.stringify(readChannelKeysState())
++  })
++
++  // [cx] 内置渠道热重载：新增 key 后调此——主进程拉该 key 的 /v1/models（无 CORS）落盘，
++  // 重写 OPENCODE_CONFIG 文件 + POST /global/dispose，内核重建 instance 即出现该 provider。
++  // 不重启进程；dispose 会中断进行中的流式回复（同原生加 provider），故 renderer 在空闲时触发。
++  ipcMain.handle("channel-config-refresh-key", async (_event: IpcMainInvokeEvent, id: string) => {
++    await refreshKeyModelsAndReload(id)
++  })
++  // [cx] 内置渠道热重载（不拉模型）：删除 key 后调此——重写文件 + dispose，provider 随之消失。
++  ipcMain.handle("channel-config-reload", async () => {
++    await reloadChannelConfig()
++  })
++
+   ipcMain.handle(
+     "open-directory-picker",
+     async (_event: IpcMainInvokeEvent, opts?: { multiple?: boolean; title?: string; defaultPath?: string }) => {
+diff --git a/packages/desktop/src/preload/index.ts b/packages/desktop/src/preload/index.ts
+index dae18b0716..b1e249f923 100644
+--- a/packages/desktop/src/preload/index.ts
++++ b/packages/desktop/src/preload/index.ts
+@@ -79,6 +79,17 @@ const api: ElectronAPI = {
+   draftBlobPut: (data) => ipcRenderer.invoke("draft-blob-put", data),
+   draftBlobGet: (id) => ipcRenderer.invoke("draft-blob-get", id),
+ 
++  // [cx] US-009: 本地 key 列表增删改 + 切换激活（见 types.ts 说明）。
++  channelKeysList: () => ipcRenderer.invoke("channel-keys-list"),
++  channelKeysAdd: (input) => ipcRenderer.invoke("channel-keys-add", input),
++  channelKeysRemove: (id) => ipcRenderer.invoke("channel-keys-remove", id),
++  channelKeysUpdateLabel: (id, label) => ipcRenderer.invoke("channel-keys-update-label", id, label),
++  channelKeysSetActive: (id) => ipcRenderer.invoke("channel-keys-set-active", id),
++  channelKeysSetModels: (id, models) => ipcRenderer.invoke("channel-keys-set-models", id, models),
++  // [cx] 内置渠道热重载：新增 key 后拉模型+重载（provider 出现）/ 删除后重载（provider 消失）。不重启进程。
++  channelConfigRefreshKey: (id) => ipcRenderer.invoke("channel-config-refresh-key", id),
++  channelConfigReload: () => ipcRenderer.invoke("channel-config-reload"),
++
+   getWindowID: () => ipcRenderer.invoke("get-window-id"),
+   onMenuCommand: (cb) => {
+     const handler = (_: unknown, id: string) => cb(id)
+diff --git a/packages/desktop/src/preload/types.ts b/packages/desktop/src/preload/types.ts
+index 20c39097d3..e0063025cd 100644
+--- a/packages/desktop/src/preload/types.ts
++++ b/packages/desktop/src/preload/types.ts
+@@ -70,6 +70,19 @@ export type ElectronAPI = {
+   draftBlobPut: (data: ArrayBuffer) => Promise<string>
+   draftBlobGet: (id: string) => Promise<ArrayBuffer | null>
+ 
++  // [cx] US-009: 本地 key 列表增删改 + 切换激活。全部走主进程数据层（store-channel-keys），
++  // 返回值为 JSON.stringify 的最新 ChannelKeysState 字符串，renderer 解析回对象刷新 UI。
++  // 不用通用 storeSet：那会把整个对象存成字符串、破坏主进程侧 readChannelKeysState 的对象读取。
++  channelKeysList: () => Promise<string>
++  channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => Promise<string>
++  channelKeysRemove: (id: string) => Promise<string>
++  channelKeysUpdateLabel: (id: string, label: string) => Promise<string>
++  channelKeysSetActive: (id: string) => Promise<string>
++  channelKeysSetModels: (id: string, models: string[]) => Promise<string>
++  // [cx] 内置渠道热重载：新增 key 后拉模型+重载 / 删除后重载。不重启进程。
++  channelConfigRefreshKey: (id: string) => Promise<void>
++  channelConfigReload: () => Promise<void>
++
+   getWindowID: () => Promise<string>
+   onMenuCommand: (cb: (id: string) => void) => () => void
+   onDeepLink: (cb: (urls: string[]) => void) => () => void

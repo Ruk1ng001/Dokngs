@@ -1,0 +1,89 @@
+# 官方客户端镜像：每日检测 Claude Desktop / ChatGPT Desktop / Claude Code /
+# Codex CLI / Gemini CLI 官方最新版，有新版则下载并按固定文件名上传 R2 的
+# official/ 目录（同名覆盖）。
+#
+# - 版本状态即 R2 上的 official/<client>/VERSION（也是首页展示的版本号）：
+#   与官方最新版一致则跳过，全部一致时本 job 是纯只读探测，几十秒结束。
+# - 文件名契约与 new-api 后端 controller/official_downloads.go 的 catalog 对应，
+#   哪个文件没传首页对应按钮自动隐藏（Gemini CLI 上游暂无 windows/linux 原生
+#   二进制，故这两个固定名当前不上传）。
+# - ChatGPT Desktop 的 Windows 包只经 Microsoft Store 分发，需由 fe3-store-url.py
+#   访问 Store 后端（fe3.delivery.mp.microsoft.com）解析真实 MSIX 直链。该域在部分
+#   网络里被中间盒拦截，届时只镜像 macOS 的 dmg，Windows 按钮自动隐藏。
+# - 渐进增强：R2 Secret 未配置时整体跳过，不报失败（与两个产品的发布工作流约定一致）。
+#
+# [monorepo] official/ 已从 cc-switch 仓内提级为顶层产品目录，脚本落在 official/scripts/。
+#   本 job 用 defaults.run.working-directory: official，使脚本调用保持 scripts/… 原样。
+#   R2 落点仍是桶根 official/<client>/…（路径契约不变，new-api 后端与首页无需改动）。
+#   本文件不发也不读 GitHub Release，故「只留 tag」的改动与它无关。
+name: official mirror
+
+on:
+  schedule:
+    # [monorepo] 每日 UTC 18:53，错开同仓其余三个定时任务：cc-switch 升级 16:37、
+    # open-code 升级 16:23、infinite-canvas 升级 17:47（互不重叠，避免抢 runner 配额）。
+    - cron: "53 18 * * *"
+  workflow_dispatch:
+    inputs:
+      clients:
+        description: "要同步的客户端（all 或空格分隔：claude-desktop chatgpt claude-code codex gemini-cli）"
+        required: false
+        default: "all"
+      force:
+        description: "版本相同也强制重新镜像"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # [monorepo] 组名带产品前缀，与 cc-switch-* / open-code-* 分池，互不排队、互不取消。
+  group: official-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 # 五客户端全量约 1.7GB 下载 + 上传，留足余量
+    defaults:
+      run:
+        working-directory: official
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - name: 检出仓库（无需 submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: 同步官方客户端镜像
+        if: env.R2_ACCESS_KEY_ID != ''
+        env:
+          # aws CLI 凭据（ubuntu runner 自带 aws，R2 兼容 S3 API）
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # GitHub API 探测 codex / gemini-cli release 用，规避匿名限流
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force == true && '1' || '' }}
+          # 经 env 传入而非直接插值进 run —— workflow_dispatch 的 clients 是自由文本，
+          # 若写成 ${{ inputs.clients }} 会被 shell 当代码执行（本步骤 env 里有 R2 凭据，
+          # 一次 dispatch 就能把 Secret 外带）。脚本侧另有白名单校验兜底。
+          CLIENTS: ${{ inputs.clients }}
+        # [monorepo] 路径仍写 scripts/…：本 job 的 defaults.run.working-directory 是
+        # official/，且脚本自身用 $HERE（BASH_SOURCE）定位同目录的 fe3-store-url.py，
+        # 不依赖 cwd，故搬目录后无需改脚本。
+        run: |
+          bash scripts/mirror-official-clients.sh ${CLIENTS:-all}
+
+      # 这一步只在「没配 R2 Secret」时才执行。配好 Secret 的正常情况下它自身被跳过，
+      # 会以灰色 skipped 出现在 UI 里 —— 那是本步骤没运行，不代表镜像被跳过。
+      # 故名字用「缺 Secret 时才提示」，避免 skipped 状态被误读成同步未执行。
+      - name: 缺 R2 Secret 时才提示（正常应为 skipped）
+        if: env.R2_ACCESS_KEY_ID == ''
+        run: echo "R2_* Secret 未配置，镜像同步跳过（渐进增强，不视为失败）。"

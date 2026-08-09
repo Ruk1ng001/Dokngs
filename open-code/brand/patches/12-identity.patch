@@ -1,0 +1,39 @@
+diff --git a/packages/desktop/src/main/server.ts b/packages/desktop/src/main/server.ts
+index 4867eb4d4..83a232a9c 100644
+--- a/packages/desktop/src/main/server.ts
++++ b/packages/desktop/src/main/server.ts
+@@ -409,6 +409,12 @@ function createSidecarEnv(): Record<string, string> {
+   env.OPENCODE_CONFIG = getChannelConfigPath()
+   // 清掉可能从 process.env 继承来的旧注入方式，避免覆盖文件配置。
+   delete env.OPENCODE_CONFIG_CONTENT
++  // [cx] 品牌身份注入：把构建期内联的 PRODUCT_NAME（来自 brand.json，见 11-rebrand 的
++  //   主进程 define）作为运行时环境变量传给内核 sidecar。system.ts 的 environment() 读它，
++  //   在系统提示词里声明「你是 <PRODUCT_NAME>，基于 opencode」，覆盖各 provider 提示词里
++  //   写死的 "You are opencode" 身份。缺失时 system.ts 侧回退 "Dokng"。
++  if (typeof import.meta.env.PRODUCT_NAME === "string" && import.meta.env.PRODUCT_NAME.length > 0)
++    env.PRODUCT_NAME = import.meta.env.PRODUCT_NAME
+   return env
+ }
+ 
+diff --git a/packages/opencode/src/session/system.ts b/packages/opencode/src/session/system.ts
+index b94e79426..141970f72 100644
+--- a/packages/opencode/src/session/system.ts
++++ b/packages/opencode/src/session/system.ts
+@@ -62,7 +62,17 @@ const layer = Layer.effect(
+         const references = yield* Effect.gen(function* () {
+           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
+         }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
++        // [cx] 品牌身份覆盖：各 provider 提示词（prompt/*.txt）里写死 "You are opencode"，
++        // 组装顺序为 provider 提示词 → environment（本函数）→ user.system（见 session/llm/request.ts），
++        // 故此处身份声明排在 "You are opencode" 之后，用覆盖式措辞压过它。一处覆盖全部 provider，
++        // 不改任何 txt，跟随上游升级零冲突。品牌名由主进程经 sidecar env 注入 PRODUCT_NAME
++        // （来自 brand/brand.json，见 desktop server.ts createSidecarEnv），缺省回退 "Dokng"。
++        const PRODUCT_NAME =
++          typeof process.env.PRODUCT_NAME === "string" && process.env.PRODUCT_NAME.length > 0
++            ? process.env.PRODUCT_NAME
++            : "Dokng"
+         return [
++          `You are ${PRODUCT_NAME}, a coding agent built on opencode. When asked what you are or what model/tool powers you, identify yourself as ${PRODUCT_NAME} (based on opencode). Do not describe yourself as plain "opencode".`,
+           [
+             `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
+             `Here is some useful information about the environment you are running in:`,

@@ -1,0 +1,73 @@
+# 画布补丁分组清单：仅用于文档与自动一致性校验；执行顺序仍以 canvas-patches/*.patch 文件名为准。
+# 每段 section 名必须与同名 .patch 文件一致。
+
+# iframe 宿主配置注入与路由/持久化适配：
+# - client-root-init.tsx 接收宿主 dokng:canvas-config、发送 ready 握手；
+# - router.tsx 改用 hash router，适配 oc://renderer/canvas/index.html；
+# - use-config-store.ts 嵌入态持久化时剥离 apiKey。
+[01-embed-inject]
+web/src/components/layout/client-root-init.tsx
+web/src/router.tsx
+web/src/stores/use-config-store.ts
+
+# 嵌入态 UI 与提示词源国内可达适配：
+# - 精简顶栏：只隐藏主题切换 / 版本 / GitHub 三个入口（嵌入桌面壳内主题跟随宿主、版本与仓库标识
+#   对终端用户无意义），文档 / 配置 / 节点插件 / 语言切换 / 快捷键一律保留。语言切换是上游
+#   v0.14.0 新增的入口，属于有意保留项，rebase 解冲突时勿连带删除；
+# - 首页只保留 hero：移除 showcase 区块及其 fetchPrompts 拉取，hero 改 flex 伸缩铺满视口；
+# - 提示词源国内可达（上游 v0.10.0 起提示词重构为预编译 JSON registry，原 prompts.ts 的
+#   markdown 解析 hook 点消失，适配同义迁移到新的唯一网络入口 prompt-source-runtime.ts）：
+#   registry JSON 拉取经 toCdn 走 jsDelivr 镜像（覆盖内置六源与自定义 raw 链接）；
+#   coverUrl / referenceImageUrls 图片经 proxyImage（raw→jsDelivr，其余外链→weserv 图片代理，
+#   常量可换自建反代或置空关闭）；sourceUrl（查看原文网页链接）不改写。
+[02-embed-ui]
+web/src/components/layout/user-status-actions.tsx
+web/src/pages/home/index.tsx
+web/src/services/api/prompt-source-runtime.ts
+
+# 提示词详情弹窗渲染 preview 里的示例图：
+# - 上游 v0.9.0 用 <pre> 原样直出 preview，导致 ![](url) 退化成裸 markdown 文本、图片不渲染；
+# - 改为零依赖轻量解析，把 markdown 图片抽成真正的 <img>（可点开原图），其余说明文字保留。
+[03-prompt-preview-render]
+web/src/pages/prompts/components/prompt-detail-dialog.tsx
+
+# 生图/视频请求改走 media. 子域，绕开 CDN 请求超时：
+# - use-config-store.ts 新增 toMediaBaseUrl()：把渠道 host 改写为 media.<host>（localhost /
+#   纯 IP / 已带 media. 前缀时原样返回，幂等）；后端同时接受原 host 与 media 子域，纯 host 改写；
+# - image.ts / video.ts 在 resolveModelRequestConfig 结果上套 withMediaBaseUrl，仅影响
+#   生图/编辑/视频等长耗时请求，文本/音频与其余链路保持原 host。
+[04-media-base-url]
+web/src/services/api/image.ts
+web/src/services/api/video.ts
+web/src/stores/use-config-store.ts
+
+# 画布数据落盘（替代 IndexedDB + 修退出丢数据）：
+# - 起因：生成图片后关闭软件再打开，画布加载不出来。根因是 use-canvas-store 的 persist 有 400ms
+#   debounce 且无任何 pagehide/beforeunload 兜底，而 opencode 主进程退出走 app.exit(0) 硬退出、
+#   不等 renderer 收尾，pending 写直接丢——节点没了，图片就成了无人引用的孤儿。叠加第二个隐患：
+#   画布从未调用 navigator.storage.persist()，IndexedDB 属 best-effort 存储、可被浏览器回收，
+#   且节点里存的是 URL.createObjectURL() 的会话级 blob: URL，重启必失效、依赖启动时 hydrate 重建。
+# - host-fs-bridge.ts（新增）：画布 ↔ 主进程的文件通道。画布跑在 oc://renderer/canvas/ 的 iframe
+#   里，而 preload 只注入主 frame（未开 nodeIntegrationInSubFrames），画布侧没有 window.api，
+#   故链路必须是 画布 → postMessage → 宿主 canvas-embed.tsx → IPC → 主进程。双向严格校验
+#   origin 与 source，二进制走 base64（分块转换，避免大文件 fromCharCode 爆栈），单请求 60s 超时。
+#   另收敛"磁盘现存 key"缓存：写/删函数内部自动维护，调用方无需手动同步（image/file 两侧共用，
+#   目录是同一个，各自维护会出现一方的写入在另一方缓存里缺失）。standalone web 下桥整体不可用，
+#   所有方法返回"未落盘"语义，调用方回退原 IndexedDB 路径，故纯 web 打开时本补丁无行为变化。
+# - image-storage.ts / file-storage.ts：上传/覆写优先落盘，成功则节点里存
+#   oc://renderer/__canvas-file/<key> 持久直链（浏览器直接加载并缓存，不再需要 hydrate 重建）；
+#   读取、取原始字节（图生图/导出）、删除、孤儿清理全部磁盘优先并同步清理磁盘副本。两边共用同一
+#   目录，故各自只清自己前缀的 key（image: 归 image-storage，其余归 file-storage），否则会互删。
+# - use-canvas-store.ts：debounce 缩到 120ms，并在 pagehide / visibilitychange(hidden) /
+#   beforeunload 三处 flush pending 写（flush 只把 postMessage 投出去、不等回帖，文档正在销毁
+#   等不到）；状态改写 userData/canvas-state.json（主进程侧临时文件 + rename 原子落盘）；读取
+#   磁盘优先，磁盘没有则读 IndexedDB 并立刻回写磁盘，老用户无缝迁移、无需单独迁移入口；坏 JSON
+#   不再直接抛出而当作无数据，避免整个 store 起不来。残留风险仅 SIGKILL/断电，最多丢最后 120ms
+#   编辑——图片字节不受影响，uploadImage 的落盘是 await 的，函数返回时字节已在磁盘上。
+# - 对应 opencode 侧补丁 18-canvas-fs（主进程 store-canvas-files.ts + oc:// 协议分支 + IPC +
+#   preload + 宿主 postMessage 桥），两者的消息类型与 URL 前缀常量必须同步修改。
+[05-canvas-fs]
+web/src/lib/host-fs-bridge.ts
+web/src/services/file-storage.ts
+web/src/services/image-storage.ts
+web/src/stores/canvas/use-canvas-store.ts

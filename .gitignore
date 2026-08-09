@@ -1,0 +1,39 @@
+# ── 渠道 / 密钥真实值 ─────────────────────────────────────
+# 含 token，绝不进 git。线上由 CI Secret 注入，本地由 *.env / channel.env 提供。
+# 只跟踪 *.env.example（示例，无真实值）。
+*.env
+!*.env.example
+auth.json
+*.pem
+*.key
+id_rsa*
+
+# open-code：渠道真实值与渲染产物（含 token）。
+# render 脚本把 opencode.template.json 的占位符替换成真实值生成 opencode.json，
+# 打包时该成品会放进 installer/ 或 dist/ 随包分发——这些实例一律忽略。
+/open-code/brand/channel.env
+/open-code/brand/opencode.json
+/open-code/installer/opencode.json
+
+# ── 本地覆盖 / 构建产物 ───────────────────────────────────
+# 任意 *.local 文件视为个人本地覆盖（可能含真实值），一律忽略。
+*.local
+/dist/
+/target/
+/open-code/dist/
+/cc-switch/dist/
+/cc-switch/target/
+
+# ── agent 运行时凭据 ──────────────────────────────────────
+# .claude/ 含 agent 运行时凭据（ANTHROPIC_AUTH_TOKEN 等），绝不进 git / 产品包。
+.claude/
+.chief/
+
+# ── rebase 中间态 ─────────────────────────────────────────
+# rebase-patches.sh 的进度状态目录（.rebase-state/ 为 opencode 侧，
+# .rebase-state-canvas/ 为画布侧）。纯本地中间产物，abort/finish 会清理，不进 git。
+.rebase-state*/
+
+# ── Python 缓存 ───────────────────────────────────────────
+__pycache__/
+*.pyc

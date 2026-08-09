@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dokng — 下载</title>
+    <!--
+      [cx] Cloudflare Pages 下载落地页（R2 发布托管）。
+      纯静态单页：运行时 fetch R2 上的 latest*.yml，解析出各平台最新版本与文件名，
+      渲染下载按钮。无后端、无构建步骤。
+
+      配置：DL_BASE 指向 R2 自定义域的 open-code/ 目录（与 brand/brand.json 的
+      updateBaseUrl 保持一致），当前为 https://dl.dokng.com/open-code。
+
+      CORS：本页所在域（Pages 子域）与 DL_BASE 子域不同源，R2 桶需加一条 CORS 规则
+      允许本页域 GET latest*.yml（见 brand/download-page/README.md）。
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fafafa;
+        --fg: #1a1a1a;
+        --muted: #6b7280;
+        --card: #ffffff;
+        --border: rgba(0, 0, 0, 0.1);
+        --accent: #2563eb;
+        --accent-fg: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0b0b0c;
+          --fg: #f2f2f3;
+          --muted: #9ca3af;
+          --card: #161618;
+          --border: rgba(255, 255, 255, 0.12);
+          --accent: #3b82f6;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 32px;
+        padding: 48px 20px;
+        background: var(--bg);
+        color: var(--fg);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      header {
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 32px;
+        font-weight: 680;
+      }
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        font-size: 15px;
+      }
+      .version {
+        margin-top: 12px;
+        font-size: 13px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 16px;
+        width: 100%;
+        max-width: 720px;
+      }
+      .card {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 24px;
+        border-radius: 14px;
+        background: var(--card);
+        box-shadow: inset 0 0 0 1px var(--border);
+      }
+      .card h2 {
+        margin: 0;
+        font-size: 17px;
+        font-weight: 620;
+      }
+      .card .platform-note {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+        min-height: 16px;
+      }
+      .dl-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 10px 16px;
+        border-radius: 10px;
+        background: var(--accent);
+        color: var(--accent-fg);
+        font-size: 14px;
+        font-weight: 560;
+        text-decoration: none;
+        transition: opacity 120ms ease;
+      }
+      .dl-btn:hover {
+        opacity: 0.9;
+      }
+      .dl-btn[data-disabled] {
+        pointer-events: none;
+        opacity: 0.4;
+      }
+      .dl-btn + .dl-btn {
+        margin-top: 8px;
+      }
+      .state {
+        font-size: 14px;
+        color: var(--muted);
+        text-align: center;
+      }
+      footer {
+        font-size: 12px;
+        color: var(--muted);
+        text-align: center;
+      }
+      footer a {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Dokng</h1>
+      <p class="subtitle">AI 编码助手 · 内置渠道开箱即用</p>
+      <p class="version" id="version">正在获取最新版本…</p>
+    </header>
+
+    <main class="grid" id="cards" hidden></main>
+    <p class="state" id="state">正在加载下载信息…</p>
+
+    <!-- [monorepo] 原「也可从 GitHub Releases 下载」链接已移除：本仓不再发 Release，
+         该链接恒 404。安装包只从 DL_BASE（R2）分发，即本页各按钮的来源。 -->
+    <footer>未签名包首次打开需绕过系统提示（见 README）</footer>
+
+    <script>
+      // [cx] R2 自定义域的 open-code/ 目录（与 brand.json updateBaseUrl 一致）。
+      const DL_BASE = "https://dl.dokng.com/open-code"
+
+      // electron-builder 的 latest*.yml 是简化 YAML。只需 version 与各 file 的 url（相对文件名）。
+      // 用轻量行解析（与 finalize-latest-yml.ts 的解析思路一致），不引第三方 YAML 库。
+      function parseYml(text) {
+        const lines = text.split("\n")
+        let version = ""
+        const files = []
+        let current = null
+        const flush = () => {
+          if (current && current.url) files.push(current)
+          current = null
+        }
+        for (const line of lines) {
+          const indented = line.startsWith("    ") || line.startsWith("  -")
+          if (line.startsWith("version:")) {
+            version = line.slice("version:".length).trim()
+          } else if (line.trim().startsWith("- url:")) {
+            flush()
+            current = { url: line.trim().slice("- url:".length).trim().replace(/^'|'$/g, "") }
+          } else if (indented && current && line.trim().startsWith("size:")) {
+            current.size = Number(line.trim().slice("size:".length).trim())
+          } else if (!indented && current) {
+            flush()
+          }
+        }
+        flush()
+        return { version, files }
+      }
+
+      async function fetchYml(name) {
+        try {
+          const res = await fetch(`${DL_BASE}/${name}`, { cache: "no-store" })
+          if (!res.ok) return null
+          return parseYml(await res.text())
+        } catch {
+          return null
+        }
+      }
+
+      function human(size) {
+        if (!size) return ""
+        const mb = size / (1024 * 1024)
+        return mb >= 1 ? `${mb.toFixed(0)} MB` : `${(size / 1024).toFixed(0)} KB`
+      }
+
+      function pick(files, re) {
+        return files.find((f) => re.test(f.url))
+      }
+
+      function button(label, file) {
+        if (!file) return `<a class="dl-btn" data-disabled>暂无</a>`
+        const size = human(file.size)
+        return `<a class="dl-btn" href="${DL_BASE}/${file.url}" download>${label}${size ? ` · ${size}` : ""}</a>`
+      }
+
+      async function main() {
+        const [mac, win, linux] = await Promise.all([
+          fetchYml("latest-mac.yml"),
+          fetchYml("latest.yml"),
+          fetchYml("latest-linux.yml"),
+        ])
+
+        const version = mac?.version || win?.version || linux?.version
+        const versionEl = document.getElementById("version")
+        const stateEl = document.getElementById("state")
+        const cardsEl = document.getElementById("cards")
+
+        if (!version) {
+          // [monorepo] 原文案让用户「前往 GitHub Releases 下载」——本仓不发 Release，
+          // 那是条死路。R2 是唯一分发源，取不到就只能稍后重试。
+          stateEl.textContent = "暂时无法获取下载信息，请稍后重试。"
+          return
+        }
+
+        versionEl.textContent = `最新版本 v${version}`
+
+        // macOS：dmg 供人工下载（arm64 / x64 分开）。zip 是自更新载体，不在下载页展示。
+        const macArm = mac ? pick(mac.files, /arm64\.dmg$/) : null
+        // Intel：优先命中 x64/x86_64，fallback 到「非 arm64 的 dmg」——绝不回退到 arm64 dmg，
+        // 避免文件名不含 x64 时把 Apple Silicon 包误当 Intel 包。
+        const macX64 = mac
+          ? pick(mac.files, /(x64|x86_64)\.dmg$/) || pick(mac.files, /(?<!arm64)\.dmg$/)
+          : null
+        // Windows：nsis .exe。
+        const winExe = win ? pick(win.files, /\.exe$/) : null
+        // Linux：AppImage。
+        const linuxImg = linux ? pick(linux.files, /\.AppImage$/i) : null
+
+        cardsEl.innerHTML = [
+          `<div class="card">
+            <h2>macOS</h2>
+            <p class="platform-note">Apple Silicon 与 Intel 分开下载</p>
+            ${button("Apple Silicon", macArm)}
+            ${button("Intel", macX64)}
+          </div>`,
+          `<div class="card">
+            <h2>Windows</h2>
+            <p class="platform-note">NSIS 安装器（per-user）</p>
+            ${button("下载 .exe", winExe)}
+          </div>`,
+          `<div class="card">
+            <h2>Linux</h2>
+            <p class="platform-note">AppImage，chmod +x 后直接运行</p>
+            ${button("下载 .AppImage", linuxImg)}
+          </div>`,
+        ].join("")
+
+        cardsEl.hidden = false
+        stateEl.hidden = true
+      }
+
+      main()
+    </script>
+  </body>
+</html>

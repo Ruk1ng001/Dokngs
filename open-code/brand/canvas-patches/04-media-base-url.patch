@@ -1,0 +1,116 @@
+diff --git a/web/src/services/api/image.ts b/web/src/services/api/image.ts
+index e062a09..d1522fc 100644
+--- a/web/src/services/api/image.ts
++++ b/web/src/services/api/image.ts
+@@ -1,7 +1,7 @@
+ import axios from "axios";
+ 
+ import i18n from "@/i18n";
+-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
++import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, toMediaBaseUrl, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+ import { normalizePluginImages, runModelPlugin } from "./model-plugin";
+ import { nanoid } from "nanoid";
+ import { dataUrlToFile } from "@/lib/image-utils";
+@@ -336,6 +336,11 @@ function aiApiUrl(config: AiConfig, path: string) {
+     return buildApiUrl(config.baseUrl, path);
+ }
+ 
++/** Route image generation/edit through the `media.` subdomain to bypass the CDN request timeout. */
++function withMediaBaseUrl<T extends { baseUrl: string }>(config: T): T {
++    return { ...config, baseUrl: toMediaBaseUrl(config.baseUrl) };
++}
++
+ function aiHeaders(config: AiConfig, contentType?: string) {
+     return {
+         Authorization: `Bearer ${config.apiKey}`,
+@@ -714,7 +719,7 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
+ }
+ 
+ export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
+-    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
++    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, config.model || config.imageModel));
+     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+     const script = resolveModelScript(config, config.model || config.imageModel);
+     if (script) {
+@@ -772,7 +777,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
+ }
+ 
+ export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
+-    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
++    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, config.model || config.imageModel));
+     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+     const requestPrompt = buildImageReferencePromptText(prompt, references);
+     const script = resolveModelScript(config, config.model || config.imageModel);
+diff --git a/web/src/services/api/video.ts b/web/src/services/api/video.ts
+index d81d1f7..f106d07 100644
+--- a/web/src/services/api/video.ts
++++ b/web/src/services/api/video.ts
+@@ -6,7 +6,7 @@ import { dataUrlToFile } from "@/lib/image-utils";
+ import { getMediaBlob, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
+ import { imageToDataUrl } from "@/services/image-storage";
+ import { boolConfig, buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
+-import { buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, type AiConfig } from "@/stores/use-config-store";
++import { buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, toMediaBaseUrl, type AiConfig } from "@/stores/use-config-store";
+ import { runModelPlugin } from "./model-plugin";
+ import type { ReferenceImage } from "@/types/image";
+ import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
+@@ -37,6 +37,11 @@ function aiApiUrl(config: AiConfig, path: string) {
+     return buildApiUrl(config.baseUrl, path);
+ }
+ 
++/** Route video generation through the `media.` subdomain to bypass the CDN request-timeout limit. */
++function withMediaBaseUrl<T extends { baseUrl: string }>(config: T): T {
++    return { ...config, baseUrl: toMediaBaseUrl(config.baseUrl) };
++}
++
+ function aiHeaders(config: AiConfig, contentType?: string) {
+     return {
+         Authorization: `Bearer ${config.apiKey}`,
+@@ -60,7 +65,7 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
+ 
+ export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
+     const selectedModel = (config.model || config.videoModel).trim();
+-    const requestConfig = resolveModelRequestConfig(config, selectedModel);
++    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, selectedModel));
+     const script = resolveModelScript(config, selectedModel);
+     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
+     assertVideoConfig(requestConfig, requestConfig.model);
+@@ -78,7 +83,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
+         const result = pluginVideoResults.get(task.id);
+         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
+     }
+-    const requestConfig = resolveModelRequestConfig(config, task.model);
++    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, task.model));
+     assertVideoConfig(requestConfig, requestConfig.model);
+     return task.provider === "seedance" ? pollSeedanceTask(requestConfig, task, options) : pollOpenAIVideoTask(requestConfig, task, options);
+ }
+diff --git a/web/src/stores/use-config-store.ts b/web/src/stores/use-config-store.ts
+index 9624b34..42a3f4c 100644
+--- a/web/src/stores/use-config-store.ts
++++ b/web/src/stores/use-config-store.ts
+@@ -401,6 +401,25 @@ function uniqueModelOptions(models: string[]) {
+     return Array.from(new Set((models || []).map((model) => model.trim()).filter(Boolean)));
+ }
+ 
++/**
++ * Route media (image/video) generation through the `media.` subdomain so those long-running
++ * requests bypass the CDN's request-timeout limit. Text/audio keep the channel's original host.
++ * The backend accepts both the original host and the media subdomain, so this is a pure host rewrite.
++ * Idempotent, and left untouched for localhost / IP hosts where a media subdomain makes no sense.
++ */
++export function toMediaBaseUrl(baseUrl: string) {
++    const trimmed = baseUrl.trim();
++    try {
++        const url = new URL(trimmed);
++        const host = url.hostname;
++        if (host === "localhost" || /^[\d.]+$/.test(host) || host.startsWith("media.")) return trimmed;
++        url.hostname = `media.${host}`;
++        return url.toString().replace(/\/+$/, "");
++    } catch {
++        return trimmed;
++    }
++}
++
+ export function buildApiUrl(baseUrl: string, path: string) {
+     let normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+     normalizedBaseUrl = normalizeArkPlanBaseUrl(normalizedBaseUrl);

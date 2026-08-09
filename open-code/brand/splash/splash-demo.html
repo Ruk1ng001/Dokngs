@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dokng 启动开屏模拟</title>
+<style>
+  /* ===== 与 brand/patches/14-splash-brand.patch 的 styles.css 逐字一致 ===== */
+  @keyframes cx-splash-breathe {
+    0%, 100% { opacity: .6; transform: scale(.99); }
+    50% { opacity: 1; transform: scale(1.01); }
+  }
+  @keyframes cx-splash-sway {
+    0%, 100% { transform: rotate(-3.5deg); }
+    50% { transform: rotate(3.5deg); }
+  }
+  @keyframes cx-splash-blink {
+    0%, 90%, 100% { transform: scaleY(1); }
+    93% { transform: scaleY(.08); }
+    97% { transform: scaleY(1); }
+  }
+  [data-slot="cx-splash"] {
+    animation: cx-splash-breathe 3s ease-in-out infinite;
+    transform-origin: center; transform-box: view-box;
+    will-change: opacity, transform;
+  }
+  [data-slot="cx-splash"] [data-slot="cx-splash-paws"] {
+    animation: cx-splash-sway 2.8s ease-in-out infinite;
+    transform-box: view-box; transform-origin: 24px 24px;
+  }
+  [data-slot="cx-splash"] [data-slot="cx-splash-eye"] {
+    transform-box: fill-box; transform-origin: center;
+    animation: cx-splash-blink 4s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    [data-slot="cx-splash"],
+    [data-slot="cx-splash"] [data-slot="cx-splash-paws"],
+    [data-slot="cx-splash"] [data-slot="cx-splash-eye"] { animation: none; }
+  }
+
+  /* ===== 全屏窗口模拟（对齐真实开屏：bg-background-base）===== */
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; font-family: system-ui, -apple-system, sans-serif; }
+  body { --bg:#101010; --fg:#ededed; --muted:#7e7e7e; background:var(--bg); color:var(--fg); transition: background .4s ease; }
+  body.light { --bg:#f8f8f8; --fg:#171717; --muted:#8f8f8f; }
+
+  /* 爪印弧的主题变量（对齐补丁：var(--icon-weak-base) 自适应明暗）*/
+  body      [data-slot="cx-splash-paws"] { --icon-weak-base:#343434; }
+  body.light [data-slot="cx-splash-paws"] { --icon-weak-base:#dbdbdb; }
+
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+
+  /* 开屏层：真实开屏就是全屏居中一个 splash */
+  #splashLayer {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:22px;
+    background:var(--bg);
+    transition: opacity .5s ease, transform .5s ease;
+  }
+  #splashLayer svg { width:96px; height:120px; }
+  .splash-word { font-size:15px; font-weight:600; letter-spacing:.14em; color:var(--fg); opacity:.9; }
+  .splash-tip  { font-size:12px; color:var(--muted); letter-spacing:.04em;
+    animation: cx-splash-breathe 2.4s ease-in-out infinite; }
+
+  /* 「启动完成」揭示的模拟工作台（只为演示过渡，不是真实 UI）*/
+  #appLayer {
+    position:absolute; inset:0; opacity:0; transform:scale(1.01);
+    transition: opacity .5s ease .05s, transform .5s ease .05s;
+    display:flex; flex-direction:column;
+  }
+  #appLayer .titlebar { height:38px; flex:none; display:flex; align-items:center; gap:8px;
+    padding:0 14px; border-bottom:.5px solid var(--muted); opacity:.9; }
+  #appLayer .dot { width:11px; height:11px; border-radius:50%; }
+  #appLayer .body { flex:1; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:13px; }
+
+  /* 状态切换 */
+  body[data-phase="ready"] #splashLayer { opacity:0; transform:scale(1.04); pointer-events:none; }
+  body[data-phase="ready"] #appLayer   { opacity:1; transform:scale(1); }
+
+  /* 悬浮控制条（演示用，真实开屏没有）*/
+  #ctl { position:fixed; right:16px; bottom:16px; z-index:10; display:flex; gap:8px;
+    font-size:12px; }
+  #ctl button { border:.5px solid var(--muted); background:transparent; color:var(--fg);
+    padding:7px 12px; border-radius:7px; cursor:pointer; font-size:12px; }
+  #ctl button:hover { background:rgba(127,127,127,.15); }
+</style>
+</head>
+<body data-phase="loading">
+  <div id="stage">
+    <!-- 开屏层：真实的 LoadingSplash 内容 -->
+    <div id="splashLayer">
+      <svg
+        data-slot="cx-splash"
+        class="w-20 h-20"
+        viewBox="0 0 48 48"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <defs>
+          <linearGradient id="cx-splash-grad" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#06b6d4" />
+            <stop offset=".5" stop-color="#3b82f6" />
+            <stop offset="1" stop-color="#8b5cf6" />
+          </linearGradient>
+        </defs>
+
+        {/* 环绕的爪印：四枚爪印弧 + 爪垫点，整组绕狗脸中心轻摆（sway），像小狗晃动。 */}
+        <g data-slot="cx-splash-paws">
+          <path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#cx-splash-grad)" stroke-width="2.45" stroke-linecap="round" />
+          <path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#cx-splash-grad)" stroke-width="2.45" stroke-linecap="round" />
+          <path d="M11.8 15 A15.05 15.05 0 0 1 17.7 9.2" fill="none" stroke="#67e8f9" stroke-width="1.1" stroke-linecap="round" opacity=".55" />
+          <path d="M36.2 33 A15.05 15.05 0 0 1 30.3 38.8" fill="none" stroke="#c4b5fd" stroke-width="1.1" stroke-linecap="round" opacity=".55" />
+          <circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4" />
+          <circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6" />
+          <circle cx="17.7" cy="9.2" r=".9" fill="#22d3ee" opacity=".65" />
+          <circle cx="30.3" cy="38.8" r=".9" fill="#a78bfa" opacity=".65" />
+        </g>
+
+        {/* 狗脸主体：眉弧 + 双眼 + 鼻/嘴。眉与鼻静止，双眼周期眨眼（blink）。 */}
+        <path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#cx-splash-grad)" stroke-width="2.25" stroke-linecap="round" />
+        <circle data-slot="cx-splash-eye" cx="20.2" cy="22.1" r="1.5" fill="#06b6d4" />
+        <circle data-slot="cx-splash-eye" cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6" />
+        <ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#cx-splash-grad)" />
+      </svg>
+      <div class="splash-word">DOKNG</div>
+      <div class="splash-tip" id="tip">正在启动…</div>
+    </div>
+
+    <!-- 启动完成后揭示的模拟工作台（仅演示过渡）-->
+    <div id="appLayer">
+      <div class="titlebar">
+        <span class="dot" style="background:#ff5f57"></span>
+        <span class="dot" style="background:#febc2e"></span>
+        <span class="dot" style="background:#28c840"></span>
+        <span style="margin-left:8px;font-size:12px;opacity:.7">Dokng</span>
+      </div>
+      <div class="body">启动完成 · 工作台已就绪（此为过渡演示，非真实界面）</div>
+    </div>
+  </div>
+
+  <div id="ctl">
+    <button id="replay">重播启动</button>
+    <button id="theme">切换明暗</button>
+  </div>
+
+<script>
+  const body = document.body;
+  const tip = document.getElementById("tip");
+  let timers = [];
+  function clearTimers(){ timers.forEach(clearTimeout); timers = []; }
+
+  // 模拟一次真实启动：加载文案递进 → 就绪 → 揭示工作台 → 稍后自动重播
+  function runLaunch() {
+    clearTimers();
+    body.setAttribute("data-phase","loading");
+    const steps = ["正在启动…","初始化内核…","连接内置渠道…","准备工作台…"];
+    let i = 0; tip.textContent = steps[0];
+    timers.push(setInterval-0); // placeholder
+    const stepTimer = setInterval(() => {
+      i++; if (i < steps.length) tip.textContent = steps[i];
+      else clearInterval(stepTimer);
+    }, 900);
+    timers.push({});
+    // ~4s 后进入就绪，揭示工作台
+    timers.push(setTimeout(() => {
+      clearInterval(stepTimer);
+      body.setAttribute("data-phase","ready");
+    }, 4000));
+    // ~7s 后自动重播，循环演示
+    timers.push(setTimeout(runLaunch, 7000));
+  }
+
+  document.getElementById("replay").onclick = runLaunch;
+  document.getElementById("theme").onclick = () => body.classList.toggle("light");
+
+  // 自动开始
+  runLaunch();
+</script>
+</body>
+</html>
