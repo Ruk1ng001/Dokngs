@@ -25,9 +25,11 @@ manifest 格式（每补丁一个 section，# 开头为注释）：
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Windows GitHub runner 控制台默认 cp1252，中文输出会 UnicodeEncodeError（历史坑：
@@ -78,11 +80,27 @@ def parse_manifest(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 def numstat_files(patch: Path) -> set[str]:
-    proc = subprocess.run(
-        ["git", "apply", "--numstat", str(patch)],
-        capture_output=True,
-        text=True,
-    )
+    # 必须在「任何 git work tree 之外」跑（monorepo 实战坑）：`git apply` 在仓库内会把补丁
+    # 路径按 work tree **顶层**解析，落在当前子目录之外的路径被静默忽略（git-apply(1)：
+    # patched paths outside the current directory are ignored）——本仓从 cc-switch/ 调用，
+    # 补丁里的 src-tauri/... 会被解析成 <repo根>/src-tauri/...，于是 numstat 输出空集，
+    # 校验 2 反过来报「声明了 diff 中不存在的文件」。旧仓 cwd 恰好是仓库根才没暴露。
+    # 本校验只需要补丁的**文本**文件集（不碰工作区），所以放到临时空目录里做纯解析：
+    #   - cwd=空临时目录 + GIT_CEILING_DIRECTORIES 阻断向上发现仓库；
+    #   - 剔除 GIT_DIR/GIT_WORK_TREE，避免 CI 环境变量把 git 拉回某个仓库；
+    #   - patch 传绝对路径，因为 cwd 已被换掉。
+    # 换 cwd 而非改用 `git -C <submodule>`：后者要求 submodule 已物化，而 preflight 的语义
+    # 是「不依赖上游工作区的静态门禁」（CI 里先 preflight 再 init submodule）。
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+    with tempfile.TemporaryDirectory() as neutral:
+        env["GIT_CEILING_DIRECTORIES"] = str(Path(neutral).parent)
+        proc = subprocess.run(
+            ["git", "apply", "--numstat", str(patch.resolve())],
+            capture_output=True,
+            text=True,
+            cwd=neutral,
+            env=env,
+        )
     if proc.returncode != 0:
         fail([f"{patch.name}: git apply --numstat 失败：{proc.stderr.strip()}"])
     files: set[str] = set()
