@@ -620,6 +620,22 @@ for c in "${CLIENTS[@]}"; do
   esac
 done
 
+# 凭据先去空白再校验：Secret 值若两端带空白（`echo` 存值会补一个 \n，最常见），
+# 空白会被原样拼进 aws 的 SigV4 `Credential=<key>/<date>/…` 作用域，
+# 新版 urllib3 严格校验 header 值、直接 `Invalid header value` 死掉（实测过一次）。
+# 这四个值都是 base64/hex token 或桶名与账号 ID，内部本就不含空白，故整体删空白而非仅裁两端。
+# 放在校验之前：这样「只有空白」的值会被归零、被下面的非空校验拦住，而不是带着脏值往下跑。
+# 用变量传参不走命令行，避免明文进入进程列表。
+strip_ws() { printf '%s' "${1:-}" | tr -d '[:space:]'; }
+R2_ACCOUNT_ID="$(strip_ws "${R2_ACCOUNT_ID:-}")"
+R2_ACCESS_KEY_ID="$(strip_ws "${R2_ACCESS_KEY_ID:-}")"
+R2_SECRET_ACCESS_KEY="$(strip_ws "${R2_SECRET_ACCESS_KEY:-}")"
+R2_BUCKET="$(strip_ws "${R2_BUCKET:-}")"
+# aws CLI 隐式读 AWS_*（由 CI 从同一批 Secret 映射，见 .github/workflows/official-mirror.yml），
+# 与上面的 R2_* 是两组独立变量，必须单独处理并 export 才能传进 aws 子进程。
+export AWS_ACCESS_KEY_ID="$(strip_ws "${AWS_ACCESS_KEY_ID:-}")"
+export AWS_SECRET_ACCESS_KEY="$(strip_ws "${AWS_SECRET_ACCESS_KEY:-}")"
+
 if [ -z "$DRY_RUN" ] && [ -z "$CHECK_ONLY" ]; then
   for v in "${R2_ACCOUNT_ID:-}" "${R2_ACCESS_KEY_ID:-}" "${R2_SECRET_ACCESS_KEY:-}" "${R2_BUCKET:-}"; do
     [ -n "$v" ] || { echo "缺 R2_* 环境变量（或用 DRY_RUN=1 / CHECK_ONLY=1）" >&2; exit 2; }

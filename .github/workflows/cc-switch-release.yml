@@ -464,6 +464,24 @@ jobs:
           for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
+          # [dokng] 凭据去空白（本仓踩过的坑，四个 R2 消费点都要做）：Secret 值末尾若带换行
+          # （`echo … | gh secret set` 会补一个 \n，很容易发生），会被原样拼进 SigV4 的
+          # Credential=<key>/<date>/<region>/s3/aws4_request 作用域；新版 urllib3 严格校验
+          # header 值并直接抛 "Invalid header value" 令整步失败，旧版不校验照发。于是同一个
+          # Secret 在 ubuntu-22.04 上「上传成功」、在 24.04 上崩——那种 success 不可信。
+          # 这四个值都是 hex/base64/桶名，本不含空白，故一律全剥，让流水线对 Secret 两端的
+          # 空白免疫。用 printf|tr 而非 ${var//}：macOS runner 的 /bin/bash 是 3.2；且 printf
+          # 是 builtin、tr 只读 stdin，明文不进任何进程的 argv。重新赋值不丢 export 属性，
+          # aws 子进程拿到的是剥过的值。剥完再 mask 一次（掩码按精确子串匹配，带换行的原值
+          # 与剥后的值是两个不同串，两个都要登记）。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           stage="s3://${R2_BUCKET}/_staging/cc-switch/${GITHUB_RUN_ID}"
 
@@ -534,6 +552,15 @@ jobs:
           AWS_DEFAULT_REGION: auto
         run: |
           set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          # 凭据去空白 + 重新登记掩码，理由见 build 段「上传产物到 R2 暂存区」的长注释。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
           for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
@@ -671,6 +698,18 @@ jobs:
           TAG: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          # 凭据去空白 + 重新登记掩码，理由见 build 段「上传产物到 R2 暂存区」的长注释。
+          # 本步 R2_* 与 AWS_* 是同源双份（前者拼 URL、后者喂 aws），六个都得剥。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          R2_ACCESS_KEY_ID="$(strip_ws "$R2_ACCESS_KEY_ID")"
+          R2_SECRET_ACCESS_KEY="$(strip_ws "$R2_SECRET_ACCESS_KEY")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
           for v in "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
@@ -826,6 +865,15 @@ jobs:
           AWS_DEFAULT_REGION: auto
         run: |
           set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          # 凭据去空白 + 重新登记掩码，理由见 build 段「上传产物到 R2 暂存区」的长注释。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
           for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done

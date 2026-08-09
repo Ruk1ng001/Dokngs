@@ -868,6 +868,24 @@ jobs:
           for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
+          # [dokng] Secret 值末尾若带空白（用 `echo ... | gh secret set` 设置时 echo 会补
+          # 一个 \n，这是最常见的来源），aws CLI 会把它原样拼进 SigV4 的 Credential 作用域
+          # （格式 <key_id>/<date>/<region>/s3/aws4_request）。新版 urllib3 严格校验 header
+          # 值、遇换行直接抛 "Invalid header value"；旧版不校验会放过 —— 于是同一个 Secret
+          # 在 ubuntu-22.04 上「成功」、在 24.04 上硬失败，且要等构建跑完二十几分钟才在
+          # 上传阶段暴露。这几个值（account id / bucket / key id / secret）本身都不含空白，
+          # 故整体删空白最稳，也顺带兜住首部空白与 \r（Windows 侧粘贴）。
+          # 注：R2_ACCOUNT_ID 等来自 env: 块，已带 export 属性，重新赋值后仍是导出态，
+          # 因此 aws CLI 隐式读取的 AWS_* 拿到的就是 trim 后的值，无需再显式 export。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
+          # trim 后的值是原值子串，掩码需按新值再登记一次（GitHub 按字面量匹配）。
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           stage="s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}"
           # [monorepo] 本步工作目录是 workspace 根（见上），故 dist 带 open-code/ 前缀。
@@ -998,6 +1016,15 @@ jobs:
           for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
+          # 凭据去空白 + 重新登记掩码，理由见 package 段「上传产物到 R2 暂存区」的长注释。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           stage="s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}"
 
@@ -1105,6 +1132,18 @@ jobs:
         run: |
           set -euo pipefail
           # 敏感值登记日志掩码，防误打印。
+          for v in "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          # 凭据去空白 + 重新登记掩码，理由见 package 段「上传产物到 R2 暂存区」的长注释。
+          # 本步 env 里 R2_* 与 aws CLI 读的 AWS_* 是两组独立变量（同源不同名），六个都要处理。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_ACCESS_KEY_ID="$(strip_ws "$R2_ACCESS_KEY_ID")"
+          R2_SECRET_ACCESS_KEY="$(strip_ws "$R2_SECRET_ACCESS_KEY")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
           for v in "$R2_ACCOUNT_ID" "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
@@ -1278,6 +1317,15 @@ jobs:
           AWS_DEFAULT_REGION: auto
         run: |
           set -euo pipefail
+          for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
+            [ -n "$v" ] && echo "::add-mask::$v" || true
+          done
+          # 凭据去空白 + 重新登记掩码，理由见 package 段「上传产物到 R2 暂存区」的长注释。
+          strip_ws() { printf '%s' "$1" | tr -d '[:space:]'; }
+          R2_ACCOUNT_ID="$(strip_ws "$R2_ACCOUNT_ID")"
+          R2_BUCKET="$(strip_ws "$R2_BUCKET")"
+          AWS_ACCESS_KEY_ID="$(strip_ws "$AWS_ACCESS_KEY_ID")"
+          AWS_SECRET_ACCESS_KEY="$(strip_ws "$AWS_SECRET_ACCESS_KEY")"
           for v in "$R2_ACCOUNT_ID" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$R2_BUCKET"; do
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
