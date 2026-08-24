@@ -318,7 +318,7 @@ index fce89d4..127be65 100644
  
  export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()) {
 diff --git a/web/src/services/image-storage.ts b/web/src/services/image-storage.ts
-index 1dce06e..dec5e82 100644
+index e38e170..cecdeed 100644
 --- a/web/src/services/image-storage.ts
 +++ b/web/src/services/image-storage.ts
 @@ -3,6 +3,9 @@ import localforage from "localforage";
@@ -331,7 +331,7 @@ index 1dce06e..dec5e82 100644
  
  export type UploadedImage = {
      url: string;
-@@ -19,15 +22,28 @@ const objectUrls = new Map<string, string>();
+@@ -21,15 +24,28 @@ const objectUrls = new Map<string, string>();
  export async function uploadImage(input: string | Blob): Promise<UploadedImage> {
      const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
      const storageKey = `image:${nanoid()}`;
@@ -364,7 +364,7 @@ index 1dce06e..dec5e82 100644
      const cached = objectUrls.get(storageKey);
      if (cached) return cached;
      const blob = await store.getItem<Blob>(storageKey);
-@@ -38,10 +54,23 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
+@@ -40,10 +56,23 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
  }
  
  export async function getImageBlob(storageKey: string) {
@@ -388,7 +388,7 @@ index 1dce06e..dec5e82 100644
      await store.setItem(storageKey, blob);
      const url = URL.createObjectURL(blob);
      objectUrls.set(storageKey, url);
-@@ -55,8 +84,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
+@@ -57,8 +86,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
  }
  
  export async function deleteStoredImages(keys: Iterable<string>) {
@@ -401,10 +401,10 @@ index 1dce06e..dec5e82 100644
              const url = objectUrls.get(key);
              if (url) URL.revokeObjectURL(url);
              objectUrls.delete(key);
-@@ -67,10 +99,17 @@ export async function deleteStoredImages(keys: Iterable<string>) {
- 
- export async function cleanupUnusedImages(usedData: unknown) {
-     const usedKeys = collectImageStorageKeys(usedData);
+@@ -77,10 +109,17 @@ export async function cleanupUnusedImages(usedData: unknown) {
+             collectImageStorageKeys(value, usedKeys);
+         }),
+     ]);
 -    const unused: string[] = [];
 +    const unused = new Set<string>();
      await store.iterate((_value, key) => {

@@ -149,11 +149,11 @@ index 69e19db..5e595f6 100644
          element: (
              <UserLayout>
 diff --git a/web/src/stores/use-config-store.ts b/web/src/stores/use-config-store.ts
-index 2097921..9624b34 100644
+index 8565daf..90e328d 100644
 --- a/web/src/stores/use-config-store.ts
 +++ b/web/src/stores/use-config-store.ts
 @@ -63,6 +63,23 @@ export type WebdavSyncConfig = {
- export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav";
+ export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
  
  export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 +
@@ -176,7 +176,7 @@ index 2097921..9624b34 100644
  const CHANNEL_MODEL_SEPARATOR = "::";
  const OPENAI_BASE_URL = "https://api.openai.com";
  const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
-@@ -215,7 +232,7 @@ export const useConfigStore = create<ConfigStore>()(
+@@ -218,7 +235,7 @@ export const useConfigStore = create<ConfigStore>()(
          }),
          {
              name: CONFIG_STORE_KEY,
