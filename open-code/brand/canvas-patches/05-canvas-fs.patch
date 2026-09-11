@@ -211,7 +211,7 @@ index 0000000..f0384a5
 +    return hostFileKeys();
 +}
 diff --git a/web/src/services/file-storage.ts b/web/src/services/file-storage.ts
-index fce89d4..127be65 100644
+index a6ddf9b..823f991 100644
 --- a/web/src/services/file-storage.ts
 +++ b/web/src/services/file-storage.ts
 @@ -1,5 +1,8 @@
@@ -221,11 +221,11 @@ index fce89d4..127be65 100644
 +// 不再依赖可被回收的 IndexedDB 与会话级 blob: URL。standalone web 下桥不可用，自动回退原逻辑。
 +import { deleteHostFiles, hasHostFile, hostFileKeySet, hostFileUrl, IS_EMBEDDED, readHostFile, writeHostFile } from "@/lib/host-fs-bridge";
  
- export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
+ import { withLocalProxy } from "@/stores/use-config-store";
  
-@@ -9,15 +12,29 @@ const objectUrls = new Map<string, string>();
+@@ -11,15 +14,29 @@ const objectUrls = new Map<string, string>();
  export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
-     const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+     const blob = typeof input === "string" ? await (await fetch(withLocalProxy(input))).blob() : input;
      const storageKey = `${prefix}:${nanoid()}`;
 -    await store.setItem(storageKey, blob);
 -    const url = URL.createObjectURL(blob);
@@ -257,7 +257,7 @@ index fce89d4..127be65 100644
      const cached = objectUrls.get(storageKey);
      if (cached) return cached;
      const blob = await store.getItem<Blob>(storageKey);
-@@ -28,10 +45,23 @@ export async function resolveMediaUrl(storageKey?: string, fallback = "") {
+@@ -30,10 +47,23 @@ export async function resolveMediaUrl(storageKey?: string, fallback = "") {
  }
  
  export async function getMediaBlob(storageKey: string) {
@@ -281,7 +281,7 @@ index fce89d4..127be65 100644
      await store.setItem(storageKey, blob);
      const url = URL.createObjectURL(blob);
      objectUrls.set(storageKey, url);
-@@ -39,8 +69,11 @@ export async function setMediaBlob(storageKey: string, blob: Blob) {
+@@ -41,8 +71,11 @@ export async function setMediaBlob(storageKey: string, blob: Blob) {
  }
  
  export async function deleteStoredMedia(keys: Iterable<string>) {
@@ -294,7 +294,7 @@ index fce89d4..127be65 100644
              const url = objectUrls.get(key);
              if (url) URL.revokeObjectURL(url);
              objectUrls.delete(key);
-@@ -51,11 +84,19 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
+@@ -53,11 +86,19 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
  
  export async function cleanupUnusedMedia(usedData: unknown) {
      const usedKeys = collectMediaStorageKeys(usedData);
@@ -318,44 +318,56 @@ index fce89d4..127be65 100644
  
  export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()) {
 diff --git a/web/src/services/image-storage.ts b/web/src/services/image-storage.ts
-index e38e170..cecdeed 100644
+index a781c09..3ae9efe 100644
 --- a/web/src/services/image-storage.ts
 +++ b/web/src/services/image-storage.ts
 @@ -3,6 +3,9 @@ import localforage from "localforage";
  import { nanoid } from "nanoid";
  import i18n from "@/i18n";
- import { readImageMeta } from "@/lib/image-utils";
+ import { withLocalProxy } from "@/stores/use-config-store";
 +// [dokng] 落盘桥：嵌入 opencode 桌面壳时把图片字节写到 userData/canvas-files/，
 +// 不再依赖可被回收的 IndexedDB 与会话级 blob: URL。standalone web 下桥不可用，自动回退原逻辑。
 +import { deleteHostFiles, hasHostFile, hostFileKeySet, hostFileUrl, IS_EMBEDDED, readHostFile, writeHostFile } from "@/lib/host-fs-bridge";
  
  export type UploadedImage = {
      url: string;
-@@ -21,15 +24,28 @@ const objectUrls = new Map<string, string>();
- export async function uploadImage(input: string | Blob): Promise<UploadedImage> {
-     const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+@@ -42,17 +45,29 @@ export async function uploadImage(input: string | Blob, options?: ImageReadOptio
+ 
+ async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<UploadedImage> {
      const storageKey = `image:${nanoid()}`;
--    await store.setItem(storageKey, blob);
 -    const url = URL.createObjectURL(blob);
--    objectUrls.set(storageKey, url);
--    const meta = await readImageMeta(url);
-+    // [dokng] 嵌入宿主时先落盘：成功则节点里存的是 oc:// 持久 URL（重启即在），不再写 IndexedDB。
-+    // 落盘失败（宿主不可用 / standalone web）回退原 IndexedDB + blob: 路径。
-+    const persisted = await writeHostFile(storageKey, blob);
-+    if (!persisted) await store.setItem(storageKey, blob);
-+    // 读尺寸仍用临时 blob: URL（本地解码，不必等磁盘可读）；落盘成功时它不进节点数据。
++    // [dokng] 读尺寸仍用临时 blob: URL（本地解码，不必等磁盘可读）；落盘成功时它不进节点数据。
 +    const probeUrl = URL.createObjectURL(blob);
-+    const meta = await readImageMeta(probeUrl);
-+    let url: string;
-+    if (persisted) {
++    let persisted = false;
+     try {
+-        const meta = await loadImageMeta(url, options);
++        const meta = await loadImageMeta(probeUrl, options);
+         if (!meta) throw new Error(i18n.t("common.imageReadFailed"));
+         throwIfAborted(options?.signal);
+-        await store.setItem(storageKey, blob);
++        // [dokng] 嵌入宿主时先落盘：成功则节点里存的是 oc:// 持久 URL（重启即在），不再写 IndexedDB。
++        // 落盘失败（宿主不可用 / standalone web）回退原 IndexedDB + blob: 路径。
++        persisted = await writeHostFile(storageKey, blob);
++        if (!persisted) await store.setItem(storageKey, blob);
+         throwIfAborted(options?.signal);
+-        objectUrls.set(storageKey, url);
+-        return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type.startsWith("image/") ? blob.type : "" };
++        const mimeType = blob.type.startsWith("image/") ? blob.type : "";
++        if (persisted) {
++            URL.revokeObjectURL(probeUrl);
++            return { url: hostFileUrl(storageKey), storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType };
++        }
++        objectUrls.set(storageKey, probeUrl);
++        return { url: probeUrl, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType };
+     } catch (error) {
+-        URL.revokeObjectURL(url);
 +        URL.revokeObjectURL(probeUrl);
-+        url = hostFileUrl(storageKey);
-+    } else {
-+        url = probeUrl;
-+        objectUrls.set(storageKey, url);
-+    }
-     return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type || meta.mimeType };
- }
++        // [dokng] 磁盘副本同样要清：中途 abort 时若已落盘，不清就会在磁盘上留下孤儿。
++        if (persisted) await deleteHostFiles([storageKey]).catch(() => undefined);
+         await store.removeItem(storageKey).catch(() => undefined);
+         throw error;
+     }
+@@ -132,6 +147,8 @@ function throwIfAborted(signal?: AbortSignal) {
  
  export async function resolveImageUrl(storageKey?: string, fallback = "") {
      if (!storageKey) return fallback;
@@ -364,7 +376,7 @@ index e38e170..cecdeed 100644
      const cached = objectUrls.get(storageKey);
      if (cached) return cached;
      const blob = await store.getItem<Blob>(storageKey);
-@@ -40,10 +56,23 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
+@@ -142,10 +159,23 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
  }
  
  export async function getImageBlob(storageKey: string) {
@@ -388,7 +400,7 @@ index e38e170..cecdeed 100644
      await store.setItem(storageKey, blob);
      const url = URL.createObjectURL(blob);
      objectUrls.set(storageKey, url);
-@@ -57,8 +86,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
+@@ -159,8 +189,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
  }
  
  export async function deleteStoredImages(keys: Iterable<string>) {
@@ -401,7 +413,7 @@ index e38e170..cecdeed 100644
              const url = objectUrls.get(key);
              if (url) URL.revokeObjectURL(url);
              objectUrls.delete(key);
-@@ -77,10 +109,17 @@ export async function cleanupUnusedImages(usedData: unknown) {
+@@ -179,10 +212,17 @@ export async function cleanupUnusedImages(usedData: unknown) {
              collectImageStorageKeys(value, usedKeys);
          }),
      ]);
@@ -422,7 +434,7 @@ index e38e170..cecdeed 100644
  }
  
 diff --git a/web/src/stores/canvas/use-canvas-store.ts b/web/src/stores/canvas/use-canvas-store.ts
-index 89eca3d..8418eff 100644
+index 9389f33..d734971 100644
 --- a/web/src/stores/canvas/use-canvas-store.ts
 +++ b/web/src/stores/canvas/use-canvas-store.ts
 @@ -4,6 +4,8 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
@@ -434,10 +446,10 @@ index 89eca3d..8418eff 100644
  import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
  import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
  
-@@ -36,14 +38,82 @@ type CanvasStore = {
+@@ -42,14 +44,82 @@ type CanvasStore = {
  const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
  const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
- type PersistedCanvasState = Pick<CanvasStore, "projects">;
+ type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
 +
 +// [dokng] 画布状态落盘。
 +//
@@ -520,9 +532,9 @@ index 89eca3d..8418eff 100644
          queuedPersistState = parsed.state as PersistedCanvasState;
          return parsed;
      },
-@@ -51,13 +121,28 @@ const canvasStorage: PersistStorage<CanvasStore> = {
+@@ -57,13 +127,28 @@ const canvasStorage: PersistStorage<CanvasStore> = {
          const nextState = value.state as PersistedCanvasState;
-         if (queuedPersistState && queuedPersistState.projects === nextState.projects) return;
+         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
          queuedPersistState = nextState;
 +        pendingWrite = { name, json: JSON.stringify(value) };
          if (saveTimer) clearTimeout(saveTimer);
@@ -544,7 +556,7 @@ index 89eca3d..8418eff 100644
 +        }
 +        queuedPersistState = null;
 +        // 磁盘副本一并清空，否则下次启动 getItem 又从 canvas-state.json 把已删数据读回来。
-+        // 写空串而非删文件：getItem 对空内容按"无数据"处理，语义一致且少一个 IPC 面。
++        // 写空串而非删文件：getItem 对空内容按「无数据」处理，语义一致且少一个 IPC 面。
 +        if (IS_EMBEDDED) void writeHostState("");
 +        return localForageStorage.removeItem(name);
      },

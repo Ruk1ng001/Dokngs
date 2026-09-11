@@ -1,12 +1,12 @@
 diff --git a/web/src/components/layout/client-root-init.tsx b/web/src/components/layout/client-root-init.tsx
-index 576d387..cbb6539 100644
+index d8fe078..db6cb0c 100644
 --- a/web/src/components/layout/client-root-init.tsx
 +++ b/web/src/components/layout/client-root-init.tsx
-@@ -3,19 +3,54 @@ import { useEffect, useRef } from "react";
+@@ -3,18 +3,54 @@ import { useEffect, useRef } from "react";
  import { App } from "antd";
  import { useTranslation } from "react-i18next";
  
--import { createModelChannel, useConfigStore } from "@/stores/use-config-store";
+-import { useConfigStore } from "@/stores/use-config-store";
 +import type { ChannelModel, ModelCapability, ModelChannel } from "@/stores/use-config-store";
 +import { createModelChannel, modelOptionsFromChannels, normalizeChannelModels, normalizeModelOptionValue, useConfigStore } from "@/stores/use-config-store";
  import { usePromptSourceScheduler } from "@/hooks/use-prompt-source-scheduler";
@@ -48,19 +48,19 @@ index 576d387..cbb6539 100644
      const { t } = useTranslation();
      const handledConfigParams = useRef(false);
 +    const injectedOnce = useRef(false);
-     const updateConfig = useConfigStore((state) => state.updateConfig);
-     const config = useConfigStore((state) => state.config);
+     const importChannelCredentials = useConfigStore((state) => state.importChannelCredentials);
      const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
  
      usePromptSourceScheduler();
  
-+    // [dokng] query 参数注入（standalone web 的既有链路，行为不变）：?baseUrl=&apiKey= 写单个 channels[0]。
++    // [dokng] query 参数注入（standalone web 的既有链路，行为不变）：?baseUrl=&apiKey=
++    // 走上游 importChannelCredentials upsert 渠道（v0.18.0 起上游把这段重构进了 store）。
      useEffect(() => {
          if (handledConfigParams.current) return;
          const searchParams = new URLSearchParams(window.location.search);
-@@ -49,5 +84,63 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
-         message.success(t("config.importedDirectConfig"));
-     }, [config.channels, message, openConfigDialog, t, updateConfig]);
+@@ -35,5 +71,63 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
+         else message.error(t("config.importedChannelBaseUrlInvalid"));
+     }, [importChannelCredentials, message, openConfigDialog, t]);
  
 +    // [dokng] postMessage 注入（宿主 iframe 链路）：宿主投来渠道数组 → 重建 config.channels。
 +    // 注入的 apiKey 只驻留内存、不落盘（见 use-config-store 的 partialize：嵌入态剥离 apiKey），
@@ -149,11 +149,11 @@ index 69e19db..5e595f6 100644
          element: (
              <UserLayout>
 diff --git a/web/src/stores/use-config-store.ts b/web/src/stores/use-config-store.ts
-index 8565daf..90e328d 100644
+index c0a0c85..833537c 100644
 --- a/web/src/stores/use-config-store.ts
 +++ b/web/src/stores/use-config-store.ts
-@@ -63,6 +63,23 @@ export type WebdavSyncConfig = {
- export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
+@@ -71,6 +71,23 @@ export type ChannelCredentialsImportResult = {
+ };
  
  export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 +
@@ -176,7 +176,7 @@ index 8565daf..90e328d 100644
  const CHANNEL_MODEL_SEPARATOR = "::";
  const OPENAI_BASE_URL = "https://api.openai.com";
  const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
-@@ -218,7 +235,7 @@ export const useConfigStore = create<ConfigStore>()(
+@@ -238,7 +255,7 @@ export const useConfigStore = create<ConfigStore>()(
          }),
          {
              name: CONFIG_STORE_KEY,

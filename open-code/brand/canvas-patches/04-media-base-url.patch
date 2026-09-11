@@ -1,17 +1,17 @@
 diff --git a/web/src/services/api/image.ts b/web/src/services/api/image.ts
-index 1fa9d77..f2e8a4e 100644
+index d707be5..51d95e8 100644
 --- a/web/src/services/api/image.ts
 +++ b/web/src/services/api/image.ts
 @@ -1,7 +1,7 @@
  import axios from "axios";
  
  import i18n from "@/i18n";
--import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
-+import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, toMediaBaseUrl, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
++import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, toMediaBaseUrl, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
  import { normalizePluginImages, runModelPlugin } from "./model-plugin";
  import { nanoid } from "nanoid";
  import { dataUrlToFile } from "@/lib/image-utils";
-@@ -337,6 +337,11 @@ function aiApiUrl(config: AiConfig, path: string) {
+@@ -343,6 +343,11 @@ function aiApiUrl(config: AiConfig, path: string) {
      return buildApiUrl(config.baseUrl, path);
  }
  
@@ -23,7 +23,7 @@ index 1fa9d77..f2e8a4e 100644
  function aiHeaders(config: AiConfig, contentType?: string) {
      return {
          Authorization: `Bearer ${config.apiKey}`,
-@@ -715,7 +720,7 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
+@@ -721,7 +726,7 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
  }
  
  export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
@@ -32,29 +32,29 @@ index 1fa9d77..f2e8a4e 100644
      const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
      const script = resolveModelScript(config, config.model || config.imageModel);
      if (script) {
-@@ -773,7 +778,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
+@@ -780,7 +785,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
  }
  
- export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
+ export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
 -    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
 +    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, config.model || config.imageModel));
      const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
      const requestPrompt = buildImageReferencePromptText(prompt, references);
      const script = resolveModelScript(config, config.model || config.imageModel);
 diff --git a/web/src/services/api/video.ts b/web/src/services/api/video.ts
-index 9312ec7..7ee6d9e 100644
+index 20bea38..1bf08c1 100644
 --- a/web/src/services/api/video.ts
 +++ b/web/src/services/api/video.ts
-@@ -5,7 +5,7 @@ import i18n from "@/i18n";
- import { dataUrlToFile } from "@/lib/image-utils";
- import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
+@@ -6,7 +6,7 @@ import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
+ import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
+ import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
  import { imageToDataUrl } from "@/services/image-storage";
--import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, type AiConfig } from "@/stores/use-config-store";
-+import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, toMediaBaseUrl, type AiConfig } from "@/stores/use-config-store";
+-import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
++import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, toMediaBaseUrl, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
  import { runModelPlugin } from "./model-plugin";
  import type { ReferenceImage } from "@/types/image";
- 
-@@ -26,6 +26,11 @@ function aiApiUrl(config: AiConfig, path: string) {
+ import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
+@@ -36,6 +36,11 @@ function aiApiUrl(config: AiConfig, path: string) {
      return buildApiUrl(config.baseUrl, path);
  }
  
@@ -66,29 +66,29 @@ index 9312ec7..7ee6d9e 100644
  function aiHeaders(config: AiConfig, contentType?: string) {
      return {
          Authorization: `Bearer ${config.apiKey}`,
-@@ -48,7 +53,7 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
+@@ -71,7 +76,7 @@ function videoTaskFailed(message: string) {
  
- export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
+ export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
      const selectedModel = (config.model || config.videoModel).trim();
 -    const requestConfig = resolveModelRequestConfig(config, selectedModel);
 +    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, selectedModel));
      const script = resolveModelScript(config, selectedModel);
      if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
      assertVideoConfig(requestConfig, requestConfig.model);
-@@ -60,7 +65,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
+@@ -84,7 +89,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
          const result = pluginVideoResults.get(task.id);
          return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
      }
 -    const requestConfig = resolveModelRequestConfig(config, task.model);
 +    const requestConfig = withMediaBaseUrl(resolveModelRequestConfig(config, task.model));
      assertVideoConfig(requestConfig, requestConfig.model);
+     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
      return pollOpenAIVideoTask(requestConfig, task, options);
- }
 diff --git a/web/src/stores/use-config-store.ts b/web/src/stores/use-config-store.ts
-index 90e328d..d4aed81 100644
+index 833537c..8b17f3a 100644
 --- a/web/src/stores/use-config-store.ts
 +++ b/web/src/stores/use-config-store.ts
-@@ -403,6 +403,25 @@ function uniqueModelOptions(models: string[]) {
+@@ -490,6 +490,25 @@ function uniqueModelOptions(models: string[]) {
      return Array.from(new Set((models || []).map((model) => model.trim()).filter(Boolean)));
  }
  
