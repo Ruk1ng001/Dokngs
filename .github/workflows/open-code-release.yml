@@ -117,7 +117,7 @@ jobs:
       # [monorepo] submodules: false —— 不能用 recursive，否则白拉 infinite-canvas（6M）
       # 与 cc-switch/upstream（77M）。本 job 只动 opencode 基线，只初始化它。
       - name: Checkout（不带 submodule；用 PAT 以便推送能触发发布段）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
           fetch-depth: 0
@@ -333,7 +333,7 @@ jobs:
       # 本 job 要初始化两个：infinite-canvas 是升级对象；opencode 仅为下面 setup-bun 的
       # bun-version-file 提供锁定的 bun 版本（刻意与发布构建同源，避免版本漂移）。
       - name: Checkout（不带 submodule；用 PAT 保持与 opencode 升级同款推送凭据）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
           fetch-depth: 0
@@ -506,7 +506,7 @@ jobs:
       # fetch-depth: 0 会连带拉全部 tag —— next-dokng-version.sh 的本地回落
       # （git tag -l '<base>-dokng.*'）依赖它，缺 tag 会把 N 算回 1 并覆盖线上版本。
       - name: Checkout（仅父仓库，不需要 submodule）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
           fetch-depth: 0
@@ -694,7 +694,7 @@ jobs:
       # 本 job 两个都要：opencode 是构建主体，infinite-canvas 的画布产物内嵌进 desktop
       # （build-canvas.ts 以 VITE_BASE=/canvas/ 构建后拷进 out/renderer/canvas/）。
       - name: Checkout（不带 submodule）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
 
@@ -929,7 +929,7 @@ jobs:
       # 回退路径：未配置 R2 时仍用 artifact（retention-days: 1 压到最小，避免撑爆配额）。
       - name: 上传安装包产物（artifact 回退，无 R2 凭据时）
         if: env.R2_ACCESS_KEY_ID == ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_glob }}
@@ -951,7 +951,7 @@ jobs:
       # 个别平台缺 blockmap（差量更新载体）不受影响。
       - name: 上传更新元数据（artifact 回退，无 R2 凭据时）
         if: env.R2_ACCESS_KEY_ID == ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.meta_subdir }}
           # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
@@ -981,7 +981,7 @@ jobs:
       # [monorepo] submodules: false —— 本 job 只需要 opencode（跑它里面的
       # finalize-latest-yml.ts + 读 package.json 定 bun 版本），不需要画布与 cc-switch/upstream。
       - name: Checkout（不带 submodule）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
 
@@ -1052,7 +1052,7 @@ jobs:
       # 回退路径：未配置 R2 时仍从 artifact 取（与 package job 的回退分支配对）。
       - name: 下载安装包产物（artifact 回退，无 R2 凭据时）
         if: env.R2_ACCESS_KEY_ID == ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/artifacts
           pattern: dokng-*
@@ -1060,7 +1060,7 @@ jobs:
 
       - name: 下载更新元数据（artifact 回退，无 R2 凭据时）
         if: env.R2_ACCESS_KEY_ID == ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/latest-yml
           pattern: latest-yml-*

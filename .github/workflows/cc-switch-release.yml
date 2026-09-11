@@ -80,7 +80,7 @@ jobs:
       app_version: ${{ steps.resolve.outputs.app_version }}
     steps:
       - name: Checkout（含全部 tag，供 next-version.sh 计算）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -154,7 +154,7 @@ jobs:
       # （cc-switch/upstream 77M、open-code/opencode 488M、open-code/infinite-canvas 6M），
       # recursive 会让本 job 白拉另一个产品的 494M。只按需初始化本产品这一个。
       - name: Checkout（checkout 到出包 tag，不带 submodule）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
           fetch-depth: 0
@@ -212,12 +212,12 @@ jobs:
           PY
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
 
       - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 9
 
@@ -502,7 +502,7 @@ jobs:
       # 撑爆账号配额并让后续 upload 全部失败，故压到最小值。
       - name: 上传产物到 workflow（artifact 回退，无 R2 凭据时）
         if: env.R2_ACCESS_KEY_ID == ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-assets-${{ matrix.label }}
           # [monorepo] uses: 型步骤不受 defaults.run.working-directory 影响，路径以
@@ -533,7 +533,7 @@ jobs:
       # 必须排在下载产物之前：actions/checkout 默认清理工作区，放在后面会把
       # release-assets/ 一起删掉。
       - name: Checkout（仅需 scripts/，不带 submodule）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
           ref: ${{ needs.resolve.outputs.version }}
@@ -587,7 +587,7 @@ jobs:
       # 回退路径：未配置 R2 时仍从 artifact 取（与 build job 的回退分支配对）。
       - name: 下载全部构建产物（artifact 回退，无 R2 凭据时）
         if: env.R2_ACCESS_KEY_ID == ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: release-assets-*
           # [monorepo] 同上：uses: 型步骤路径以 workspace 根为基准，须带前缀，

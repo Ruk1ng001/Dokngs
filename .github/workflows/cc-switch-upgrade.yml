@@ -57,7 +57,7 @@ jobs:
       # [monorepo] submodules: false —— 不能用 recursive，否则白拉 open-code 的
       # opencode（488M）+ infinite-canvas（6M）。只按需初始化本产品这一个。
       - name: Checkout（不带 submodule；用 PAT 以便推送能触发下游 workflow）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: false
           fetch-depth: 0
@@ -109,16 +109,21 @@ jobs:
 
       - name: 安装 pnpm
         if: steps.detect.outputs.need == 'true'
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
-          # 上游 package.json 无 packageManager 字段，action-setup 无法自动推断，
-          # 必须显式给版本。cc-switch 用 pnpm 9.x，此处锁大版本；上游若升 pnpm，
-          # 补丁重放/typecheck 报错会通知维护者，届时同步调这里即可。
+          # 必须显式给版本：action-setup 的 package_json_file 默认读 GITHUB_WORKSPACE/package.json
+          # （文档明确「relative to the repository root」），而本 monorepo 根没有 package.json，
+          # 故它推断不出 packageManager，也因此不会与上游声明冲突报 "Multiple versions of pnpm"。
+          #
+          # 注意分歧（当前无害，勿当 bug 修）：上游 upstream/package.json 已声明
+          # packageManager: pnpm@10.12.3，我们仍装 pnpm 9。二者共用 lockfileVersion 9.0，
+          # v3.20.2 的实际发布构建（09-07）用 pnpm 9 全绿。要对齐到 10 得先在本地跑通
+          # 完整 tauri 构建再改，别只凭声明值盲升。
           version: 9
 
       - name: 安装 Node
         if: steps.detect.outputs.need == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           # 上游 package.json 无 engines/volta、仓库无 .nvmrc，node-version-file 会报错。
           # 故显式指定 Node LTS（20.x）。cache 走 pnpm-lock.yaml。
