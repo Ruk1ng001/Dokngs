@@ -95,6 +95,8 @@ concurrency:
 
 permissions:
   contents: write
+  # 补丁冲突时自动开 issue 通知维护者（定时任务失败只有红叉，实测能连挂多晚无人发现）。
+  issues: write
 
 jobs:
   # ── upgrade-opencode：每日升级 opencode 上游基线（原 auto-upgrade.yml）────────
@@ -174,6 +176,7 @@ jobs:
           bun-version-file: open-code/opencode/package.json
 
       - name: 切到新 tag 并按 NN 序重放补丁（strict apply）
+        id: replay
         if: steps.detect.outputs.need == 'true'
         env:
           LATEST: ${{ steps.detect.outputs.latest }}
@@ -239,6 +242,52 @@ jobs:
             echo "补丁 strict apply 失败，需人工把补丁 rebase 到 ${LATEST}（见上方 3way 诊断）。" >&2
             exit 1
           fi
+
+      # 补丁冲突自动开 issue。动机与去重策略见 cc-switch-upgrade.yml 同名步骤的注释；
+      # 差别只在修复步骤——opencode 有 scripts/rebase-patches.sh，不必手工建 worktree。
+      - name: 补丁冲突 → 开 issue 通知维护者
+        # 只认 replay 这一步的失败：后续 typecheck 失败属另一类问题，不套「需人工 rebase」模板。
+        if: failure() && steps.replay.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="open-code 品牌补丁需 rebase 到上游 ${LATEST}"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label patch-conflict --search "in:title ${LATEST}" \
+            --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            echo "已存在 open issue #${existing}（${LATEST}），不重复创建。"
+            exit 0
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --label patch-conflict \
+            --body "$(cat <<EOF
+          上游 opencode 发布了 \`${LATEST}\`，品牌补丁栈 strict apply 失败，自动升级已中止（基线未推进，线上不受影响）。
+
+          **冲突详情**：见 [失败的运行日志](${RUN_URL}) 里 \`strict apply 失败——3way 漂移诊断\` 折叠组，
+          它逐补丁列出 3way 结果与冲突 hunk 的 \`.rej\`。
+
+          **修复步骤**（在 \`open-code/\` 下，用现成的 rebase 脚本）：
+          1. \`scripts/rebase-patches.sh plan ${LATEST}\` —— 逐补丁重放，冲突处停下并落 \`.rej\`
+          2. 手工解 worktree 里的冲突文件，删掉对应 \`.rej\`
+          3. \`scripts/rebase-patches.sh continue\` —— 提交本补丁并继续（再遇冲突会再停）
+          4. \`scripts/rebase-patches.sh finish\` —— 重导出漂移补丁、刷新 \`BASE_TAG\`/\`BASE_SHA\`、跑 \`--check\`
+          5. 审阅 diff 后提交推送（脚本刻意不自动提交）
+
+          6. 提交推送后**手动触发出包**：基线已被这次 rebase 推到最新，次日 cron 的 detect 会判
+             no-op 而走不到打 tag 那步（自动出包只发生在 cron 自己推进基线的那次）。须跑
+             \`gh workflow run open-code-release.yml -f mode=release\`，由 detect 算下一个 \`-dokng.N\`。
+
+          放弃本次 rebase：\`scripts/rebase-patches.sh abort\`。
+
+          修好后请手动关闭本 issue。
+          EOF
+          )"
+          echo "已创建 issue。"
 
       - name: 安装依赖 + typecheck（app + desktop）
         if: steps.detect.outputs.need == 'true'
@@ -391,6 +440,7 @@ jobs:
           bun-version-file: open-code/opencode/package.json
 
       - name: 切到新 tag 并按 NN 序重放画布补丁（strict apply）
+        id: replay
         if: steps.detect.outputs.need == 'true'
         env:
           LATEST: ${{ steps.detect.outputs.latest }}
@@ -426,6 +476,50 @@ jobs:
             exit 1
           fi
           echo "全部画布补丁 apply 成功。"
+
+      # 同 cc-switch / opencode：补丁冲突自动开 issue。画布这条尤其需要——它挂了 9 晚没人发现，
+      # 因为画布不独立发版，红叉不会连带出包失败，唯一的信号就是 Actions 页面。
+      - name: 画布补丁冲突 → 开 issue 通知维护者
+        if: failure() && steps.replay.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="画布品牌补丁需 rebase 到上游 ${LATEST}"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label patch-conflict --search "in:title ${LATEST}" \
+            --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            echo "已存在 open issue #${existing}（${LATEST}），不重复创建。"
+            exit 0
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --label patch-conflict \
+            --body "$(cat <<EOF
+          上游 \`infinite-canvas\` 发布了 **${LATEST}**，\`brand/canvas-patches/\` 的 strict apply 失败，需人工 rebase。
+
+          冲突 hunk 的 3way 诊断在这次运行的日志里：${RUN_URL}
+
+          ## 修复步骤（在 \`open-code/\` 下执行）
+
+          1. 起检查点 worktree，逐补丁重放：
+             \`\`\`bash
+             scripts/rebase-patches.sh --target canvas plan ${LATEST}
+             \`\`\`
+          2. 脚本停在冲突补丁上时，按提示手改 \`.rej\`，改完 \`scripts/rebase-patches.sh --target canvas continue\`。
+          3. 全部落地后 \`scripts/rebase-patches.sh --target canvas finish\`——它会把漂移的补丁重导出到 \`brand/canvas-patches/\`，并双向校验 manifest。
+             想放弃重来：\`scripts/rebase-patches.sh --target canvas abort\`。
+          4. 同步基线：\`brand/CANVAS_BASE_TAG\` = \`${LATEST}\`、\`brand/CANVAS_BASE_SHA\` = 该 tag 的 commit、\`infinite-canvas\` 的 gitlink 一起推进。三者必须同时移动。
+          5. 本地验证：\`scripts/apply-canvas-patches.sh\` 干净通过 + \`VITE_BASE=/canvas/ pnpm build\`（与 desktop 的 \`build-canvas.ts\` 同一条路径）。
+          6. 出包：**画布不需要手动补触发**。它不独立发版，产物内嵌在 opencode desktop 的 \`out/renderer/canvas/\`，所以本 job 只推进基线 + 推 main，不打 dokng tag。画布的改动会搭下一次 opencode 升级或手动发布的车一起出去。
+
+          修完后手动关掉这条 issue。若上游又发新版，版本号不同会另开一条。
+          EOF
+          )"
+          echo "已创建 issue。"
 
       - name: 安装依赖 + 构建画布（VITE_BASE=/canvas/，与 desktop 打包一致）
         if: steps.detect.outputs.need == 'true'
