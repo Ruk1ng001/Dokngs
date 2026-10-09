@@ -318,20 +318,20 @@ index a6ddf9b..823f991 100644
  
  export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()) {
 diff --git a/web/src/services/image-storage.ts b/web/src/services/image-storage.ts
-index a781c09..3ae9efe 100644
+index f9c62d7..ede3e7b 100644
 --- a/web/src/services/image-storage.ts
 +++ b/web/src/services/image-storage.ts
-@@ -3,6 +3,9 @@ import localforage from "localforage";
- import { nanoid } from "nanoid";
+@@ -4,6 +4,9 @@ import { nanoid } from "nanoid";
  import i18n from "@/i18n";
  import { withLocalProxy } from "@/stores/use-config-store";
+ import { createImageThumbnail } from "@/lib/image-thumbnail";
 +// [dokng] 落盘桥：嵌入 opencode 桌面壳时把图片字节写到 userData/canvas-files/，
 +// 不再依赖可被回收的 IndexedDB 与会话级 blob: URL。standalone web 下桥不可用，自动回退原逻辑。
 +import { deleteHostFiles, hasHostFile, hostFileKeySet, hostFileUrl, IS_EMBEDDED, readHostFile, writeHostFile } from "@/lib/host-fs-bridge";
  
  export type UploadedImage = {
      url: string;
-@@ -42,17 +45,29 @@ export async function uploadImage(input: string | Blob, options?: ImageReadOptio
+@@ -51,18 +54,35 @@ export async function uploadImage(input: string | Blob, options?: ImageReadOptio
  
  async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<UploadedImage> {
      const storageKey = `image:${nanoid()}`;
@@ -351,14 +351,20 @@ index a781c09..3ae9efe 100644
 +        if (!persisted) await store.setItem(storageKey, blob);
          throwIfAborted(options?.signal);
 -        objectUrls.set(storageKey, url);
++        if (persisted) URL.revokeObjectURL(probeUrl);
++        else objectUrls.set(storageKey, probeUrl);
++        // 缩略图无论字节落在磁盘还是 IndexedDB 都只存 IndexedDB——它不进节点数据、不参与导出，
++        // 丢了也能由原图重新生成，没有跟着落盘的必要。
+         await storeImagePreview(storageKey, blob);
 -        return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type.startsWith("image/") ? blob.type : "" };
-+        const mimeType = blob.type.startsWith("image/") ? blob.type : "";
-+        if (persisted) {
-+            URL.revokeObjectURL(probeUrl);
-+            return { url: hostFileUrl(storageKey), storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType };
-+        }
-+        objectUrls.set(storageKey, probeUrl);
-+        return { url: probeUrl, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType };
++        return {
++            url: persisted ? hostFileUrl(storageKey) : probeUrl,
++            storageKey,
++            width: meta.width,
++            height: meta.height,
++            bytes: blob.size,
++            mimeType: blob.type.startsWith("image/") ? blob.type : "",
++        };
      } catch (error) {
 -        URL.revokeObjectURL(url);
 +        URL.revokeObjectURL(probeUrl);
@@ -367,7 +373,7 @@ index a781c09..3ae9efe 100644
          await store.removeItem(storageKey).catch(() => undefined);
          throw error;
      }
-@@ -132,6 +147,8 @@ function throwIfAborted(signal?: AbortSignal) {
+@@ -142,6 +162,8 @@ function throwIfAborted(signal?: AbortSignal) {
  
  export async function resolveImageUrl(storageKey?: string, fallback = "") {
      if (!storageKey) return fallback;
@@ -376,11 +382,11 @@ index a781c09..3ae9efe 100644
      const cached = objectUrls.get(storageKey);
      if (cached) return cached;
      const blob = await store.getItem<Blob>(storageKey);
-@@ -142,10 +159,23 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
+@@ -152,6 +174,11 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
  }
  
  export async function getImageBlob(storageKey: string) {
-+    // [dokng] 磁盘优先：落盘后 IndexedDB 里已无这份字节，图生图 / 导出需从磁盘读回。
++    // [dokng] 磁盘优先：落盘后 IndexedDB 里已无这份字节，图生图 / 导出 / 缩略图重算需从磁盘读回。
 +    if (await hasHostFile(storageKey)) {
 +        const blob = await readHostFile(storageKey, "image/png");
 +        if (blob) return blob;
@@ -388,19 +394,28 @@ index a781c09..3ae9efe 100644
      return store.getItem<Blob>(storageKey);
  }
  
+@@ -214,9 +241,19 @@ async function deleteImagePreview(storageKey: string) {
+ }
+ 
  export async function setImageBlob(storageKey: string, blob: Blob) {
+-    await store.setItem(storageKey, blob);
 +    // [dokng] 与 uploadImage 同策：优先落盘并返回 oc:// 持久 URL，失败回退 IndexedDB + blob:。
-+    if (await writeHostFile(storageKey, blob)) {
++    const persisted = await writeHostFile(storageKey, blob);
++    if (!persisted) await store.setItem(storageKey, blob);
++    // 字节换了，旧缩略图必须重算——两条路径都要走，否则界面上还是旧图的缩略。
+     await deleteImagePreview(storageKey);
+     await storeImagePreview(storageKey, blob);
++    if (persisted) {
 +        // 换了字节，旧的 blob: 缓存必须失效，否则界面仍显示旧图。
 +        const stale = objectUrls.get(storageKey);
 +        if (stale) URL.revokeObjectURL(stale);
 +        objectUrls.delete(storageKey);
 +        return hostFileUrl(storageKey);
 +    }
-     await store.setItem(storageKey, blob);
      const url = URL.createObjectURL(blob);
      objectUrls.set(storageKey, url);
-@@ -159,8 +189,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
+     return url;
+@@ -229,8 +266,11 @@ export async function imageToDataUrl(image: { url?: string; dataUrl?: string; st
  }
  
  export async function deleteStoredImages(keys: Iterable<string>) {
@@ -413,7 +428,7 @@ index a781c09..3ae9efe 100644
              const url = objectUrls.get(key);
              if (url) URL.revokeObjectURL(url);
              objectUrls.delete(key);
-@@ -179,10 +212,17 @@ export async function cleanupUnusedImages(usedData: unknown) {
+@@ -250,10 +290,17 @@ export async function cleanupUnusedImages(usedData: unknown) {
              collectImageStorageKeys(value, usedKeys);
          }),
      ]);
@@ -430,9 +445,9 @@ index a781c09..3ae9efe 100644
 +            if (key.startsWith("image:") && !usedKeys.has(key)) unused.add(key);
 +        }
 +    }
-     await deleteStoredImages(unused);
- }
- 
+     const orphanPreviews: string[] = [];
+     await previewStore.iterate((_value, key) => {
+         if (!usedKeys.has(key)) orphanPreviews.push(key);
 diff --git a/web/src/stores/canvas/use-canvas-store.ts b/web/src/stores/canvas/use-canvas-store.ts
 index 9389f33..d734971 100644
 --- a/web/src/stores/canvas/use-canvas-store.ts
