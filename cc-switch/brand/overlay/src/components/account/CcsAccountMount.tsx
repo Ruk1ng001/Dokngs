@@ -1,9 +1,13 @@
 // [ccs] 账户功能在 App.tsx 的唯一挂载点。
 //
-// 设计目标：把二开对上游 src/App.tsx 的侵入压缩到 3 行（1 个 import + 2 个 JSX 挂载），
+// 设计目标：把二开对上游 src/App.tsx 的侵入压缩到 2 行（1 个 import + 1 个 JSX 挂载），
 // 其余全部收敛在本 overlay 文件内，随上游升级零冲突：
-//   - AccountEntryButton：顶栏「账户」图标按钮（插在设置按钮之后）；
 //   - CcsAccountMount：面板 Dialog 容器 + 自动弹出策略 + 托盘事件监听。
+//
+// 入口按钮不在本文件：上游 v4.0.0 删掉了顶栏工具条（齿轮按钮 + UpdateBadge 整条移除），
+// 改为侧栏导航 + 每屏 52px 的 AppPageHeader。账户入口随「设置」一起落到侧栏底栏，
+// 由补丁 04 在 Sidebar.tsx 的底栏加一个 NavItem 直接调 openAccountPanel()——
+// NavItem 是 Sidebar.tsx 的局部组件，拿不到也不必导出，故按钮不再由 overlay 提供。
 //
 // 面板开关状态用模块级微 store（useSyncExternalStore）承载，使按钮与挂载点无需共享
 // React 状态/Context，也让托盘事件、首启逻辑都能在组件外触发打开。
@@ -22,8 +26,6 @@
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
-import { UserCircle } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { universalProvidersApi } from "@/lib/api";
 import { AccountPanel } from "./AccountPanel";
@@ -89,30 +91,8 @@ function useReloadToken(): number {
 // 首启标记：出现过账户面板即落盘，此后仅在「无已绑定渠道」时才自动弹出。
 const FIRST_RUN_KEY = "ccs-account-panel-seen";
 
-/** [ccs] 顶栏账户入口按钮（App.tsx 顶栏工具条内挂载）。 */
-export function AccountEntryButton() {
-  const { t } = useTranslation();
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      onClick={openAccountPanel}
-      title={t("account.title", { defaultValue: "账户" })}
-      className="hover:bg-black/5 dark:hover:bg-white/5"
-    >
-      <UserCircle className="w-4 h-4" />
-    </Button>
-  );
-}
-
-interface CcsAccountMountProps {
-  // App.tsx 的固定顶栏高度（拖拽条 + header）。Dialog 需在顶栏下方的可用区内垂直
-  // 居中并限高，否则小窗口下面板顶部会被顶栏遮住。
-  contentTopOffset: number;
-}
-
 /** [ccs] 账户面板挂载点：Dialog 容器 + 自动弹出策略 + 托盘事件监听。 */
-export function CcsAccountMount({ contentTopOffset }: CcsAccountMountProps) {
+export function CcsAccountMount() {
   const { t } = useTranslation();
   const open = usePanelOpen();
   const reload = useReloadToken();
@@ -182,17 +162,12 @@ export function CcsAccountMount({ contentTopOffset }: CcsAccountMountProps) {
   }, []);
 
   return (
-    // 位置/尺寸：固定顶栏盖在 base 层 Dialog 之上，故不按整窗垂直居中，而是在顶栏下方
-    // 可用区内居中：top 取该区中心、maxHeight 扣掉顶栏高度；高度 680 兜底，放不下时由
-    // 面板内部 key 列表滚动区消化。p-0 去掉默认内边距（面板各区自带 px-6）。
+    // 位置/尺寸：上游 v4.0.0 去掉了盖在 Dialog 之上的固定顶栏（改为每屏 52px 的
+    // AppPageHeader，在 overlay 之下），故直接用 Dialog 默认的整窗居中，不再按顶栏高度
+    // 偏移。高度 680 兜底、max-h 扣掉上下边距，放不下时由面板内部 key 列表滚动区消化。
+    // p-0 去掉默认内边距（面板各区自带 px-6）。
     <Dialog open={open} onOpenChange={setPanelOpen}>
-      <DialogContent
-        className="w-[640px] max-w-[calc(100vw-2rem)] h-[680px] p-0 gap-0 overflow-hidden"
-        style={{
-          top: `calc(${contentTopOffset}px / 2 + 50vh)`,
-          maxHeight: `calc(100vh - ${contentTopOffset}px - 1rem)`,
-        }}
-      >
+      <DialogContent className="w-[640px] max-w-[calc(100vw-2rem)] h-[680px] max-h-[calc(100vh-2rem)] p-0 gap-0 overflow-hidden">
         <AccountPanel
           onClose={() => setPanelOpen(false)}
           reloadToken={reload}

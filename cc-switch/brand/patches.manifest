@@ -19,10 +19,13 @@ file = src-tauri/src/lib.rs
 file = src-tauri/src/services/mod.rs
 
 [04-account-ui-anchors]
-# App.tsx 3 行挂载（import + 顶栏按钮 + CcsAccountMount）+ dokng 图标注册。
+# App.tsx 2 行挂载（import + <CcsAccountMount />）+ Sidebar 底栏入口 NavItem
+# （上游 v4.0.0 删了顶栏工具条，入口随「设置」落到侧栏；NavItem 未导出故不能走 overlay）
+# + dokng 图标注册。
 # depends：运行时调用 02 注册的 get_account_profile / get_account_models。
 depends = 02-account-backend-anchors
 file = src/App.tsx
+file = src/components/shell/Sidebar.tsx
 file = src/icons/extracted/index.ts
 file = src/icons/extracted/metadata.ts
 

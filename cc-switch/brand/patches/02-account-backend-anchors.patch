@@ -40,7 +40,7 @@
 # 应用（在 upstream/ 内，基线为 brand/BASE_SHA）：
 #   git -C upstream apply brand/patches/02-account-backend-anchors.patch
 diff --git a/src-tauri/src/commands/mod.rs b/src-tauri/src/commands/mod.rs
-index 08e27091..d9b13aea 100644
+index b289bf7c..fb25799d 100644
 --- a/src-tauri/src/commands/mod.rs
 +++ b/src-tauri/src/commands/mod.rs
 @@ -1,5 +1,6 @@
@@ -50,7 +50,7 @@ index 08e27091..d9b13aea 100644
  mod auth;
  mod balance;
  mod codex_oauth;
-@@ -36,6 +37,7 @@ mod usage;
+@@ -37,6 +38,7 @@ mod usage;
  mod webdav_sync;
  mod workspace;
  
@@ -59,7 +59,7 @@ index 08e27091..d9b13aea 100644
  pub use balance::*;
  pub use codex_oauth::*;
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
-index 1e6cd62f..39a9a7c1 100644
+index 19d4ad4a..efbb6730 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
 @@ -11,6 +11,8 @@ mod commands;
@@ -71,7 +71,7 @@ index 1e6cd62f..39a9a7c1 100644
  mod error;
  mod gemini_config;
  mod gemini_mcp;
-@@ -233,6 +235,13 @@ fn handle_deeplink_url(
+@@ -270,6 +272,13 @@ fn handle_deeplink_url(
          return false;
      }
  
@@ -85,7 +85,7 @@ index 1e6cd62f..39a9a7c1 100644
      log::info!(
          "✓ Deep link URL detected from {source}: {}",
          url_for_log(url_str)
-@@ -1030,6 +1039,12 @@ pub fn run() {
+@@ -1101,6 +1110,12 @@ pub fn run() {
              });
              log::info!("✓ Deep-link URL handler registered");
  
@@ -98,7 +98,7 @@ index 1e6cd62f..39a9a7c1 100644
              // 创建动态托盘菜单
              let menu = tray::create_tray_menu(app.handle(), &app_state)?;
  
-@@ -1389,6 +1404,12 @@ pub fn run() {
+@@ -1469,6 +1484,12 @@ pub fn run() {
              commands::get_xai_oauth_quota,
              commands::get_coding_plan_quota,
              commands::get_balance,
@@ -111,7 +111,7 @@ index 1e6cd62f..39a9a7c1 100644
              // New MCP via config.json (SSOT)
              commands::get_mcp_config,
              commands::upsert_mcp_server_in_config,
-@@ -1748,6 +1769,16 @@ pub fn run() {
+@@ -1876,6 +1897,16 @@ pub fn run() {
                                  }
                              }
  
@@ -129,11 +129,11 @@ index 1e6cd62f..39a9a7c1 100644
                              match crate::deeplink::parse_deeplink_url(&url_str) {
                                  Ok(request) => {
 diff --git a/src-tauri/src/services/mod.rs b/src-tauri/src/services/mod.rs
-index 2fce3bec..b41e4f3a 100644
+index 429fcd0b..be4f153b 100644
 --- a/src-tauri/src/services/mod.rs
 +++ b/src-tauri/src/services/mod.rs
 @@ -1,3 +1,4 @@
 +pub mod account;
+ pub mod backup_storage;
  pub mod balance;
  pub mod codex_oauth_models;
- pub mod coding_plan;

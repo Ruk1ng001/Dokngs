@@ -289,7 +289,8 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.set_focus();
         #[cfg(target_os = "linux")]
         {
-            crate::linux_fix::nudge_main_window(window.clone());
+            // reason 只进日志，用来区分是哪条路径唤起的窗口（上游 v4.0.0 加的第二参）。
+            crate::linux_fix::nudge_main_window(window.clone(), "ccs-account-deeplink");
         }
     }
 }
