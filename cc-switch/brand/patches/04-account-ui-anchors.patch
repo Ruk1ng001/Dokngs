@@ -28,10 +28,10 @@
 # 应用（在 upstream/ 内，基线为 brand/BASE_SHA）：
 #   git -C upstream apply brand/patches/04-account-ui-anchors.patch
 diff --git a/src/App.tsx b/src/App.tsx
-index 39be00f5..7644b3b7 100644
+index cde4ba9f..2d7dcef7 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -99,6 +99,9 @@ import UnifiedSkillsPanel from "@/components/skills/UnifiedSkillsPanel";
+@@ -106,6 +106,9 @@ import UnifiedSkillsPanel from "@/components/skills/UnifiedSkillsPanel";
  import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
  import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
  import { WhatsNewNotice } from "@/components/WhatsNewDialog";
@@ -41,7 +41,7 @@ index 39be00f5..7644b3b7 100644
  import { Badge } from "@/components/ui/badge";
  import { Button } from "@/components/ui/button";
  import { HoverTip } from "@/components/ui/hover-tip";
-@@ -1646,6 +1649,8 @@ function App() {
+@@ -1685,6 +1688,8 @@ function App() {
        <FirstRunNoticeDialog />
        <NewLayoutDialog />
        <WhatsNewNotice />
@@ -51,7 +51,7 @@ index 39be00f5..7644b3b7 100644
    );
  }
 diff --git a/src/components/shell/Sidebar.tsx b/src/components/shell/Sidebar.tsx
-index 1e77fd51..f83cb619 100644
+index 19ae4728..bc7fce20 100644
 --- a/src/components/shell/Sidebar.tsx
 +++ b/src/components/shell/Sidebar.tsx
 @@ -20,6 +20,7 @@ import {
@@ -71,8 +71,8 @@ index 1e77fd51..f83cb619 100644
  import { useUpdate } from "@/contexts/UpdateContext";
  import { sidebarWidth, useSidebarCollapsed } from "@/hooks/useSidebarCollapsed";
  import { useSidebarStatus, type AppNavStatus } from "@/hooks/useSidebarStatus";
-@@ -331,6 +334,17 @@ function MainDirectory({
-           dot={hasUpdate}
+@@ -332,6 +335,17 @@ function MainDirectory({
+           dotTone="success"
            onClick={() => onSelectPage("settings")}
          />
 +        {/* [ccs] 账户入口：面板是 overlay 自管的 Dialog，不是一个 GlobalPage，故不走
