@@ -1,5 +1,5 @@
 diff --git a/package.json b/package.json
-index 635b9444e6..b994a4309b 100644
+index 635b9444e6..cda23d57ef 100644
 --- a/package.json
 +++ b/package.json
 @@ -105,7 +105,7 @@
@@ -7,7 +7,7 @@ index 635b9444e6..b994a4309b 100644
        "@solidjs/meta": "0.29.4",
        "@solidjs/router": "1.0.0",
 -      "@solidjs/start": "https://pkg.pr.new/@solidjs/start@dfb2020",
-+      "@solidjs/start": "^1.2.0",
++      "@solidjs/start": "2.0.0-alpha.0",
        "@sentry/solid": "10.71.0",
        "@sentry/vite-plugin": "5.4.0",
        "solid-js": "1.9.15",

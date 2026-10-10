@@ -411,16 +411,13 @@ packages/app/src/env.d.ts
 packages/desktop/src/main/service/background-service.ts
 packages/core/src/instructions/builtins.ts
 
-# 修复上游 v1.17.20 的坏依赖引用（CI bun install 404）：
-#   - 上游 v1.17.20 的根 package.json 把 catalog 里的 @solidjs/start 钉死到临时预览包
-#     https://pkg.pr.new/@solidjs/start@dfb2020；pkg.pr.new 会回收预览包，该地址已 404，
-#     导致 bun install 在下载阶段失败（这是 v1.17.20 tag 自带的坑，非本项目引入）。
-#   - 修法：把 catalog 里该依赖改成正式 npm 版本 ^1.2.0（@solidjs/start 已正式发布 1.2.0）。
-#   - 仅改 package.json 一行；bun.lock 不入补丁——CI 用非 frozen bun install（报错日志有
-#     "Saved lockfile"），检测到 package.json 与 lockfile 不一致会自动重解析、更新 lockfile。
-#     已本地用真实 bun install 验证：只改这一行即可装成功、不再碰死链。lockfile diff 达 961 行、
-#     且随上游频繁变动，入补丁会极度脆弱，故不纳入。
-#   - 独立于其余补丁的文件（仅改根 package.json），按 NN 序最后应用。
+# 用 npm 已发布的包替代上游临时预览依赖：
+#   - v2.0.26 仍引用 https://pkg.pr.new/@solidjs/start@dfb2020；该预览地址曾令 CI 下载失败。
+#   - 精确锁定 2.0.0-alpha.0：它与预览包使用同一组依赖，支持 Vite 7、solidStart 配置插件、
+#     根入口的 Asset / PageEvent / APIEvent 类型，以及 /http 的 useSession。
+#     v1 缺少这些 v2 API；后续 alpha 移动了类型导出，稳定 v2 又要求 Vite 8/9，不能直接替换。
+#   - 仅改根 package.json；CI 的非 frozen bun install 负责重新解析 bun.lock，避免把庞大的
+#     自动生成锁文件变动纳入易冲突的补丁。安装、完整 lint/typecheck 与编译均由 Actions 验证。
 [13-fix-solidjs-dep]
 package.json
 

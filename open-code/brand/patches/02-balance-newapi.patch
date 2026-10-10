@@ -1,12 +1,12 @@
 diff --git a/packages/desktop/electron.vite.config.ts b/packages/desktop/electron.vite.config.ts
-index abc14f75e9..0bcec4af9b 100644
+index abc14f75e9..1ee272ad70 100644
 --- a/packages/desktop/electron.vite.config.ts
 +++ b/packages/desktop/electron.vite.config.ts
 @@ -1,5 +1,7 @@
  import { defineConfig } from "electron-vite"
  import { pickerPlugin } from "./scripts/picker"
 +// [dokng] 画布产物拷贝插件用（上游原先为 copy-server-assets 导入过 fs，该插件移除后导入也没了）。
-+import * as fs from "node:fs/promises"
++import { access, cp, rm } from "node:fs/promises"
  
  const channel = (() => {
    const raw = process.env.OPENCODE_CHANNEL
@@ -86,14 +86,14 @@ index abc14f75e9..0bcec4af9b 100644
 +          const CANVAS_DIST = "../../../infinite-canvas/web/dist"
 +          const DEST = "./out/renderer/canvas"
 +          try {
-+            await fs.access(CANVAS_DIST)
++            await access(CANVAS_DIST)
 +          } catch {
 +            // dev（electron-vite dev 不跑 prebuild）或未构建画布时跳过，不阻断桌面构建。
 +            console.warn(`[dokng:copy-canvas] 未找到画布产物 ${CANVAS_DIST}，跳过拷贝（dev 或未构建画布时正常）。`)
 +            return
 +          }
-+          await fs.rm(DEST, { recursive: true, force: true })
-+          await fs.cp(CANVAS_DIST, DEST, { recursive: true })
++          await rm(DEST, { recursive: true, force: true })
++          await cp(CANVAS_DIST, DEST, { recursive: true })
 +          console.log(`[dokng:copy-canvas] 已拷贝画布产物 → ${DEST}`)
 +        },
 +      },
