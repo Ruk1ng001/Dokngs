@@ -121,10 +121,10 @@ index 0000000000..69edb58e09
 +}
 diff --git a/packages/app/src/components/cx-account/cx-deep-links.ts b/packages/app/src/components/cx-account/cx-deep-links.ts
 new file mode 100644
-index 0000000000..cde1579543
+index 0000000000..2098e2aab4
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-deep-links.ts
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +// [cx] app 包侧的 deep-link 消费工具（US-013 一键导入深链需要）。
 +//
 +// 为什么要自带这两个函数：上游 v1 在 app 包里有 pages/layout/deep-links.ts（导出
@@ -152,7 +152,8 @@ index 0000000000..cde1579543
 + */
 +export function drainPendingDeepLinks(target: Window): string[] {
 +  const store = (target as DeepLinkWindow).__OPENCODE__
-+  const urls = store?.deepLinks
++  if (!store) return []
++  const urls = store.deepLinks
 +
 +  if (!urls?.length) return []
 +  store.deepLinks = []
