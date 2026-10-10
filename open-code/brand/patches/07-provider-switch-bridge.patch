@@ -1,284 +1,329 @@
 diff --git a/packages/app/src/components/cx-account/cx-account-launcher.tsx b/packages/app/src/components/cx-account/cx-account-launcher.tsx
 new file mode 100644
-index 0000000000..2c55b052ae
+index 0000000000..69edb58e09
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-launcher.tsx
-@@ -0,0 +1,100 @@
-+// [cx] 新布局(newLayoutDesigns / layout-new.tsx)下的账户面板接线。
+@@ -0,0 +1,115 @@
++// [cx] 账户面板在 app shell 里的接线：标题栏账户按钮 + dokng:// 一键导入深链 + 首启无 key 引导。
 +//
-+// 背景：上游「新布局」走 layout-new.tsx（NewLayout），只有 Titlebar + main，没有 SidebarContent，
-+// 故 07 补丁挂在旧布局(layout.tsx)侧边栏底部的账户按钮 + onMount 里的 dokng:// 深链 / 首启无 key
-+// 引导在新布局下全部失效。本组件把这三件事重新接到新布局：
-+//   1. 标题栏右侧账户按钮：经 useTitlebarRightMount() 的 #opencode-titlebar-right portal 挂载
-+//      （与原生 status popover 同排，new-session.tsx / session-header.tsx 同款范式）。
-+//   2. dokng:// 一键导入深链：复用 opencode 既有 deep-link 分发（opencode:deep-link 事件 +
-+//      启动缓冲 drainPendingDeepLinks），解析出 dokng:// 后弹导入确认框（CxDialogImport，不静默写入）。
-+//   3. 首启无 key 引导：读本地 key 列表为空则自动弹账户面板（CxDialogAccount）。
++// 三件事都挂在同一个组件里，因为它们共用同一份懒加载的 cx-account 模块与同一个 useDialog()：
++//   1. 账户入口按钮：经 TitlebarRight 挂到标题栏右侧（与原生的扩展胶囊同排）。
++//   2. dokng:// 一键导入深链（US-013）：复用 desktop 既有 deep-link 分发（opencode:deep-link
++//      事件 + 启动缓冲，见 cx-deep-links.ts），解析出 dokng:// 后弹导入确认框（不静默写入）。
++//   3. 首启无 key 引导（FR-3.6）：启动时读本地 key 列表，为空则自动弹账户面板（引导新增流程）。
++// 三者全部仅 desktop 生效（账户面板经 desktop IPC 读写本地 key），非 desktop 渲染 null。
 +//
-+// 逻辑与 07 的 layout.tsx 段等价，仅挂载点不同（旧布局侧边栏 slot → 新布局标题栏 portal）。
-+// 两套布局运行时二选一（app.tsx），本组件只在 layout-new.tsx 挂载，不与旧布局重复触发。
-+// 全部仅 desktop 生效（账户面板依赖 desktop preload 的 window.api）；非 desktop 渲染 null。
++// [cx] 上游 v2 重构：v1 这些接线分散在 pages/layout.tsx（旧布局：侧边栏账户按钮 + onMount 里的
++// 深链与首启引导）与 pages/cx-account-launcher.tsx（新布局：标题栏 portal 版同款逻辑）两处——
++// 因为 v1 同时存在 LegacyLayout 与 NewLayout 两套布局、运行时二选一。v2 只剩一套 shell
++// （shell/shell.tsx），故两份等价逻辑合回这一个组件，挂载点也只剩一个。
 +//
-+// 依赖：切 key 的 cx:select-provider 桥仍在 07 的 directory-layout.tsx（CxProviderSwitchBridge，
-+// 跨布局通用，新布局 session 页仍经过 DirectoryDataProvider），本组件不重复实现。
++// 为什么账户按钮走 TitlebarRight 而不是 HomeUtilityNav：v1 的落点（侧边栏底部、settings/help
++// 同排）在 v2 的对应物是 home 页的 HomeUtilityNav，但它只在 home 页渲染——会话进行中够不到
++// 账户面板（看余额、切 key 恰恰是会话中的需求）。标题栏是 v2 唯一跨路由常驻的 chrome。
++// 代价：标题栏右侧挂载点（#opencode-titlebar-right）在「垂直标签页」外观下不渲染（上游
++// titlebar.tsx 的 `<Show when={!props.verticalTabs}>`），故另注册一条命令面板入口
++// （cx.account.open）兜底——垂直标签页是用户主动开启的非默认外观（默认 horizontal）。
 +
-+import { onMount, Show } from "solid-js"
-+import { Portal } from "solid-js/web"
++import { onMount } from "solid-js"
++import { Icon } from "@opencode/ui/icon"
++import { IconButton } from "@opencode/ui/icon-button"
++import { Tooltip } from "@opencode/ui/tooltip"
++import { useDialog } from "@opencode/ui/context/dialog"
 +import { makeEventListener } from "@solid-primitives/event-listener"
-+import { Icon } from "@opencode-ai/ui/icon"
-+import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
-+import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-+import { useDialog } from "@opencode-ai/ui/context/dialog"
-+import { usePlatform } from "@/context/platform"
-+import { useTitlebarRightMount } from "@/components/titlebar"
-+import { deepLinkEvent, drainPendingDeepLinks } from "@/pages/layout/deep-links"
++import { usePlatform } from "@/runtime/platform/platform"
++import { useCommand } from "@/shell/commands/command"
++import { TitlebarRight } from "@/shell/titlebar/right-slot"
++import { deepLinkEvent, drainPendingDeepLinks } from "./cx-deep-links"
++
++const ACCOUNT_LABEL = "账户"
 +
 +export function CxAccountLauncher() {
 +  const platform = usePlatform()
 +  const dialog = useDialog()
-+  const rightMount = useTitlebarRightMount()
++  const command = useCommand()
 +
-+  // 非 desktop（web 等）不渲染任何东西：账户面板依赖 desktop preload 的 window.api。
++  // 非 desktop（web 等）不渲染任何东西：账户面板经 desktop IPC 读写本地 key，web 端无此通道。
 +  if (platform.platform !== "desktop") return null
 +
 +  const openAccount = () => {
-+    void import("@/components/cx-account/cx-account-dialog").then((x) => {
++    void import("./cx-account-dialog").then((x) => {
 +      dialog.show(() => <x.CxDialogAccount />)
 +    })
 +  }
 +
 +  // dokng:// 一键导入深链：解析出第一条有效链接后弹导入确认框（不静默写入，见 cx-account-import）。
 +  const handleDeepLinks = (urls: string[]) => {
-+    void import("@/components/cx-account/cx-account-api").then((api) => {
++    if (urls.length === 0) return
++    void import("./cx-account-api").then((api) => {
 +      for (const url of urls) {
 +        const req = api.parseImportDeepLink(url)
++
 +        if (!req) continue
-+        void import("@/components/cx-account/cx-account-import").then((x) => {
++        void import("./cx-account-import").then((x) => {
 +          dialog.show(() => <x.CxDialogImport request={req} />)
 +        })
++
 +        break
 +      }
 +    })
 +  }
 +
++  // 命令面板入口：垂直标签页外观下标题栏右侧挂载点不存在，这条是该场景的兜底入口（也给键盘流用户）。
++  command.register("cx-account", () => [
++    {
++      id: "cx.account.open",
++      title: ACCOUNT_LABEL,
++      // 不设则按 id 前缀归类，cx.* 落不到任何已知前缀、会兜底进 General——显式写出同一结果。
++      section: "general",
++      onSelect: openAccount,
++    },
++  ])
++
 +  onMount(() => {
 +    const handler = (event: Event) => {
-+      const detail = (event as CustomEvent<{ urls: string[] }>).detail
-+      const urls = detail?.urls ?? []
-+      if (urls.length === 0) return
-+      handleDeepLinks(urls)
++      const detail = (event as CustomEvent<{ urls?: string[] }>).detail
++
++      handleDeepLinks(detail?.urls ?? [])
 +    }
 +
++    // 先排空启动缓冲（挂载前到达的深链只进了缓冲、事件已派发完），再订阅后续事件，缺一会漏链接。
 +    handleDeepLinks(drainPendingDeepLinks(window))
 +    makeEventListener(window, deepLinkEvent, handler as EventListener)
 +
-+    // [cx] FR-3.6: 首启无 key 引导。启动时读本地 key 列表，若为空则自动弹账户面板（引导新增流程）。
-+    // 仅触发一次（dialog.show 一次性；添加后 keys 非空自然不再触发）。
-+    void import("@/components/cx-account/cx-account-api").then(async (api) => {
++    // [cx] FR-3.6: 首启无 key 引导。启动时读本地 key 列表，若为空则自动弹账户面板（AddKeyForm
++    // 以 startOpen 展开，引导即进入新增流程）。仅触发一次：dialog.show 是一次性的，且添加后
++    // keys 非空，本会话内不会重弹。
++    void import("./cx-account-api").then(async (api) => {
 +      const state = await api.loadChannelState()
-+      if (api.resolveKeyList(state).length === 0) {
-+        const x = await import("@/components/cx-account/cx-account-dialog")
-+        dialog.show(() => <x.CxDialogAccount />)
-+      }
++
++      if (api.resolveKeyList(state).length > 0) return
++      const x = await import("./cx-account-dialog")
++      dialog.show(() => <x.CxDialogAccount />)
 +    })
 +  })
 +
-+  // 标题栏右侧账户按钮（#opencode-titlebar-right portal，与原生 status popover 同排）。
 +  return (
-+    <Show when={rightMount()}>
-+      {(mount) => (
-+        <Portal mount={mount()}>
-+          <TooltipV2 placement="bottom" value="账户">
-+            <IconButtonV2
-+              type="button"
-+              variant="ghost-muted"
-+              size="large"
-+              class="shrink-0"
-+              icon={<Icon name="user" />}
-+              onClick={openAccount}
-+              aria-label="账户"
-+            />
-+          </TooltipV2>
-+        </Portal>
-+      )}
-+    </Show>
++    <TitlebarRight>
++      <Tooltip placement="bottom" value={ACCOUNT_LABEL}>
++        <IconButton
++          type="button"
++          variant="ghost-muted"
++          size="large"
++          class="shrink-0"
++          icon={<Icon name="user" />}
++          onClick={openAccount}
++          aria-label={ACCOUNT_LABEL}
++        />
++      </Tooltip>
++    </TitlebarRight>
 +  )
 +}
-diff --git a/packages/app/src/pages/directory-layout.tsx b/packages/app/src/pages/directory-layout.tsx
-index a0b3576396..e002272738 100644
---- a/packages/app/src/pages/directory-layout.tsx
-+++ b/packages/app/src/pages/directory-layout.tsx
-@@ -4,7 +4,7 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
- import { useLocation, useNavigate, useParams } from "@solidjs/router"
- import { type Accessor, createEffect, createMemo, createResource, onCleanup, type ParentProps, Show } from "solid-js"
- import { useLanguage } from "@/context/language"
--import { LocalProvider } from "@/context/local"
-+import { LocalProvider, useLocal } from "@/context/local"
- import { SDKProvider } from "@/context/sdk"
- import { useSync } from "@/context/sync"
- import { decode64 } from "@/utils/base64"
-@@ -67,13 +67,38 @@ export function DirectoryDataProvider(
-           onNavigateToSession={(sessionID: string) => navigate(href(sessionID))}
-           onSessionHref={href}
-         >
--          <LocalProvider>{props.children}</LocalProvider>
-+          <LocalProvider>
-+            {/* [cx] 账户面板（挂在组件树外）→ 原生 model 切换 的桥。见 CxProviderSwitchBridge。 */}
-+            <CxProviderSwitchBridge />
-+            {props.children}
-+          </LocalProvider>
-         </DataProvider>
-       )}
-     </Show>
-   )
- }
- 
-+// [cx] 桥接组件：账户面板（BalanceLauncher，挂在 opencode 组件树之外，够不到 useLocal）
-+// 通过 window CustomEvent `cx:select-provider` 请求切换到某个 key 对应的 provider/model；
-+// 本组件挂在 LocalProvider 作用域内，收到事件后调用与原生 model 选择器同一个入口
-+// useLocal().model.set(...)，把当前会话切到该 provider —— 纯请求级、零重启，效果同原生「闪一下」。
-+// 复用仓库已有的 deep-link 事件桥同款模式（index.tsx 派发 / layout.tsx 监听）。
-+// detail: { providerID: string; modelID: string }
-+function CxProviderSwitchBridge() {
+diff --git a/packages/app/src/components/cx-account/cx-deep-links.ts b/packages/app/src/components/cx-account/cx-deep-links.ts
+new file mode 100644
+index 0000000000..cde1579543
+--- /dev/null
++++ b/packages/app/src/components/cx-account/cx-deep-links.ts
+@@ -0,0 +1,34 @@
++// [cx] app 包侧的 deep-link 消费工具（US-013 一键导入深链需要）。
++//
++// 为什么要自带这两个函数：上游 v1 在 app 包里有 pages/layout/deep-links.ts（导出
++// deepLinkEvent / drainPendingDeepLinks），因为 v1 的 layout.tsx 自己要消费 opencode://
++// 的「打开项目」深链。v2 把这套消费逻辑整条移出了 app 包——app 包现在对 deep-link 零引用，
++// 派发方只剩 desktop 的 renderer/startup/deep-links.ts：
++//   window.__OPENCODE__.deepLinks = [...已有, ...新到]   // 启动缓冲（renderer 挂载前到达的）
++//   window.dispatchEvent(new CustomEvent("opencode:deep-link", { detail: { urls } }))
++// 协议名与缓冲字段都仍在，只是 app 侧没有读取者了。故本文件只重建「读取端」，与 desktop
++// 派发端的两个契约（事件名、缓冲字段）对齐，不新造通路、不碰 desktop 侧代码。
++
++/** desktop renderer 派发的 deep-link 事件名（与 renderer/startup/deep-links.ts 一致）。 */
++export const deepLinkEvent = "opencode:deep-link"
++
++type DeepLinkWindow = Window & {
++  __OPENCODE__?: { deepLinks?: string[] }
++}
++
++/**
++ * 取走并清空启动缓冲里的深链。
++ *
++ * 必要性：主进程可能在 renderer 挂载（本组件 onMount）之前就收到了深链（冷启动点链接、
++ * second-instance），那批 URL 只进了 window.__OPENCODE__.deepLinks 缓冲，事件已经派发完了。
++ * 故挂载时必须先排空缓冲，再订阅后续事件，两者缺一就会漏链接。
++ */
++export function drainPendingDeepLinks(target: Window): string[] {
++  const store = (target as DeepLinkWindow).__OPENCODE__
++  const urls = store?.deepLinks
++
++  if (!urls?.length) return []
++  store.deepLinks = []
++
++  return urls
++}
+diff --git a/packages/app/src/components/cx-account/cx-provider-switch-bridge.tsx b/packages/app/src/components/cx-account/cx-provider-switch-bridge.tsx
+new file mode 100644
+index 0000000000..15f39b766a
+--- /dev/null
++++ b/packages/app/src/components/cx-account/cx-provider-switch-bridge.tsx
+@@ -0,0 +1,84 @@
++// [cx] 桥接组件：账户面板（CxDialogAccount，经 DialogProvider 挂在 opencode 组件树之外、
++// 够不到 useLocal()）通过 window CustomEvent `cx:select-provider` 请求切换到某个 key 对应的
++// provider/model；本组件挂在 LocalProvider 作用域内，收到事件后调用与原生 model 选择器同一个
++// 入口 useLocal().model.set(...)，把当前会话切到该 provider —— 纯请求级、零重启，效果同原生
++// 「闪一下」。detail: { providerID: string; modelID: string }
++//
++// 多 provider 改造总述（配合 03 的多 provider 注入 + 04 的 channelProviderId）：每个本地 key
++// 被注入成一个独立 opencode provider（providerID = `newapi-<id前8位>`），内核启动时同时握有
++// 全部 key 的 provider。在已注入的 key 之间切换是纯请求级（本桥的 model.set），零重启；只有
++// 新增/删除 key 改变了 provider 集合，才需重启一次让新 provider 注册进内核。
++//
++// [cx] 上游 v2 重构：v1 本组件内联在 pages/directory-layout.tsx 里（DirectoryDataProvider）。
++// v2 把该文件换成了 shell/routes/session-ui-provider.tsx（SessionUIProvider），LocalProvider
++// 也从 @/context/local 迁到 @/providers/models/selection。这里独立成文件，对上游 v2 的侵入
++// 压到「一行 import + 一行挂载」。
++
++import { onCleanup } from "solid-js"
++import { useLocal } from "@/providers/models/selection"
++
++export const cxSelectProviderEvent = "cx:select-provider"
++
++// [cx] 上游 v2 在 model.set 里新增了 validModel 守卫：provider 必须已在
++// providers.all() 且在 connected() 里、且该 provider 下确有此 modelID，否则 set 静默 return。
++// v1 无此守卫（直写），所以 v1 发完事件即生效。v2 下「刚新增一个 key 就切过去」会撞上时序：
++// 写 config → 内核重建 provider → renderer 经 server 事件重新同步 provider/model 列表，
++// 这几步完成前守卫不满足，请求会被静默丢掉。故这里做一次有界重试（轮询 model.list() 直到
++// 目标 provider/model 出现），等到即切、等不到即放弃，不抛错也不阻塞 UI。
++const RETRY_INTERVAL_MS = 300
++const RETRY_TIMEOUT_MS = 10_000
++
++export function CxProviderSwitchBridge() {
 +  const local = useLocal()
++  // 只保留最后一次请求的重试计时器：用户连点两个 key 时，前一次重试必须让位，
++  // 否则两个定时器会竞争、最终切到先满足守卫的那个（而非用户最后点的那个）。
++  let timer: ReturnType<typeof setTimeout> | undefined
++
++  const stop = () => {
++    if (timer === undefined) return
++    clearTimeout(timer)
++    timer = undefined
++  }
++
++  const switchTo = (providerID: string, modelID: string) => {
++    const deadline = Date.now() + RETRY_TIMEOUT_MS
++
++    const attempt = () => {
++      timer = undefined
++      // 与 validModel 同一判据（provider 下确有该 model）；connected 由服务端 provider 列表
++      // 决定，注入的 newapi-* 一旦注册进内核就同时进 all 与 connected，故查 list 足够。
++      const ready = local.model.list().some((item) => item.provider.id === providerID && item.id === modelID)
++
++      if (ready) {
++        local.model.set({ providerID, modelID }, { recent: true })
++
++        return
++      }
++
++      if (Date.now() >= deadline) return
++      timer = setTimeout(attempt, RETRY_INTERVAL_MS)
++    }
++
++    attempt()
++  }
++
 +  const handler = (event: Event) => {
 +    const detail = (event as CustomEvent).detail as { providerID?: unknown; modelID?: unknown } | undefined
++
 +    if (!detail) return
 +    const providerID = typeof detail.providerID === "string" ? detail.providerID : undefined
 +    const modelID = typeof detail.modelID === "string" ? detail.modelID : undefined
++
 +    if (!providerID || !modelID) return
-+    local.model.set({ providerID, modelID }, { recent: true })
++    stop()
++    switchTo(providerID, modelID)
 +  }
-+  window.addEventListener("cx:select-provider", handler)
-+  onCleanup(() => window.removeEventListener("cx:select-provider", handler))
++
++  window.addEventListener(cxSelectProviderEvent, handler)
++  onCleanup(() => {
++    stop()
++    window.removeEventListener(cxSelectProviderEvent, handler)
++  })
++
 +  return null
 +}
-+
- export const ProjectDirString = Schema.String.pipe(Schema.brand("ProjectDirString"))
- export type ProjectDirString = Schema.Schema.Type<typeof ProjectDirString>
+diff --git a/packages/app/src/home/projects/controller.tsx b/packages/app/src/home/projects/controller.tsx
+index 7cfa1ad37b..7067a3125d 100644
+--- a/packages/app/src/home/projects/controller.tsx
++++ b/packages/app/src/home/projects/controller.tsx
+@@ -184,7 +184,8 @@ export function createHomeProjectsController(home: HomeController) {
+     },
+     utility: {
+       settings: openSettings,
+-      help: () => platform.openExternal("https://opencode.ai/desktop-feedback"),
++      // [cx] 问号帮助入口改跳品牌站点（Dokng），替换上游 opencode 反馈页。
++      help: () => platform.openExternal("https://dokng.com/"),
+     },
+   }
+ }
+diff --git a/packages/app/src/shell/routes/session-ui-provider.tsx b/packages/app/src/shell/routes/session-ui-provider.tsx
+index 2eeb1766b1..fceac9d598 100644
+--- a/packages/app/src/shell/routes/session-ui-provider.tsx
++++ b/packages/app/src/shell/routes/session-ui-provider.tsx
+@@ -12,6 +12,8 @@ import { useTabs } from "@/shell/tabs/tabs"
+ import { readLocalImage } from "@/runtime/server/image"
+ import { useLanguage } from "@/runtime/i18n/language"
+ import { showToast } from "@/shell/notifications/toast"
++// [cx] 账户面板（挂在组件树外）→ 原生 model 切换 的桥。见 cx-provider-switch-bridge。
++import { CxProviderSwitchBridge } from "@/components/cx-account/cx-provider-switch-bridge"
  
-diff --git a/packages/app/src/pages/layout-new.tsx b/packages/app/src/pages/layout-new.tsx
-index 6d76ca8401..3d50f23691 100644
---- a/packages/app/src/pages/layout-new.tsx
-+++ b/packages/app/src/pages/layout-new.tsx
-@@ -5,6 +5,8 @@ import { TabsInfoPopup } from "@/components/help-button"
- import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
- import { usePlatform } from "@/context/platform"
- import { setV2Toast, ToastRegion } from "@/utils/toast"
-+// [cx] 新布局账户面板接线（标题栏账户按钮 + dokng:// 深链 + 首启无 key 引导）。见 07 补丁。
+ export function SessionUIProvider(
+   props: ParentProps<{
+@@ -92,7 +94,11 @@ export function SessionUIProvider(
+       onSessionHref={href}
+     >
+       <MarkdownProvider readImage={readImage()} openSession={openReferencedSession}>
+-        <LocalProvider>{props.children}</LocalProvider>
++        <LocalProvider>
++          {/* [cx] 必须在 LocalProvider 作用域内：桥接要用 useLocal().model.set 切 provider。 */}
++          <CxProviderSwitchBridge />
++          {props.children}
++        </LocalProvider>
+       </MarkdownProvider>
+     </DataProvider>
+   )
+diff --git a/packages/app/src/shell/shell.tsx b/packages/app/src/shell/shell.tsx
+index 25bc4954cd..b2592bc801 100644
+--- a/packages/app/src/shell/shell.tsx
++++ b/packages/app/src/shell/shell.tsx
+@@ -11,6 +11,8 @@ import { useSettingsSurface } from "@/settings/surface"
+ import { useSettings } from "@/settings/model"
+ import { ExtensionServerCover } from "@/runtime/extension/server-shell"
+ import { ExtensionSlot } from "@/runtime/extension/render"
++// [cx] 账户面板接线（标题栏账户按钮 + dokng:// 深链 + 首启无 key 引导）。见 07 补丁。
 +import { CxAccountLauncher } from "@/components/cx-account/cx-account-launcher"
  
- export default function NewLayout(props: ParentProps) {
+ export default function Layout(props: ParentProps) {
    const platform = usePlatform()
-@@ -38,6 +40,8 @@ export default function NewLayout(props: ParentProps) {
-             : undefined
-         }
-       />
-+      {/* [cx] 账户入口 + dokng:// 深链 + 首启引导（组件内部自判 desktop，非 desktop 渲染 null）。 */}
-+      <CxAccountLauncher />
-       <main class="flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-strict">
-         <Suspense>{props.children}</Suspense>
-       </main>
-diff --git a/packages/app/src/pages/layout.tsx b/packages/app/src/pages/layout.tsx
-index 963a542f88..2a1685e501 100644
---- a/packages/app/src/pages/layout.tsx
-+++ b/packages/app/src/pages/layout.tsx
-@@ -1261,6 +1261,22 @@ export default function LegacyLayout(props: ParentProps) {
-   }
- 
-   const handleDeepLinks = (urls: string[]) => {
-+    // [cx] US-013: dokng:// 一键导入深链。放在 server.isLocal() guard 之前——导入 key 与本地
-+    // server 无关，任何 server 环境都应响应。解析出第一条有效 dokng:// 后弹导入确认框（不静默写入，
-+    // 见 cx-account-import）；面板/确认框依赖 desktop preload 的 window.api，故仅桌面端处理。
-+    if (platform.platform === "desktop") {
-+      void import("@/components/cx-account/cx-account-api").then((api) => {
-+        for (const url of urls) {
-+          const req = api.parseImportDeepLink(url)
-+          if (!req) continue
-+          void import("@/components/cx-account/cx-account-import").then((x) => {
-+            dialog.show(() => <x.CxDialogImport request={req} />)
-+          })
-+          break
-+        }
-+      })
-+    }
-+
-     if (!server.isLocal()) return
- 
-     for (const directory of collectOpenProjectDeepLinks(urls)) {
-@@ -1290,6 +1306,20 @@ export default function LegacyLayout(props: ParentProps) {
- 
-     handleDeepLinks(drainPendingDeepLinks(window))
-     makeEventListener(window, deepLinkEvent, handler as EventListener)
-+
-+    // [cx] FR-3.6: 首启无 key 引导。仅 desktop：启动时读本地 key 列表，若为空则自动弹出账户面板
-+    // （AddKeyForm 以 startOpen 展开，引导即进入新增流程）。仅触发一次、用户关闭后本会话不重弹
-+    // （dialog.show 一次性；无 key 时才弹，添加后 keys 非空自然不再触发）。面板依赖 desktop
-+    // preload 的 window.api，故非 desktop 平台跳过。动态 import 与账户按钮同款懒加载。
-+    if (platform.platform === "desktop") {
-+      void import("@/components/cx-account/cx-account-api").then(async (api) => {
-+        const state = await api.loadChannelState()
-+        if (api.resolveKeyList(state).length === 0) {
-+          const x = await import("@/components/cx-account/cx-account-dialog")
-+          dialog.show(() => <x.CxDialogAccount />)
-+        }
-+      })
-+    }
-   })
- 
-   async function renameProject(project: LocalProject, next: string) {
-@@ -2249,7 +2279,31 @@ export default function LegacyLayout(props: ParentProps) {
-       settingsKeybind={() => command.keybind("settings.open")}
-       onOpenSettings={openSettings}
-       helpLabel={() => language.t("sidebar.help")}
--      onOpenHelp={() => platform.openExternal("https://opencode.ai/desktop-feedback")}
-+      // [cx] 问号帮助入口改跳品牌站点（Dokng），替换上游 opencode 反馈页。
-+      onOpenHelp={() => platform.openExternal("https://dokng.com/")}
-+      renderAccountButton={
-+        // [cx] 桌面端账户入口：挂在侧边栏底部（settings / help 同排），点击用同作用域的
-+        // useDialog() 直接弹出账户面板（面板已迁入 app 包，见 cx-account/）。动态 import
-+        // 避免首屏加载面板代码，与上游其它 dialog（settings / connect-provider）同款懒加载。
-+        // web 端不渲染（platform !== desktop），账户面板依赖 desktop preload 的 window.api。
-+        platform.platform === "desktop"
-+          ? () => (
-+              <Tooltip placement={mobile ? "bottom" : "right"} value="账户">
-+                <IconButton
-+                  icon="user"
-+                  variant="ghost"
-+                  size="large"
-+                  aria-label="账户"
-+                  onClick={() => {
-+                    void import("@/components/cx-account/cx-account-dialog").then((x) => {
-+                      dialog.show(() => <x.CxDialogAccount />)
-+                    })
-+                  }}
-+                />
-+              </Tooltip>
-+            )
-+          : undefined
-+      }
-       renderPanel={() =>
-         mobile ? <SidebarPanel project={currentProject} mobile /> : <SidebarPanel project={currentProject} merged />
-       }
-diff --git a/packages/app/src/pages/layout/sidebar-shell.tsx b/packages/app/src/pages/layout/sidebar-shell.tsx
-index ca36af2a42..6a83602f3e 100644
---- a/packages/app/src/pages/layout/sidebar-shell.tsx
-+++ b/packages/app/src/pages/layout/sidebar-shell.tsx
-@@ -30,6 +30,8 @@ export const SidebarContent = (props: {
-   onOpenSettings: () => void
-   helpLabel: Accessor<string>
-   onOpenHelp: () => void
-+  // [cx] 可选：账户入口按钮（desktop 传入，渲染在底部设置齿轮上方）。不传则不渲染。
-+  renderAccountButton?: () => JSX.Element
-   renderPanel: () => JSX.Element
- }): JSX.Element => {
-   const expanded = createMemo(() => !!props.mobile || props.opened())
-@@ -90,6 +92,8 @@ export const SidebarContent = (props: {
-           </DragDropProvider>
-         </div>
-         <div class="shrink-0 w-full pt-3 pb-6 flex flex-col items-center gap-2">
-+          {/* [cx] 账户入口（内置渠道多 key 管理）。desktop 传入，其它平台不传即不渲染。 */}
-+          {props.renderAccountButton?.()}
-           <TooltipKeybind placement={placement()} title={props.settingsLabel()} keybind={props.settingsKeybind() ?? ""}>
-             <IconButton
-               icon="settings-gear"
+@@ -46,6 +48,10 @@ export default function Layout(props: ParentProps) {
+         }}
+       >
+         <Titlebar verticalTabs={verticalTabs() ? { mount: state.tabsMount } : undefined} />
++        {/* [cx] 账户入口 + dokng:// 深链 + 首启引导（组件内部自判 desktop，非 desktop 渲染 null）。
++            按钮经 TitlebarRight portal 到 <Titlebar/> 渲染的挂载点，挂载点是响应式读取的、
++            与此处的 JSX 顺序无关；放在 Titlebar 之后只为读起来贴近它实际出现的位置。 */}
++        <CxAccountLauncher />
+         <div class="flex flex-1 min-h-0 min-w-0 flex-row">
+           <Show when={verticalTabs()}>
+             <aside
+diff --git a/packages/app/src/shell/titlebar/titlebar.tsx b/packages/app/src/shell/titlebar/titlebar.tsx
+index f3780f58e3..e336df7a3d 100644
+--- a/packages/app/src/shell/titlebar/titlebar.tsx
++++ b/packages/app/src/shell/titlebar/titlebar.tsx
+@@ -665,7 +665,8 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                                 class="flex h-7 shrink-0 items-center gap-2 rounded-[6px] px-2 text-[13px] leading-4 text-v2-text-text-faint hover:bg-v2-background-bg-layer-02 focus-visible:outline-none focus-visible:bg-v2-background-bg-layer-02"
+                                 onClick={() => {
+                                   setMobileTabs("open", false)
+-                                  platform.openExternal("https://opencode.ai/desktop-feedback")
++                                  // [cx] 问号帮助入口改跳品牌站点（Dokng），与 home 页同口径。
++                                  platform.openExternal("https://dokng.com/")
+                                 }}
+                               >
+                                 <Icon name="help" size="small" />

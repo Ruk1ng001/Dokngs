@@ -21,121 +21,233 @@
 #      typecheck 在全部补丁应用后才跑）。独立于 01/02/03 的文件。
 # 应用（在 opencode/ 内，基线为 brand/BASE_SHA，按 01→02→03→04→05 顺序）：
 #   git -C opencode apply --3way brand/patches/05-channel-keys-ipc.patch
-diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
-index d8abfc1ceb..96865081f7 100644
---- a/packages/desktop/src/main/ipc.ts
-+++ b/packages/desktop/src/main/ipc.ts
-@@ -11,6 +11,21 @@ import { runDesktopMenuAction } from "./desktop-menu-actions"
- import { setForceFocus } from "./debug"
- import { assertAttachmentBudget, createPickedFileAuthorizations } from "./attachment-picker"
- import { getStore, removeStoreFileIfEmpty } from "./store"
-+// [cx] US-009: 本地多 key 列表的增删改 / 切换激活 —— 直接复用主进程数据层（同本文件直接
-+// import getStore 的风格）。renderer 不能用通用 store-set 写 channelKeys（那会把对象存成
-+// 字符串，破坏主进程 readChannelKeysState 的对象读取），故为 key 管理开专用 IPC 通道。
+diff --git a/packages/desktop/src/main/ipc-handlers/channel-keys.ts b/packages/desktop/src/main/ipc-handlers/channel-keys.ts
+new file mode 100644
+index 0000000000..9d9b6ccdda
+--- /dev/null
++++ b/packages/desktop/src/main/ipc-handlers/channel-keys.ts
+@@ -0,0 +1,68 @@
++// [cx] US-009: 本地 key 管理的 IPC handler —— 把 04 的主进程数据层（store-channel-keys）
++// 经 RPC 暴露给 renderer，支撑账户面板的「增删改 key + 手动切换激活 key」。
++//
++// [cx] 上游 v2 重构：v1 这些是 main/ipc.ts 里的 ipcMain.handle("channel-keys-*")。v2 把 IPC
++// 换成 Effect RpcServer，handler 按域拆进 main/ipc-handlers/*，故独立成本文件（与上游的
++// storage.ts / files.ts 等并列）。对上游 ipc.ts 的侵入只剩注册 handler layer 一行。
++//
++// 为什么不复用通用 storage 通道：那边（DesktopStorage）是 renderer 自己的 KV 命名空间，
++// 主进程不读；而 channelKeys 必须由主进程同步读取（起内核前构造 config，见 channel-config.ts），
++// 两侧对同一份对象态读写，故为 key 管理开专用通道、写入统一走 04 的数据层。
++//
 +// 安全底线：本文件对 key 管理 handler 一律不打印任何入参（尤其 sk- 明文），仅透传给数据层。
++
++import { Effect } from "effect"
++import { ChannelKeysRpcs } from "../../shared/ipc-rpc/channel-keys"
++// [cx] 内置渠道热重载：增删 key 后重写 OPENCODE_CONFIG 文件，内核监听到变更即重建 provider
++// ——不重启进程（在已注册 key 之间切换更是纯前端桥接、零打断，见 07 的 provider-switch-bridge）。
++import { refreshKeyModelsAndReload, reloadChannelConfig } from "../channel-config"
 +import {
-+  readChannelKeysState,
 +  addChannelKey,
++  readChannelKeysState,
 +  removeChannelKey,
-+  updateChannelKeyLabel,
 +  setActiveChannelKey,
 +  setChannelKeyModels,
-+} from "./store-channel-keys"
-+// [cx] 内置渠道热重载：增删 key 后重写 OPENCODE_CONFIG 文件 + POST /global/dispose，
-+// 让内核重建 instance 读到新 provider——不重启进程（切换已注册 key 走前端桥、零打断）。
-+import { reloadChannelConfig, refreshKeyModelsAndReload } from "./server"
- import {
-   getPinchZoomEnabled,
-   getWindowID,
-@@ -149,6 +164,45 @@ export function registerIpcHandlers(deps: Deps) {
-     return data ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : null
-   })
++  updateChannelKeyLabel,
++} from "../store-channel-keys"
++
++// 每个写操作都在改完后回最新整份状态，renderer 直接拿它刷新 UI（省掉一次额外的 list 往返）。
++const state = () => readChannelKeysState()
++
++// 本组 handler 不依赖任何服务（数据层是同步的纯模块），故用 Effect.sync 而非上游同级那种
++// `Effect.gen` + `yield* Service`——没有依赖可取，空生成器反而更难读。
++export const channelKeysHandlers = ChannelKeysRpcs.toLayer(
++  Effect.sync(() =>
++    ChannelKeysRpcs.of({
++      ChannelKeysList: () => Effect.sync(state),
++      ChannelKeysAdd: ({ label, key, baseURL }) =>
++        Effect.sync(() => {
++          addChannelKey({ label, key, baseURL })
++          return state()
++        }),
++      ChannelKeysRemove: ({ id }) =>
++        Effect.sync(() => {
++          removeChannelKey(id)
++          return state()
++        }),
++      ChannelKeysUpdateLabel: ({ id, label }) =>
++        Effect.sync(() => {
++          updateChannelKeyLabel(id, label)
++          return state()
++        }),
++      ChannelKeysSetActive: ({ id }) =>
++        Effect.sync(() => {
++          setActiveChannelKey(id)
++          return state()
++        }),
++      ChannelKeysSetModels: ({ id, models }) =>
++        Effect.sync(() => {
++          setChannelKeyModels(id, [...models])
++          return state()
++        }),
++      // 拉 /v1/models 可能慢（10s 超时）或失败，但失败已在 channel-config 内部吞掉（返回空列表、
++      // 不动 models 缓存），本 promise 不会 reject，故无需额外的错误通道。
++      ChannelConfigRefreshKey: ({ id }) => Effect.promise(() => refreshKeyModelsAndReload(id)),
++      ChannelConfigReload: () => Effect.sync(reloadChannelConfig),
++    }),
++  ),
++)
+diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
+index e09f6cdf0d..1c269fc252 100644
+--- a/packages/desktop/src/main/ipc.ts
++++ b/packages/desktop/src/main/ipc.ts
+@@ -8,6 +8,8 @@ import { DragCancelEvent, IpcTransportPort } from "../shared/ipc-transport"
+ import { Extensions } from "./extension"
+ import { DesktopFiles, openExternalURL } from "./files"
+ import { appHandlers } from "./ipc-handlers/app"
++// [cx] US-009: 本地 key 管理 handler（二开新增域，见 ipc-handlers/channel-keys.ts）。
++import { channelKeysHandlers } from "./ipc-handlers/channel-keys"
+ import { eventHandlers } from "./ipc-handlers/events"
+ import { extensionHandlers } from "./ipc-handlers/extensions"
+ import { fileHandlers } from "./ipc-handlers/files"
+@@ -31,6 +33,8 @@ const handlers = Layer.mergeAll(
+   menuHandlers,
+   eventHandlers,
+   extensionHandlers,
++  // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
++  channelKeysHandlers,
+ )
  
-+  // [cx] US-009: 本地 key 列表的增删改 + 切换激活。全部走主进程数据层（store-channel-keys）。
-+  // 返回值统一为 JSON.stringify 后的最新 ChannelKeysState 字符串，renderer 解析回对象刷新 UI
-+  // （与 store-get 对非字符串 JSON.stringify 的约定一致）。不打印任何入参（含 sk- 明文）。
-+  ipcMain.handle("channel-keys-list", () => JSON.stringify(readChannelKeysState()))
-+  ipcMain.handle(
-+    "channel-keys-add",
-+    (_event: IpcMainInvokeEvent, input: { label: string; key: string; baseURL: string }) => {
-+      addChannelKey({ label: input.label ?? "", key: input.key ?? "", baseURL: input.baseURL ?? "" })
-+      return JSON.stringify(readChannelKeysState())
-+    },
-+  )
-+  ipcMain.handle("channel-keys-remove", (_event: IpcMainInvokeEvent, id: string) => {
-+    removeChannelKey(id)
-+    return JSON.stringify(readChannelKeysState())
-+  })
-+  ipcMain.handle("channel-keys-update-label", (_event: IpcMainInvokeEvent, id: string, label: string) => {
-+    updateChannelKeyLabel(id, label ?? "")
-+    return JSON.stringify(readChannelKeysState())
-+  })
-+  ipcMain.handle("channel-keys-set-active", (_event: IpcMainInvokeEvent, id: string) => {
-+    setActiveChannelKey(id)
-+    return JSON.stringify(readChannelKeysState())
-+  })
-+  ipcMain.handle("channel-keys-set-models", (_event: IpcMainInvokeEvent, id: string, models: string[]) => {
-+    setChannelKeyModels(id, Array.isArray(models) ? models : [])
-+    return JSON.stringify(readChannelKeysState())
-+  })
-+
-+  // [cx] 内置渠道热重载：新增 key 后调此——主进程拉该 key 的 /v1/models（无 CORS）落盘，
-+  // 重写 OPENCODE_CONFIG 文件 + POST /global/dispose，内核重建 instance 即出现该 provider。
-+  // 不重启进程；dispose 会中断进行中的流式回复（同原生加 provider），故 renderer 在空闲时触发。
-+  ipcMain.handle("channel-config-refresh-key", async (_event: IpcMainInvokeEvent, id: string) => {
-+    await refreshKeyModelsAndReload(id)
-+  })
-+  // [cx] 内置渠道热重载（不拉模型）：删除 key 后调此——重写文件 + dispose，provider 随之消失。
-+  ipcMain.handle("channel-config-reload", async () => {
-+    await reloadChannelConfig()
-+  })
-+
-   ipcMain.handle(
-     "open-directory-picker",
-     async (_event: IpcMainInvokeEvent, opts?: { multiple?: boolean; title?: string; defaultPath?: string }) => {
-diff --git a/packages/desktop/src/preload/index.ts b/packages/desktop/src/preload/index.ts
-index dae18b0716..b1e249f923 100644
---- a/packages/desktop/src/preload/index.ts
-+++ b/packages/desktop/src/preload/index.ts
-@@ -79,6 +79,17 @@ const api: ElectronAPI = {
-   draftBlobPut: (data) => ipcRenderer.invoke("draft-blob-put", data),
-   draftBlobGet: (id) => ipcRenderer.invoke("draft-blob-get", id),
+ export const layer = RpcServer.layer(DesktopRpcs, { disableFatalDefects: true }).pipe(
+diff --git a/packages/desktop/src/shared/ipc-rpc.ts b/packages/desktop/src/shared/ipc-rpc.ts
+index 5475342e97..e13747a7c4 100644
+--- a/packages/desktop/src/shared/ipc-rpc.ts
++++ b/packages/desktop/src/shared/ipc-rpc.ts
+@@ -1,5 +1,7 @@
+ import { RpcClient, RpcClientError } from "effect/unstable/rpc"
+ import { AppRpcs } from "./ipc-rpc/app"
++// [cx] US-009: 本地 key 管理通道（二开新增域，见 ipc-rpc/channel-keys.ts）。
++import { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
+ import { EventRpcs } from "./ipc-rpc/events"
+ import { ExtensionRpcs } from "./ipc-rpc/extensions"
+ import { FileRpcs } from "./ipc-rpc/files"
+@@ -9,6 +11,8 @@ import { WindowRpcs } from "./ipc-rpc/window"
  
-+  // [cx] US-009: 本地 key 列表增删改 + 切换激活（见 types.ts 说明）。
-+  channelKeysList: () => ipcRenderer.invoke("channel-keys-list"),
-+  channelKeysAdd: (input) => ipcRenderer.invoke("channel-keys-add", input),
-+  channelKeysRemove: (id) => ipcRenderer.invoke("channel-keys-remove", id),
-+  channelKeysUpdateLabel: (id, label) => ipcRenderer.invoke("channel-keys-update-label", id, label),
-+  channelKeysSetActive: (id) => ipcRenderer.invoke("channel-keys-set-active", id),
-+  channelKeysSetModels: (id, models) => ipcRenderer.invoke("channel-keys-set-models", id, models),
-+  // [cx] 内置渠道热重载：新增 key 后拉模型+重载（provider 出现）/ 删除后重载（provider 消失）。不重启进程。
-+  channelConfigRefreshKey: (id) => ipcRenderer.invoke("channel-config-refresh-key", id),
-+  channelConfigReload: () => ipcRenderer.invoke("channel-config-reload"),
-+
-   getWindowID: () => ipcRenderer.invoke("get-window-id"),
-   onMenuCommand: (cb) => {
-     const handler = (_: unknown, id: string) => cb(id)
-diff --git a/packages/desktop/src/preload/types.ts b/packages/desktop/src/preload/types.ts
-index 20c39097d3..e0063025cd 100644
---- a/packages/desktop/src/preload/types.ts
-+++ b/packages/desktop/src/preload/types.ts
-@@ -70,6 +70,19 @@ export type ElectronAPI = {
-   draftBlobPut: (data: ArrayBuffer) => Promise<string>
-   draftBlobGet: (id: string) => Promise<ArrayBuffer | null>
+ export { AppRpcs } from "./ipc-rpc/app"
  
-+  // [cx] US-009: 本地 key 列表增删改 + 切换激活。全部走主进程数据层（store-channel-keys），
-+  // 返回值为 JSON.stringify 的最新 ChannelKeysState 字符串，renderer 解析回对象刷新 UI。
-+  // 不用通用 storeSet：那会把整个对象存成字符串、破坏主进程侧 readChannelKeysState 的对象读取。
-+  channelKeysList: () => Promise<string>
-+  channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => Promise<string>
-+  channelKeysRemove: (id: string) => Promise<string>
-+  channelKeysUpdateLabel: (id: string, label: string) => Promise<string>
-+  channelKeysSetActive: (id: string) => Promise<string>
-+  channelKeysSetModels: (id: string, models: string[]) => Promise<string>
-+  // [cx] 内置渠道热重载：新增 key 后拉模型+重载 / 删除后重载。不重启进程。
-+  channelConfigRefreshKey: (id: string) => Promise<void>
-+  channelConfigReload: () => Promise<void>
++export { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
 +
-   getWindowID: () => Promise<string>
-   onMenuCommand: (cb: (id: string) => void) => () => void
-   onDeepLink: (cb: (urls: string[]) => void) => () => void
+ export { EventRpcs } from "./ipc-rpc/events"
+ 
+ export { ExtensionRpcs } from "./ipc-rpc/extensions"
+@@ -21,6 +25,15 @@ export { StorageRpcs } from "./ipc-rpc/storage"
+ 
+ export { WindowRpcs } from "./ipc-rpc/window"
+ 
+-export const DesktopRpcs = AppRpcs.merge(StorageRpcs, FileRpcs, WindowRpcs, MenuRpcs, EventRpcs, ExtensionRpcs)
++export const DesktopRpcs = AppRpcs.merge(
++  StorageRpcs,
++  FileRpcs,
++  WindowRpcs,
++  MenuRpcs,
++  EventRpcs,
++  ExtensionRpcs,
++  // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
++  ChannelKeysRpcs,
++)
+ 
+ export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>
+diff --git a/packages/desktop/src/shared/ipc-rpc/channel-keys.ts b/packages/desktop/src/shared/ipc-rpc/channel-keys.ts
+new file mode 100644
+index 0000000000..2b2ed0e7d7
+--- /dev/null
++++ b/packages/desktop/src/shared/ipc-rpc/channel-keys.ts
+@@ -0,0 +1,90 @@
++// [cx] US-009: 本地 key 管理的 IPC 契约 —— renderer 侧账户面板增删改 key / 切换激活项，
++// 全部走主进程数据层（main/store-channel-keys.ts）。
++//
++// [cx] 上游 v2 重构：v1 这组通道是 ipcMain.handle("channel-keys-*") + preload contextBridge
++// 暴露 window.api.channelKeys*。v2 把整个 IPC 层换成 Effect 的 RpcServer over MessagePort
++// （契约在 shared/ipc-rpc/*，handler 在 main/ipc-handlers/*，renderer 调 invoke()），
++// window.api 已不存在，故本组通道按 v2 范式重写为 RPC 契约。
++//
++// 返回值：统一回**类型化的 ChannelKeysState 对象**（而非 v1 的 JSON 字符串）。v1 回字符串只是
++// 为了迁就通用 store-get「非字符串就 JSON.stringify」的约定；v2 的 RPC 是 schema 驱动的
++// （参见同目录 storage.ts 的 StorageItems 直接回 Struct），renderer 拿到的就是对象，
++// 省掉一次 JSON.parse 与随之而来的类型断言。
++//
++// 安全底线（同 main/store-channel-keys.ts）：key 明文仅在本机主进程与渲染进程之间传递
++// （渲染侧 key 管理 UI 需要回显/编辑），绝不上传、绝不写日志。handler 侧不打印任何入参。
++
++import { Schema } from "effect"
++import { Rpc, RpcGroup } from "effect/unstable/rpc"
++
++// 单个渠道 key 条目。与 main/store-channel-keys.ts 的 ChannelKey 同构——那边是被同步读写的
++// 纯数据层（不引 Schema），此处是过线的编解码契约；两者结构不一致时 handler 处 typecheck 即报错。
++export const ChannelKey = Schema.Struct({
++  id: Schema.String,
++  label: Schema.String,
++  key: Schema.String,
++  baseURL: Schema.String,
++  // 该 key 的可用模型 id 列表（切换/新增时主进程拉 /v1/models 落盘的缓存）。老数据无此字段。
++  models: Schema.optionalKey(Schema.Array(Schema.String)),
++})
++
++export type ChannelKey = typeof ChannelKey.Type
++
++// 完整状态。activeKeyId 指向当前激活项；无激活项时为 null。
++export const ChannelKeysState = Schema.Struct({
++  keys: Schema.Array(ChannelKey),
++  activeKeyId: Schema.NullOr(Schema.String),
++})
++
++export type ChannelKeysState = typeof ChannelKeysState.Type
++
++// 读取整份状态（面板打开 / 每次写操作后刷新 UI）。
++export const ChannelKeysList = Rpc.make("ChannelKeysList", { success: ChannelKeysState })
++
++// 新增一个 key。第一个 key 自动成为激活项（见数据层 addChannelKey）。
++export const ChannelKeysAdd = Rpc.make("ChannelKeysAdd", {
++  payload: { label: Schema.String, key: Schema.String, baseURL: Schema.String },
++  success: ChannelKeysState,
++})
++
++// 删除指定 key。删的是激活项时，激活项回退到剩余列表首个。
++export const ChannelKeysRemove = Rpc.make("ChannelKeysRemove", {
++  payload: { id: Schema.String },
++  success: ChannelKeysState,
++})
++
++// 改 label。id 不存在时静默忽略。
++export const ChannelKeysUpdateLabel = Rpc.make("ChannelKeysUpdateLabel", {
++  payload: { id: Schema.String, label: Schema.String },
++  success: ChannelKeysState,
++})
++
++// 设为激活项。id 不在列表中时静默忽略。
++export const ChannelKeysSetActive = Rpc.make("ChannelKeysSetActive", {
++  payload: { id: Schema.String },
++  success: ChannelKeysState,
++})
++
++// 写入某 key 的可用模型列表缓存。
++export const ChannelKeysSetModels = Rpc.make("ChannelKeysSetModels", {
++  payload: { id: Schema.String, models: Schema.Array(Schema.String) },
++  success: ChannelKeysState,
++})
++
++// [cx] 内置渠道热重载（带拉模型）：新增 key 后调此——主进程拉该 key 的 /v1/models（无 CORS）
++// 落盘，再重写 OPENCODE_CONFIG 文件，内核监听到变更即把该 key 作为 provider 上线。不重启进程。
++export const ChannelConfigRefreshKey = Rpc.make("ChannelConfigRefreshKey", { payload: { id: Schema.String } })
++
++// [cx] 内置渠道热重载（不拉模型）：删除 key 后调此——重写文件，provider 随之消失。
++export const ChannelConfigReload = Rpc.make("ChannelConfigReload")
++
++export const ChannelKeysRpcs = RpcGroup.make(
++  ChannelKeysList,
++  ChannelKeysAdd,
++  ChannelKeysRemove,
++  ChannelKeysUpdateLabel,
++  ChannelKeysSetActive,
++  ChannelKeysSetModels,
++  ChannelConfigRefreshKey,
++  ChannelConfigReload,
++)

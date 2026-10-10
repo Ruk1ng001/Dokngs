@@ -1,32 +1,193 @@
-diff --git a/packages/app/src/app.tsx b/packages/app/src/app.tsx
-index f47c432e42..d92273082b 100644
---- a/packages/app/src/app.tsx
-+++ b/packages/app/src/app.tsx
-@@ -633,6 +633,10 @@ function Routes(props: { serverScoped?: JSX.Element }) {
-         <Route path="/server/:serverKey/session/:id" component={TargetSessionRoute} />
-       </Show>
-       <Route path="/new-session" component={DraftRoute} />
-+      {/* [dokng] 画布嵌入页（需求 #5 保活）：路由本身只是空占位，让 /canvas URL 生效；
-+          真正的画布 iframe 由 NewLayout 里常驻挂载的 <CanvasHost/> 渲染——切走只隐藏、
-+          切回不重载，iframe 内部状态（画布内容 / 滚动 / 输入）全部保留。 */}
-+      <Route path="/canvas" component={() => null} />
-     </>
-   )
- }
+diff --git a/packages/app/src/canvas/host.tsx b/packages/app/src/canvas/host.tsx
+new file mode 100644
+index 0000000000..8423dedf6c
+--- /dev/null
++++ b/packages/app/src/canvas/host.tsx
+@@ -0,0 +1,167 @@
++// [dokng] 画布内嵌宿主（待办 4 + 页面保活）。
++//
++// infinite-canvas（React 19 SPA）与宿主（SolidJS）框架异构，不能当组件嵌，只能 <iframe> 隔离。
++// 画布产物构建期以 VITE_BASE=/canvas/ 打包、拷进 desktop 的 out/renderer/canvas/，经 oc:// 特权协议
++// （已白名单整个 out/renderer 子树）以 oc://renderer/canvas/index.html 加载，主进程/preload/协议零改。
++//
++// —— 页面保活（keep-alive）——
++// 本组件不再作为 /canvas 路由页渲染（那样切走即卸载、iframe 重建、画布内容与状态全丢）。
++// 改为常驻挂载在 Shell 的 <main> 内容区（Titlebar 下方、跨路由不卸载的外壳）里，用 absolute
++// inset-0 填满内容区承载：靠 useLocation() 判断是否在 /canvas，只切 display 显隐、绝不卸载 iframe。
++// 首次进入 /canvas 才创建 iframe（懒挂载：没进过画布就不加载画布资源）；之后 iframe 常驻内存，
++// 从画布切到别的页面再切回来，画布内容 / 缩放 / 选中态 / 未保存编辑全部原样保留。
++//
++// —— 顶栏 ——
++// 画布只占 Titlebar 下方内容区、不盖顶栏，故壳的 Titlebar（会话 tab 条 + palette 画布入口 +
++// 账户按钮）在画布内全程可见，来回切会话/画布都方便，无需再补返回/账户极简栏。切回会话点会话
++// tab 即可；开账户 / 切四槽位模型走 Titlebar 右侧账户按钮（CxAccountLauncher）。
++//
++// 本组件职责：
++//   1. 渲染填满内容区的 <iframe src="oc://renderer/canvas/index.html">（absolute inset-0，不盖 Titlebar）。
++//   2. 把账户面板选中的 key（四槽位 image/video/text/audio）合成 channel 数组，postMessage 投给画布。
++//      投递时机：① 画布发来 dokng:canvas-ready 握手回执后立即投；② 槽位/模型变化时重投（createEffect）。
++//   3. targetOrigin 严格限 oc://renderer，杜绝把 key 投给非宿主 origin。
++//
++// 全部仅 desktop 生效（key 来自 desktop preload 的 window.api）；非 desktop 时进入 /canvas 显示占位提示。
++
++import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
++import { useLocation, useNavigate } from "@solidjs/router"
++import { Icon } from "@opencode/ui/icon"
++import { IconButton } from "@opencode/ui/icon-button"
++import { usePlatform } from "@/runtime/platform/platform"
++import { loadChannelState, resolveKeyList, type ResolvedKey } from "@/components/cx-account/cx-account-api"
++import {
++  buildCanvasPayload,
++  canvasAudioKeyId,
++  canvasImageKeyId,
++  canvasModelsVersion,
++  canvasTextKeyId,
++  canvasVideoKeyId,
++} from "@/components/cx-account/cx-canvas-slots"
++
++// 画布产物在 oc://renderer/canvas/ 下的入口；协议层已白名单 out/renderer 全子树。
++const CANVAS_SRC = "oc://renderer/canvas/index.html"
++// 画布 iframe 的 origin（oc 协议 + host=renderer）；postMessage 双向都严格用它，不用 "*"。
++const CANVAS_ORIGIN = "oc://renderer"
++// 画布路由路径：常驻宿主靠它切显隐。
++const CANVAS_PATH = "/canvas"
++
++export default function CanvasHost() {
++  const platform = usePlatform()
++  const navigate = useNavigate()
++  const location = useLocation()
++
++  // 是否处于画布路由（决定覆盖层显隐）。
++  const isCanvas = createMemo(() => location.pathname === CANVAS_PATH)
++
++  // 懒挂载：首次进入 /canvas 才创建 iframe；一旦创建就常驻（保活的关键——之后只切显隐不卸载）。
++  const [mounted, setMounted] = createSignal(false)
++  createEffect(() => {
++    if (isCanvas()) setMounted(true)
++  })
++
++  // 返回：优先浏览器历史回退（保留来源上下文），无历史时兜底回根路由。
++  // 保活下导航走后 iframe 只是 display:none、不卸载，画布状态全留。
++  const goBack = () => {
++    if (window.history.length > 1) navigate(-1)
++    else navigate("/")
++  }
++
++  // 非 desktop：画布依赖 desktop 侧渠道 key。仅在进入 /canvas 时显示占位，其余时候不渲染任何东西。
++  if (platform.platform !== "desktop") {
++    return (
++      <Show when={isCanvas()}>
++        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-v2-background-bg-deep text-v2-text-text-muted">
++          <span>画布仅在桌面客户端可用。</span>
++          <IconButton
++            type="button"
++            variant="neutral"
++            size="small"
++            icon={<Icon name="arrow-left" size="small" />}
++            onClick={goBack}
++            aria-label="返回"
++          />
++        </div>
++      </Show>
++    )
++  }
++
++  let iframeRef: HTMLIFrameElement | undefined
++  const [keys, setKeys] = createSignal<ResolvedKey[]>([])
++  const [ready, setReady] = createSignal(false)
++
++  // 向画布 iframe 投递当前槽位合成的渠道配置。画布未 ready 时不投（等握手），避免早投丢失。
++  const post = () => {
++    const win = iframeRef?.contentWindow
++    if (!win || !ready()) return
++    const payload = buildCanvasPayload(keys(), canvasImageKeyId(), canvasVideoKeyId(), canvasTextKeyId(), canvasAudioKeyId())
++    win.postMessage(payload, CANVAS_ORIGIN)
++  }
++
++  // [dokng] 从本地 store 重新拉 key 列表（含账户面板选槽位时按需拉取并落盘的最新 models），
++  // 再触发重投。账户面板 bumpCanvasModels() 后经 canvasModelsVersion 订阅走到这里，确保画布
++  // 拿到刚落盘的模型（onMount 的一次性快照读不到之后缓存的 models）。
++  const refreshKeys = () => {
++    void loadChannelState().then((state) => setKeys(resolveKeyList(state)))
++  }
++
++  onMount(() => {
++    // 加载本地 key 列表（供合成 payload）。异步、失败返回空列表，不抛出。
++    refreshKeys()
++
++    // 画布就绪握手：收到 dokng:canvas-ready 才认为可投递（画布 listener 已挂好）。
++    const onMessage = (event: MessageEvent) => {
++      if (event.origin !== CANVAS_ORIGIN) return
++      const data = event.data as { type?: unknown } | null
++      if (!data || typeof data !== "object") return
++      if (data.type === "dokng:canvas-ready") {
++        setReady(true)
++        post()
++      }
++    }
++    window.addEventListener("message", onMessage)
++    onCleanup(() => window.removeEventListener("message", onMessage))
++  })
++
++  // 账户面板选槽位按需拉到新 models 后 bump 版本 → 这里重新读 store 拿最新 models。
++  // 与下方重投 effect 分离：本 effect 只负责刷新 keys（刷新完 keys() 变化会自然触发重投）。
++  createEffect(() => {
++    void canvasModelsVersion()
++    refreshKeys()
++  })
++
++  // 槽位变化或 key 列表加载完成后重投（画布已 ready 时才实际发送）。
++  createEffect(() => {
++    // 显式订阅四槽位信号 + key 列表 + ready，任一变化触发重投。
++    void canvasImageKeyId()
++    void canvasVideoKeyId()
++    void canvasTextKeyId()
++    void canvasAudioKeyId()
++    void keys()
++    void ready()
++    post()
++  })
++
++  // 常驻内容区层：mounted 前不渲染 iframe（省资源）；mounted 后常驻，靠 isCanvas 切 display。
++  // 挂在 Shell 的 <main> 内容区（Titlebar 下方），用 absolute inset-0 填满内容区、不盖
++  // Titlebar，故壳顶栏（会话 tab + palette 画布入口 + 账户按钮）画布内全程可见，切会话/画布都方便。
++  // 无需再补返回/账户极简栏，也无需避让 macOS 红绿灯（红绿灯落在常驻可见的 Titlebar 上）。
++  return (
++    <Show when={mounted()}>
++      <div
++        class="absolute inset-0 z-10 flex flex-col bg-v2-background-bg-deep"
++        style={{ display: isCanvas() ? undefined : "none" }}
++        aria-hidden={isCanvas() ? undefined : "true"}
++      >
++        <iframe
++          ref={iframeRef}
++          src={CANVAS_SRC}
++          title="画布"
++          class="flex-1 min-h-0 min-w-0 w-full border-0"
++          // 沙箱：允许脚本 / 同源（IndexedDB 持久化画布数据）/ 弹窗 / 下载（导出图片）。
++          sandbox="allow-scripts allow-same-origin allow-popups allow-downloads allow-forms"
++        />
++      </div>
++    </Show>
++  )
++}
 diff --git a/packages/app/src/components/cx-account/cx-account-dialog.tsx b/packages/app/src/components/cx-account/cx-account-dialog.tsx
-index 0073fb3cf1..05fd059e65 100644
+index fa8bfc5d46..9b13b06044 100644
 --- a/packages/app/src/components/cx-account/cx-account-dialog.tsx
 +++ b/packages/app/src/components/cx-account/cx-account-dialog.tsx
-@@ -10,7 +10,7 @@
+@@ -11,9 +11,9 @@
  //
  // 低冲突：独立目录 packages/app/src/components/cx-account/，全部 Cx 前缀，对上游现有文件零改动。
  
 -import { createSignal, onMount, For, Show, Switch, Match } from "solid-js"
 +import { createSignal, onCleanup, onMount, For, Show, Switch, Match } from "solid-js"
- import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
- import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
- import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
-@@ -44,6 +44,19 @@ import {
+ // [cx] 上游 v2 把 v1/v2 两条组件轨合并进 @opencode/ui：路径去掉 /v2 段，组件名去掉 V2 后缀
+-// （ButtonV2→Button、TextInputV2→TextInput、IconButtonV2→IconButton、TooltipV2→Tooltip），
++// （Button→Button、TextInput→TextInput、IconButton→IconButton、Tooltip→Tooltip），
+ // badge-v2 的 Tag 并入 ./badge 的 Badge（渲染出的 data-component="tag" 不变，css 选择器无需改）。
+ // props 面逐一核对过，与 v1 的 v2 轨一致（size/variant/placement/fit/closeLabel 全部保留）。
+ import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode/ui/dialog"
+@@ -49,6 +49,19 @@ import {
    type KeyProfileState,
    type ResolvedKey,
  } from "./cx-account-api"
@@ -46,7 +207,7 @@ index 0073fb3cf1..05fd059e65 100644
  
  // [cx] US-008/US-009: 单条 key 列表项。按各自 key 独立展示 profile（loading/error/ready）；点击整行
  // 切换激活，选中态由背景与强调边框表达，操作区只保留编辑 label / 删除（builtin 条目不可管理）。
-@@ -54,6 +67,20 @@ function KeyCard(props: {
+@@ -59,6 +72,20 @@ function KeyCard(props: {
    onActivate: (entry: ResolvedKey) => void
    onSaveLabel: (id: string, label: string) => void
    onRemove: (id: string) => void
@@ -67,7 +228,7 @@ index 0073fb3cf1..05fd059e65 100644
  }) {
    const state = () => props.state ?? ({ status: "loading" } as KeyProfileState)
    const [editing, setEditing] = createSignal(false)
-@@ -197,6 +224,54 @@ function KeyCard(props: {
+@@ -202,6 +229,54 @@ function KeyCard(props: {
              </div>
            </Show>
          </div>
@@ -81,48 +242,48 @@ index 0073fb3cf1..05fd059e65 100644
 +            stopPropagation 阻止冒泡到卡片整行的切换激活。 */}
 +        <Show when={manageable() && !editing() && !confirmingDelete()}>
 +          <div data-slot="cx-canvas-slots" onClick={(e) => e.stopPropagation()}>
-+            <TooltipV2 value={props.isImageSlot ? "取消生图渠道" : "以此 key 启动生图"} placement="top">
-+              <IconButtonV2
++            <Tooltip value={props.isImageSlot ? "取消生图渠道" : "以此 key 启动生图"} placement="top">
++              <IconButton
 +                aria-label={props.isImageSlot ? "取消生图渠道" : "以此 key 启动生图"}
 +                variant={props.isImageSlot ? "contrast" : "neutral"}
 +                size="small"
 +                onClick={() => props.onToggleImageSlot(props.entry.id)}
 +                icon={<Icon name="canvas-image" size="small" />}
 +              />
-+            </TooltipV2>
-+            <TooltipV2 value={props.isVideoSlot ? "取消视频渠道" : "以此 key 启动视频"} placement="top">
-+              <IconButtonV2
++            </Tooltip>
++            <Tooltip value={props.isVideoSlot ? "取消视频渠道" : "以此 key 启动视频"} placement="top">
++              <IconButton
 +                aria-label={props.isVideoSlot ? "取消视频渠道" : "以此 key 启动视频"}
 +                variant={props.isVideoSlot ? "contrast" : "neutral"}
 +                size="small"
 +                onClick={() => props.onToggleVideoSlot(props.entry.id)}
 +                icon={<Icon name="canvas-video" size="small" />}
 +              />
-+            </TooltipV2>
-+            <TooltipV2 value={props.isTextSlot ? "取消文本渠道" : "以此 key 启动文本"} placement="top">
-+              <IconButtonV2
++            </Tooltip>
++            <Tooltip value={props.isTextSlot ? "取消文本渠道" : "以此 key 启动文本"} placement="top">
++              <IconButton
 +                aria-label={props.isTextSlot ? "取消文本渠道" : "以此 key 启动文本"}
 +                variant={props.isTextSlot ? "contrast" : "neutral"}
 +                size="small"
 +                onClick={() => props.onToggleTextSlot(props.entry.id)}
 +                icon={<Icon name="canvas-text" size="small" />}
 +              />
-+            </TooltipV2>
-+            <TooltipV2 value={props.isAudioSlot ? "取消音频渠道" : "以此 key 启动音频"} placement="top">
-+              <IconButtonV2
++            </Tooltip>
++            <Tooltip value={props.isAudioSlot ? "取消音频渠道" : "以此 key 启动音频"} placement="top">
++              <IconButton
 +                aria-label={props.isAudioSlot ? "取消音频渠道" : "以此 key 启动音频"}
 +                variant={props.isAudioSlot ? "contrast" : "neutral"}
 +                size="small"
 +                onClick={() => props.onToggleAudioSlot(props.entry.id)}
 +                icon={<Icon name="canvas-audio" size="small" />}
 +              />
-+            </TooltipV2>
++            </Tooltip>
 +          </div>
 +        </Show>
        </header>
  
        <Switch>
-@@ -212,7 +287,23 @@ function KeyCard(props: {
+@@ -217,7 +292,23 @@ function KeyCard(props: {
            when={state().status === "error" ? (state() as Extract<KeyProfileState, { status: "error" }>) : undefined}
            keyed
          >
@@ -147,7 +308,7 @@ index 0073fb3cf1..05fd059e65 100644
          </Match>
  
          <Match
-@@ -274,22 +365,42 @@ function KeyCard(props: {
+@@ -279,22 +370,42 @@ function KeyCard(props: {
          </Match>
        </Switch>
  
@@ -161,24 +322,24 @@ index 0073fb3cf1..05fd059e65 100644
            <Show
              when={editing()}
              fallback={
--              <TooltipV2 value="编辑名称" placement="top">
--                <IconButtonV2
+-              <Tooltip value="编辑名称" placement="top">
+-                <IconButton
 -                  aria-label="编辑名称"
 -                  variant="neutral"
 -                  size="small"
 -                  onClick={startEdit}
 -                  icon={<Icon name="edit" size="small" />}
 -                />
--              </TooltipV2>
+-              </Tooltip>
 +              <>
 +                {/* [dokng] 刷新模型：对该 key 强制重拉 /v1/models（复用主进程 channelConfigRefreshKey，
 +                    无 CORS）→ 落盘 → 热重载内核 provider → reloadKeys 读回 → bump 通知画布重投。
 +                    一次同时刷新「内核会话可选模型」与「画布渠道模型」，解决上游改模型后老 key 不更新。 */}
-+                <TooltipV2
++                <Tooltip
 +                  value={props.refreshingModels ? "正在刷新模型…" : "刷新模型（会短暂重载内核，请在会话空闲时操作）"}
 +                  placement="top"
 +                >
-+                  <IconButtonV2
++                  <IconButton
 +                    aria-label="刷新模型"
 +                    variant="neutral"
 +                    size="small"
@@ -187,21 +348,21 @@ index 0073fb3cf1..05fd059e65 100644
 +                    onClick={() => props.onRefreshModels(props.entry.id)}
 +                    icon={<Icon name="reset" size="small" />}
 +                  />
-+                </TooltipV2>
-+                <TooltipV2 value="编辑名称" placement="top">
-+                  <IconButtonV2
++                </Tooltip>
++                <Tooltip value="编辑名称" placement="top">
++                  <IconButton
 +                    aria-label="编辑名称"
 +                    variant="neutral"
 +                    size="small"
 +                    onClick={startEdit}
 +                    icon={<Icon name="edit" size="small" />}
 +                  />
-+                </TooltipV2>
++                </Tooltip>
 +              </>
              }
            >
-             <TooltipV2 value="保存名称" placement="top">
-@@ -425,8 +536,27 @@ export function CxDialogAccount() {
+             <Tooltip value="保存名称" placement="top">
+@@ -431,8 +542,27 @@ export function CxDialogAccount() {
    const [profiles, setProfiles] = createSignal<Record<string, KeyProfileState>>({})
    const [refreshingIds, setRefreshingIds] = createSignal<Set<string>>(new Set())
    const [switchingId, setSwitchingId] = createSignal<string | null>(null)
@@ -230,7 +391,7 @@ index 0073fb3cf1..05fd059e65 100644
    const requestVersions = new Map<string, number>()
  
    const activeEntry = () => keys().find((k) => k.isActive) ?? keys()[0]
-@@ -495,6 +625,8 @@ export function CxDialogAccount() {
+@@ -501,6 +631,8 @@ export function CxDialogAccount() {
      setProfiles((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => valid.has(id))))
      // [cx] 同步清理已删 key 的缓存快照，避免缓存无限增长 / 下次误填已删 key 的旧数据。
      pruneCachedProfiles(next.map((entry) => entry.id))
@@ -239,7 +400,7 @@ index 0073fb3cf1..05fd059e65 100644
      setInitializing(false)
      if (options.loadMissing) {
        for (const entry of next) {
-@@ -520,7 +652,7 @@ export function CxDialogAccount() {
+@@ -526,7 +658,7 @@ export function CxDialogAccount() {
    // [cx] 未填名称时：新增后用该 key 在 new-api 侧的 token 名称（/api/app/profile 的 token_name）
    // 一次性回填本地 label（后续不再与远端同步）；取名失败 / 远端也没名字时保持「未命名 key」占位。
    async function handleAdd(input: { label: string; key: string; baseURL: string }): Promise<void> {
@@ -248,7 +409,7 @@ index 0073fb3cf1..05fd059e65 100644
      const addKey = cxChannelApi()?.channelKeysAdd
      if (!addKey) throw new Error("当前环境无法保存 Key，请在桌面客户端中重试")
  
-@@ -543,7 +675,7 @@ export function CxDialogAccount() {
+@@ -549,7 +681,7 @@ export function CxDialogAccount() {
  
      // 本地写入成功后立即结束提交，让表单即时收起；远端名称、模型和 profile 在后台同步，
      // 避免网络慢时用户点击「添加」长时间看不到反馈。
@@ -257,7 +418,7 @@ index 0073fb3cf1..05fd059e65 100644
      const entrySnapshot = keys().find((k) => k.id === confirmedId)
      void (async () => {
        if (!input.label.trim() && entrySnapshot) {
-@@ -599,7 +731,7 @@ export function CxDialogAccount() {
+@@ -605,7 +737,7 @@ export function CxDialogAccount() {
    async function handleActivate(entry: ResolvedKey): Promise<void> {
      if (entry.builtin || entry.isActive || switchingId()) return
      setSwitchingId(entry.id)
@@ -266,7 +427,7 @@ index 0073fb3cf1..05fd059e65 100644
      try {
        await cxChannelApi()?.channelKeysSetActive?.(entry.id)
        // 拉该 key 的可用模型并落盘（供 provider 的可选模型）。失败返回空数组，不阻断切换。
-@@ -626,12 +758,65 @@ export function CxDialogAccount() {
+@@ -632,12 +764,65 @@ export function CxDialogAccount() {
        const target = next.find((k) => k.id === entry.id)
        if (target && !profiles()[entry.id]) void loadProfile(target)
      } catch {
@@ -333,21 +494,21 @@ index 0073fb3cf1..05fd059e65 100644
    return (
      <Dialog size="x-large" class="cx-account-dialog">
        <DialogHeader closeLabel="关闭">
-@@ -724,8 +909,12 @@ export function CxDialogAccount() {
+@@ -730,8 +915,12 @@ export function CxDialogAccount() {
                    </Match>
                  </Switch>
                  <div data-slot="cx-dashboard-actions">
--                  <TooltipV2 value="刷新全部账户数据" placement="bottom">
+-                  <Tooltip value="刷新全部账户数据" placement="bottom">
 +                  {/* [cx] 刷新中给出进行中反馈：原先只是 disabled，按钮变灰但没有任何「正在刷新」
 +                      的信号，慢网络下看起来像点击没生效。现在图标旋转 + tooltip 文案同步切换。 */}
-+                  <TooltipV2 value={anyLoading() ? "正在刷新账户数据…" : "刷新全部账户数据"} placement="bottom">
-                     <IconButtonV2
++                  <Tooltip value={anyLoading() ? "正在刷新账户数据…" : "刷新全部账户数据"} placement="bottom">
+                     <IconButton
 +                      data-slot="cx-refresh-button"
 +                      data-spinning={anyLoading() ? "" : undefined}
                        aria-label="刷新全部账户数据"
                        variant="neutral"
                        size="normal"
-@@ -818,8 +1007,17 @@ export function CxDialogAccount() {
+@@ -824,8 +1013,17 @@ export function CxDialogAccount() {
                  )
                })()}
  
@@ -367,7 +528,7 @@ index 0073fb3cf1..05fd059e65 100644
                </Show>
  
                <div data-slot="cx-key-col">
-@@ -849,6 +1047,17 @@ export function CxDialogAccount() {
+@@ -855,6 +1053,17 @@ export function CxDialogAccount() {
                          onActivate={(e) => void handleActivate(e)}
                          onSaveLabel={(id, label) => void handleSaveLabel(id, label)}
                          onRemove={(id) => void handleRemove(id)}
@@ -386,80 +547,65 @@ index 0073fb3cf1..05fd059e65 100644
                      )}
                    </For>
 diff --git a/packages/app/src/components/cx-account/cx-account-launcher.tsx b/packages/app/src/components/cx-account/cx-account-launcher.tsx
-index 2c55b052ae..28b21f853f 100644
+index 69edb58e09..7daf9638d5 100644
 --- a/packages/app/src/components/cx-account/cx-account-launcher.tsx
 +++ b/packages/app/src/components/cx-account/cx-account-launcher.tsx
-@@ -18,6 +18,7 @@
+@@ -20,6 +20,7 @@
+ // （cx.account.open）兜底——垂直标签页是用户主动开启的非默认外观（默认 horizontal）。
  
- import { onMount, Show } from "solid-js"
- import { Portal } from "solid-js/web"
+ import { onMount } from "solid-js"
 +import { useNavigate } from "@solidjs/router"
- import { makeEventListener } from "@solid-primitives/event-listener"
- import { Icon } from "@opencode-ai/ui/icon"
- import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
-@@ -30,6 +31,7 @@ import { deepLinkEvent, drainPendingDeepLinks } from "@/pages/layout/deep-links"
- export function CxAccountLauncher() {
+ import { Icon } from "@opencode/ui/icon"
+ import { IconButton } from "@opencode/ui/icon-button"
+ import { Tooltip } from "@opencode/ui/tooltip"
+@@ -36,6 +37,7 @@ export function CxAccountLauncher() {
    const platform = usePlatform()
    const dialog = useDialog()
+   const command = useCommand()
 +  const navigate = useNavigate()
-   const rightMount = useTitlebarRightMount()
  
-   // 非 desktop（web 等）不渲染任何东西：账户面板依赖 desktop preload 的 window.api。
-@@ -77,22 +79,37 @@ export function CxAccountLauncher() {
-     })
-   })
+   // 非 desktop（web 等）不渲染任何东西：账户面板经 desktop IPC 读写本地 key，web 端无此通道。
+   if (platform.platform !== "desktop") return null
+@@ -72,6 +74,7 @@ export function CxAccountLauncher() {
+       section: "general",
+       onSelect: openAccount,
+     },
++    { id: "cx.canvas.open", title: "画布", section: "general", onSelect: () => navigate("/canvas") },
+   ])
  
--  // 标题栏右侧账户按钮（#opencode-titlebar-right portal，与原生 status popover 同排）。
-+  // 标题栏右侧入口（#opencode-titlebar-right portal，与原生 status popover 同排）：画布 + 账户。
+   onMount(() => {
+@@ -99,6 +102,18 @@ export function CxAccountLauncher() {
+ 
    return (
-     <Show when={rightMount()}>
-       {(mount) => (
-         <Portal mount={mount()}>
--          <TooltipV2 placement="bottom" value="账户">
--            <IconButtonV2
--              type="button"
--              variant="ghost-muted"
--              size="large"
--              class="shrink-0"
--              icon={<Icon name="user" />}
--              onClick={openAccount}
--              aria-label="账户"
--            />
--          </TooltipV2>
-+          {/* 显式横向容器：不依赖 Portal 父级或 TooltipV2 trigger 的默认排布（真机曾上下堆叠）。
-+              左画布、右账户，同排。 */}
-+          <div class="flex items-center gap-1 shrink-0">
-+            <TooltipV2 placement="bottom" value="画布">
-+              <IconButtonV2
-+                type="button"
-+                variant="ghost-muted"
-+                size="large"
-+                class="shrink-0"
-+                icon={<Icon name="palette" />}
-+                onClick={() => navigate("/canvas")}
-+                aria-label="画布"
-+              />
-+            </TooltipV2>
-+            <TooltipV2 placement="bottom" value="账户">
-+              <IconButtonV2
-+                type="button"
-+                variant="ghost-muted"
-+                size="large"
-+                class="shrink-0"
-+                icon={<Icon name="user" />}
-+                onClick={openAccount}
-+                aria-label="账户"
-+              />
-+            </TooltipV2>
-+          </div>
-         </Portal>
-       )}
-     </Show>
+     <TitlebarRight>
++      <div class="flex items-center gap-1 shrink-0">
++        <Tooltip placement="bottom" value="画布">
++          <IconButton
++            type="button"
++            variant="ghost-muted"
++            size="large"
++            class="shrink-0"
++            icon={<Icon name="palette" />}
++            onClick={() => navigate("/canvas")}
++            aria-label="画布"
++          />
++        </Tooltip>
+       <Tooltip placement="bottom" value={ACCOUNT_LABEL}>
+         <IconButton
+           type="button"
+@@ -110,6 +125,7 @@ export function CxAccountLauncher() {
+           aria-label={ACCOUNT_LABEL}
+         />
+       </Tooltip>
++      </div>
+     </TitlebarRight>
+   )
+ }
 diff --git a/packages/app/src/components/cx-account/cx-account.css b/packages/app/src/components/cx-account/cx-account.css
-index f073cd07f1..e8e5351c0d 100644
+index 70e6506d8e..d4f8975696 100644
 --- a/packages/app/src/components/cx-account/cx-account.css
 +++ b/packages/app/src/components/cx-account/cx-account.css
-@@ -276,6 +276,44 @@
+@@ -279,6 +279,44 @@
    box-shadow: var(--v2-elevation-overlay);
    color: var(--v2-text-text-base);
    font-size: 12px;
@@ -504,7 +650,7 @@ index f073cd07f1..e8e5351c0d 100644
  }
  
  .cx-account-body [data-slot="cx-key-col"] {
-@@ -432,6 +470,26 @@
+@@ -435,6 +473,26 @@
    gap: 8px;
  }
  
@@ -531,7 +677,7 @@ index f073cd07f1..e8e5351c0d 100644
  .cx-account-body [data-slot="cx-key-card-title"] {
    min-width: 0;
    flex: 1;
-@@ -565,9 +623,14 @@
+@@ -568,9 +626,14 @@
    background: var(--v2-background-bg-accent);
  }
  
@@ -546,7 +692,7 @@ index f073cd07f1..e8e5351c0d 100644
    overflow: hidden;
    color: var(--v2-text-text-faint);
    font-size: 11px;
-@@ -575,6 +638,40 @@
+@@ -578,6 +641,40 @@
    white-space: nowrap;
  }
  
@@ -587,7 +733,7 @@ index f073cd07f1..e8e5351c0d 100644
  .cx-account-body [data-slot="cx-key-actions"] {
    justify-content: flex-end;
    gap: 4px;
-@@ -583,6 +680,24 @@
+@@ -586,6 +683,24 @@
    transition: opacity 120ms ease;
  }
  
@@ -891,209 +1037,81 @@ index 0000000000..c3b205a8b0
 +    audioModel: pick("audio"),
 +  }
 +}
-diff --git a/packages/app/src/pages/canvas-embed.tsx b/packages/app/src/pages/canvas-embed.tsx
-new file mode 100644
-index 0000000000..05f6175b26
---- /dev/null
-+++ b/packages/app/src/pages/canvas-embed.tsx
-@@ -0,0 +1,167 @@
-+// [dokng] 画布内嵌宿主（待办 4 + 页面保活）。
-+//
-+// infinite-canvas（React 19 SPA）与宿主（SolidJS）框架异构，不能当组件嵌，只能 <iframe> 隔离。
-+// 画布产物构建期以 VITE_BASE=/canvas/ 打包、拷进 desktop 的 out/renderer/canvas/，经 oc:// 特权协议
-+// （已白名单整个 out/renderer 子树）以 oc://renderer/canvas/index.html 加载，主进程/preload/协议零改。
-+//
-+// —— 页面保活（keep-alive）——
-+// 本组件不再作为 /canvas 路由页渲染（那样切走即卸载、iframe 重建、画布内容与状态全丢）。
-+// 改为常驻挂载在 NewLayout 的 <main> 内容区（Titlebar 下方、跨路由不卸载的外壳）里，用 absolute
-+// inset-0 填满内容区承载：靠 useLocation() 判断是否在 /canvas，只切 display 显隐、绝不卸载 iframe。
-+// 首次进入 /canvas 才创建 iframe（懒挂载：没进过画布就不加载画布资源）；之后 iframe 常驻内存，
-+// 从画布切到别的页面再切回来，画布内容 / 缩放 / 选中态 / 未保存编辑全部原样保留。
-+//
-+// —— 顶栏 ——
-+// 画布只占 Titlebar 下方内容区、不盖顶栏，故壳的 Titlebar（会话 tab 条 + palette 画布入口 +
-+// 账户按钮）在画布内全程可见，来回切会话/画布都方便，无需再补返回/账户极简栏。切回会话点会话
-+// tab 即可；开账户 / 切四槽位模型走 Titlebar 右侧账户按钮（CxAccountLauncher）。
-+//
-+// 本组件职责：
-+//   1. 渲染填满内容区的 <iframe src="oc://renderer/canvas/index.html">（absolute inset-0，不盖 Titlebar）。
-+//   2. 把账户面板选中的 key（四槽位 image/video/text/audio）合成 channel 数组，postMessage 投给画布。
-+//      投递时机：① 画布发来 dokng:canvas-ready 握手回执后立即投；② 槽位/模型变化时重投（createEffect）。
-+//   3. targetOrigin 严格限 oc://renderer，杜绝把 key 投给非宿主 origin。
-+//
-+// 全部仅 desktop 生效（key 来自 desktop preload 的 window.api）；非 desktop 时进入 /canvas 显示占位提示。
-+
-+import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
-+import { useLocation, useNavigate } from "@solidjs/router"
-+import { Icon } from "@opencode-ai/ui/icon"
-+import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
-+import { usePlatform } from "@/context/platform"
-+import { loadChannelState, resolveKeyList, type ResolvedKey } from "@/components/cx-account/cx-account-api"
-+import {
-+  buildCanvasPayload,
-+  canvasAudioKeyId,
-+  canvasImageKeyId,
-+  canvasModelsVersion,
-+  canvasTextKeyId,
-+  canvasVideoKeyId,
-+} from "@/components/cx-account/cx-canvas-slots"
-+
-+// 画布产物在 oc://renderer/canvas/ 下的入口；协议层已白名单 out/renderer 全子树。
-+const CANVAS_SRC = "oc://renderer/canvas/index.html"
-+// 画布 iframe 的 origin（oc 协议 + host=renderer）；postMessage 双向都严格用它，不用 "*"。
-+const CANVAS_ORIGIN = "oc://renderer"
-+// 画布路由路径：常驻宿主靠它切显隐。
-+const CANVAS_PATH = "/canvas"
-+
-+export default function CanvasHost() {
-+  const platform = usePlatform()
-+  const navigate = useNavigate()
-+  const location = useLocation()
-+
-+  // 是否处于画布路由（决定覆盖层显隐）。
-+  const isCanvas = createMemo(() => location.pathname === CANVAS_PATH)
-+
-+  // 懒挂载：首次进入 /canvas 才创建 iframe；一旦创建就常驻（保活的关键——之后只切显隐不卸载）。
-+  const [mounted, setMounted] = createSignal(false)
-+  createEffect(() => {
-+    if (isCanvas()) setMounted(true)
-+  })
-+
-+  // 返回：优先浏览器历史回退（保留来源上下文），无历史时兜底回根路由。
-+  // 保活下导航走后 iframe 只是 display:none、不卸载，画布状态全留。
-+  const goBack = () => {
-+    if (window.history.length > 1) navigate(-1)
-+    else navigate("/")
-+  }
-+
-+  // 非 desktop：画布依赖 desktop 侧渠道 key。仅在进入 /canvas 时显示占位，其余时候不渲染任何东西。
-+  if (platform.platform !== "desktop") {
-+    return (
-+      <Show when={isCanvas()}>
-+        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-v2-background-bg-deep text-v2-text-text-muted">
-+          <span>画布仅在桌面客户端可用。</span>
-+          <IconButtonV2
-+            type="button"
-+            variant="neutral"
-+            size="small"
-+            icon={<Icon name="arrow-left" size="small" />}
-+            onClick={goBack}
-+            aria-label="返回"
-+          />
-+        </div>
-+      </Show>
-+    )
-+  }
-+
-+  let iframeRef: HTMLIFrameElement | undefined
-+  const [keys, setKeys] = createSignal<ResolvedKey[]>([])
-+  const [ready, setReady] = createSignal(false)
-+
-+  // 向画布 iframe 投递当前槽位合成的渠道配置。画布未 ready 时不投（等握手），避免早投丢失。
-+  const post = () => {
-+    const win = iframeRef?.contentWindow
-+    if (!win || !ready()) return
-+    const payload = buildCanvasPayload(keys(), canvasImageKeyId(), canvasVideoKeyId(), canvasTextKeyId(), canvasAudioKeyId())
-+    win.postMessage(payload, CANVAS_ORIGIN)
-+  }
-+
-+  // [dokng] 从本地 store 重新拉 key 列表（含账户面板选槽位时按需拉取并落盘的最新 models），
-+  // 再触发重投。账户面板 bumpCanvasModels() 后经 canvasModelsVersion 订阅走到这里，确保画布
-+  // 拿到刚落盘的模型（onMount 的一次性快照读不到之后缓存的 models）。
-+  const refreshKeys = () => {
-+    void loadChannelState().then((state) => setKeys(resolveKeyList(state)))
-+  }
-+
-+  onMount(() => {
-+    // 加载本地 key 列表（供合成 payload）。异步、失败返回空列表，不抛出。
-+    refreshKeys()
-+
-+    // 画布就绪握手：收到 dokng:canvas-ready 才认为可投递（画布 listener 已挂好）。
-+    const onMessage = (event: MessageEvent) => {
-+      if (event.origin !== CANVAS_ORIGIN) return
-+      const data = event.data as { type?: unknown } | null
-+      if (!data || typeof data !== "object") return
-+      if (data.type === "dokng:canvas-ready") {
-+        setReady(true)
-+        post()
-+      }
-+    }
-+    window.addEventListener("message", onMessage)
-+    onCleanup(() => window.removeEventListener("message", onMessage))
-+  })
-+
-+  // 账户面板选槽位按需拉到新 models 后 bump 版本 → 这里重新读 store 拿最新 models。
-+  // 与下方重投 effect 分离：本 effect 只负责刷新 keys（刷新完 keys() 变化会自然触发重投）。
-+  createEffect(() => {
-+    void canvasModelsVersion()
-+    refreshKeys()
-+  })
-+
-+  // 槽位变化或 key 列表加载完成后重投（画布已 ready 时才实际发送）。
-+  createEffect(() => {
-+    // 显式订阅四槽位信号 + key 列表 + ready，任一变化触发重投。
-+    void canvasImageKeyId()
-+    void canvasVideoKeyId()
-+    void canvasTextKeyId()
-+    void canvasAudioKeyId()
-+    void keys()
-+    void ready()
-+    post()
-+  })
-+
-+  // 常驻内容区层：mounted 前不渲染 iframe（省资源）；mounted 后常驻，靠 isCanvas 切 display。
-+  // 挂在 NewLayout 的 <main> 内容区（Titlebar 下方），用 absolute inset-0 填满内容区、不盖
-+  // Titlebar，故壳顶栏（会话 tab + palette 画布入口 + 账户按钮）画布内全程可见，切会话/画布都方便。
-+  // 无需再补返回/账户极简栏，也无需避让 macOS 红绿灯（红绿灯落在常驻可见的 Titlebar 上）。
-+  return (
-+    <Show when={mounted()}>
-+      <div
-+        class="absolute inset-0 z-10 flex flex-col bg-v2-background-bg-deep"
-+        style={{ display: isCanvas() ? undefined : "none" }}
-+        aria-hidden={isCanvas() ? undefined : "true"}
-+      >
-+        <iframe
-+          ref={iframeRef}
-+          src={CANVAS_SRC}
-+          title="画布"
-+          class="flex-1 min-h-0 min-w-0 w-full border-0"
-+          // 沙箱：允许脚本 / 同源（IndexedDB 持久化画布数据）/ 弹窗 / 下载（导出图片）。
-+          sandbox="allow-scripts allow-same-origin allow-popups allow-downloads allow-forms"
-+        />
-+      </div>
-+    </Show>
-+  )
-+}
-diff --git a/packages/app/src/pages/layout-new.tsx b/packages/app/src/pages/layout-new.tsx
-index 3e0f98f5e3..e9c8281e52 100644
---- a/packages/app/src/pages/layout-new.tsx
-+++ b/packages/app/src/pages/layout-new.tsx
-@@ -9,6 +9,10 @@ import { setNavigate } from "@/utils/notification-click"
- import { setV2Toast, ToastRegion } from "@/utils/toast"
- // [cx] 新布局账户面板接线（标题栏账户按钮 + dokng:// 深链 + 首启无 key 引导）。见 07 补丁。
+diff --git a/packages/app/src/shell/routes/routes.tsx b/packages/app/src/shell/routes/routes.tsx
+index 33b0058940..7d75598370 100644
+--- a/packages/app/src/shell/routes/routes.tsx
++++ b/packages/app/src/shell/routes/routes.tsx
+@@ -45,6 +45,8 @@ export function AppRoutes() {
+     <Route component={AppLayout}>
+       <Route path="/" component={Home} />
+       <Route path="/settings" component={SettingsScreen} />
++      {/* The persistent canvas host lives in Shell so navigation preserves the iframe. */}
++      <Route path="/canvas" component={() => null} />
+       <Route
+         path="/server/:serverKey/session/:id"
+         component={() => (
+diff --git a/packages/app/src/shell/shell.tsx b/packages/app/src/shell/shell.tsx
+index b2592bc801..77763136d9 100644
+--- a/packages/app/src/shell/shell.tsx
++++ b/packages/app/src/shell/shell.tsx
+@@ -12,6 +12,7 @@ import { useSettings } from "@/settings/model"
+ import { ExtensionServerCover } from "@/runtime/extension/server-shell"
+ import { ExtensionSlot } from "@/runtime/extension/render"
+ // [cx] 账户面板接线（标题栏账户按钮 + dokng:// 深链 + 首启无 key 引导）。见 07 补丁。
++import CanvasHost from "@/canvas/host"
  import { CxAccountLauncher } from "@/components/cx-account/cx-account-launcher"
-+// [dokng] 画布常驻宿主（需求 #5 保活）：iframe 挂在 NewLayout（跨路由不卸载），切走只隐藏不卸载。
-+// 必须常驻在树里才能保活，故直接 import（lazy 在此无延迟收益，还需 Suspense 边界）；
-+// iframe 本身由组件内 mounted 信号 gate，首次进 /canvas 才真正创建、之后常驻内存。
-+import CanvasHost from "@/pages/canvas-embed"
  
- export default function NewLayout(props: ParentProps) {
-   const platform = usePlatform()
-@@ -46,8 +50,13 @@ export default function NewLayout(props: ParentProps) {
-       />
-       {/* [cx] 账户入口 + dokng:// 深链 + 首启引导（组件内部自判 desktop，非 desktop 渲染 null）。 */}
-       <CxAccountLauncher />
--      <main class="flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-strict">
-+      <main class="relative flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-strict">
-         <Suspense>{props.children}</Suspense>
-+        {/* [dokng] 画布常驻宿主（需求 #5 保活）：挂在 main 内容区（Titlebar 下方），用 absolute
-+            inset-0 填满内容区、不盖 Titlebar，故壳顶栏（会话 tab + palette 画布入口 + 账户按钮）
-+            画布内全程可见，来回切会话/画布都方便。仅在 /canvas 路由 display 显现，切走只 display:none
-+            不卸载，iframe 与画布状态跨路由保留。仅 desktop 实际渲染。 */}
-+        <CanvasHost />
-       </main>
-       {import.meta.env.DEV && state.debugTools && <DebugBar inline />}
-       <TabsInfoPopup />
+ export default function Layout(props: ParentProps) {
+@@ -75,7 +76,7 @@ export default function Layout(props: ParentProps) {
+           </Show>
+           {/* Size containment collapses percentage-height descendants in WebKit. */}
+           <main
+-            class="flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
++            class="relative flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
+             style={{
+               "padding-top": bottomTitlebar() ? "env(safe-area-inset-top, 0px)" : "0px",
+               "padding-bottom":
+@@ -90,6 +91,7 @@ export default function Layout(props: ParentProps) {
+             <ExtensionServerCover>
+               <Suspense>{props.children}</Suspense>
+             </ExtensionServerCover>
++            <CanvasHost />
+           </main>
+         </div>
+         <ExtensionSlot at="window.bottom" input={{}} />
+diff --git a/packages/app/src/shell/state/layout.tsx b/packages/app/src/shell/state/layout.tsx
+index e696fc1a75..ba3ebff1a7 100644
+--- a/packages/app/src/shell/state/layout.tsx
++++ b/packages/app/src/shell/state/layout.tsx
+@@ -41,6 +41,7 @@ export type TabRegions = {
+ 
+ export type LayoutRoute =
+   | { type: "home" }
++  | { type: "canvas" }
+   | { type: "settings" }
+   | { type: "connect" }
+   | { type: "draft"; draftID: string }
+@@ -51,6 +52,8 @@ export const currentRoute = (pathname: string, search: string): LayoutRoute => {
+ 
+   if (parts.length === 0) return { type: "home" }
+ 
++  if (parts[0] === "canvas") return { type: "canvas" }
++
+   if (parts[0] === "settings") return { type: "settings" }
+ 
+   if (parts[0] === "connect") return { type: "connect" }
+diff --git a/packages/app/src/shell/titlebar/titlebar.tsx b/packages/app/src/shell/titlebar/titlebar.tsx
+index e336df7a3d..b778fc888e 100644
+--- a/packages/app/src/shell/titlebar/titlebar.tsx
++++ b/packages/app/src/shell/titlebar/titlebar.tsx
+@@ -368,6 +368,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                   return
+                 }
+ 
++                case "canvas":
+                 case "settings":
+                 case "connect":
+                 case "home": {
 diff --git a/packages/desktop/scripts/build-canvas.ts b/packages/desktop/scripts/build-canvas.ts
 new file mode 100644
 index 0000000000..33477fbfaf
@@ -1136,25 +1154,37 @@ index 0000000000..33477fbfaf
 +
 +console.log("[dokng] 画布产物构建完成：infinite-canvas/web/dist/")
 diff --git a/packages/desktop/scripts/prebuild.ts b/packages/desktop/scripts/prebuild.ts
-index 636850a387..cd138a6b35 100644
+index ef9e517bfc..16f16af204 100644
 --- a/packages/desktop/scripts/prebuild.ts
 +++ b/packages/desktop/scripts/prebuild.ts
-@@ -9,3 +9,7 @@ await $`bun ./scripts/copy-metainfo.ts ${channel}`
+@@ -20,3 +20,6 @@ if ((channel === "beta" || channel === "prod") && Bun.env.OPENCODE_CLI_DIST) {
+ }
  
- await $`cd ../opencode && bun script/build-node.ts`
- if (channel === "dev") await downloadCliToResources()
+ if (channel === "beta" && !Bun.env.OPENCODE_CLI_DIST) await downloadCliToResources("beta")
 +
-+// [dokng] 画布产物构建（待办 4）：以 VITE_BASE=/canvas/ 构建第二上游 infinite-canvas，
-+// 产出 web/dist/，供 electron.vite 的 dokng:copy-canvas 钩子拷进 out/renderer/canvas/。
++// [dokng] Build the embedded canvas before the renderer copies its assets.
 +await $`bun ./scripts/build-canvas.ts`
-diff --git a/packages/ui/src/v2/components/icon.tsx b/packages/ui/src/v2/components/icon.tsx
-index b22d3140fe..6501f16030 100644
---- a/packages/ui/src/v2/components/icon.tsx
-+++ b/packages/ui/src/v2/components/icon.tsx
-@@ -149,6 +149,27 @@ const icons = {
-     viewBox: "0 0 16 16",
-     body: `<path d="M13.1112 13.5555V14.0555H13.6112V13.5555H13.1112ZM2.889 13.5555H2.389L2.389 14.0555H2.889V13.5555ZM3.38901 5.55546L3.38901 5.05546L2.38901 5.05546L2.38901 5.55546L2.88901 5.55546L3.38901 5.55546ZM14.4446 2.44434H14.9446V1.94434L14.4446 1.94434L14.4446 2.44434ZM14.4446 5.55545L14.4446 6.05545L14.9446 6.05545V5.55545H14.4446ZM1.55566 5.55546L1.05566 5.55545L1.05566 6.05546L1.55566 6.05546L1.55566 5.55546ZM1.5557 2.44436L1.5557 1.94436L1.05571 1.94436L1.0557 2.44435L1.5557 2.44436ZM13.1112 5.55546H12.6112V13.5555H13.1112H13.6112V5.55546H13.1112ZM2.889 13.5555H3.389L3.38901 5.55546L2.88901 5.55546L2.38901 5.55546L2.389 13.5555H2.889ZM14.4446 2.44434H13.9446V5.55545H14.4446H14.9446V2.44434H14.4446ZM1.55566 5.55546L2.05566 5.55547L2.0557 2.44436L1.5557 2.44436L1.0557 2.44435L1.05566 5.55545L1.55566 5.55546ZM6.22234 8.22213V8.72213H9.7779V8.22213V7.72213H6.22234V8.22213ZM13.1112 13.5555V13.0555H2.889V13.5555V14.0555H13.1112V13.5555ZM1.5557 2.44436L1.5557 2.94436L14.4446 2.94434L14.4446 2.44434L14.4446 1.94434L1.5557 1.94436L1.5557 2.44436ZM14.4446 5.55545L14.4446 5.05545L1.55566 5.05546L1.55566 5.55546L1.55566 6.05546L14.4446 6.05545L14.4446 5.55545Z" fill="currentColor"/>`,
-   },
+diff --git a/packages/desktop/src/renderer/window/route-storage.ts b/packages/desktop/src/renderer/window/route-storage.ts
+index 8a1f956cd7..f434c65e28 100644
+--- a/packages/desktop/src/renderer/window/route-storage.ts
++++ b/packages/desktop/src/renderer/window/route-storage.ts
+@@ -20,6 +20,8 @@ export function acceptedLastActiveUrl(value: string | null | undefined) {
+   if (value === "/") return value
+   const path = value?.split(/[?#]/, 1)[0]
+ 
++  if (path === "/canvas") return value ?? "/"
++
+   if (path === "/settings") return value ?? "/"
+ 
+   if (path === "/new-session") return value ?? "/"
+diff --git a/packages/ui/src/icons/catalog.ts b/packages/ui/src/icons/catalog.ts
+index 45bb659329..e98fb0d670 100644
+--- a/packages/ui/src/icons/catalog.ts
++++ b/packages/ui/src/icons/catalog.ts
+@@ -2,6 +2,27 @@ import { additionalIcons, additionalIconViewBox } from "./icon/additional-icons"
+ 
+ // Consumers center the SVG viewport, so each icon must center its artwork within its viewBox.
+ const icons = {
 +  // [dokng] 画布四类模型槽位图标（生图/视频/文本/音频），语义明显区分，见 cx-account-dialog KeyCard。
 +  // 生图：相框 + 山峰 + 太阳（经典图片图标）。
 +  "canvas-image": {
@@ -1176,6 +1206,6 @@ index b22d3140fe..6501f16030 100644
 +    viewBox: "0 0 16 16",
 +    body: `<path d="M3 6.5V9.5M6 4V12M9 5.5V10.5M12 7V9" stroke="currentColor" stroke-linecap="round"/>`,
 +  },
- }
- 
- const spriteID = "opencode-v2-icon-sprite"
+   // [dokng] Account and canvas toolbar artwork.
+   palette: {
+     viewBox: "0 0 20 20",

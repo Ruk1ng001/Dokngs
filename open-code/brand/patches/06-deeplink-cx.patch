@@ -1,15 +1,15 @@
-diff --git a/packages/desktop/src/main/index.ts b/packages/desktop/src/main/index.ts
-index 7fb56391a6..a6831db7dc 100644
---- a/packages/desktop/src/main/index.ts
-+++ b/packages/desktop/src/main/index.ts
-@@ -50,15 +50,18 @@ import { cleanupStoreFiles } from "./store-cleanup"
- import { startBackgroundCli } from "./background-cli"
- import { setNativeTranslations } from "./native-translations"
+diff --git a/packages/desktop/src/main/constants.ts b/packages/desktop/src/main/constants.ts
+index 79972677a1..09c4b15fc0 100644
+--- a/packages/desktop/src/main/constants.ts
++++ b/packages/desktop/src/main/constants.ts
+@@ -8,19 +8,22 @@ export const CHANNEL: Channel = raw === "local" || raw === "dev" || raw === "bet
+ 
+ export const VERSION = app.isPackaged ? app.getVersion() : (process.env.OPENCODE_VERSION ?? app.getVersion())
  
 +// [cx] 品牌改名 Dokng：运行时应用名 / appId 全部平移到品牌值（与 brand/brand.json 的
 +// productName=Dokng、appId=ai.dokng.desktop 一致，也与 electron-builder.brand.ts 打包 appId
 +// 对齐——运行时 appId 决定 userData 目录与自更新身份，必须与打包 appId 相同）。
- const APP_NAMES: Record<string, string> = {
+ const appNames: Record<string, string> = {
 -  dev: "OpenCode Dev",
 -  beta: "OpenCode Beta",
 -  prod: "OpenCode",
@@ -17,7 +17,8 @@ index 7fb56391a6..a6831db7dc 100644
 +  beta: "Dokng Beta",
 +  prod: "Dokng",
  }
- const APP_IDS: Record<string, string> = {
+ 
+ const appIDs: Record<string, string> = {
 -  dev: "ai.opencode.desktop.dev",
 -  beta: "ai.opencode.desktop.beta",
 -  prod: "ai.opencode.desktop",
@@ -25,45 +26,62 @@ index 7fb56391a6..a6831db7dc 100644
 +  beta: "ai.dokng.desktop.beta",
 +  prod: "ai.dokng.desktop",
  }
- const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
- const SIDECAR_VERSION = process.env.OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"
-@@ -122,7 +125,7 @@ const main = Effect.gen(function* () {
  
-   process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
+ // Local renderer/server mode keeps the dev application identity.
+-export const APP_NAME = app.isPackaged ? appNames[CHANNEL] : "OpenCode Dev"
++export const APP_NAME = app.isPackaged ? appNames[CHANNEL] : "Dokng Dev"
  
--  const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
-+  const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.dokng.desktop.dev"
-   const onboardingTestRoot = ((): string | undefined => {
-     if (!TEST_ONBOARDING) return
+-export const APP_ID = app.isPackaged ? appIDs[CHANNEL] : "ai.opencode.desktop.dev"
++export const APP_ID = app.isPackaged ? appIDs[CHANNEL] : "ai.dokng.desktop.dev"
+diff --git a/packages/desktop/src/main/lifecycle/environment.ts b/packages/desktop/src/main/lifecycle/environment.ts
+index 4b9b4e1fd4..3ccc59b653 100644
+--- a/packages/desktop/src/main/lifecycle/environment.ts
++++ b/packages/desktop/src/main/lifecycle/environment.ts
+@@ -37,8 +37,14 @@ export const prepareDesktop = Effect.gen(function* () {
+   const path = yield* Path.Path
+   const paths = yield* DesktopPaths.resolve
  
-@@ -138,7 +141,7 @@ const main = Effect.gen(function* () {
-     process.env.XDG_STATE_HOME = join(root, "state")
-     return root
-   })()
--  app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenCode Dev")
-+  app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "Dokng Dev")
-   app.setAppUserModelId(appId)
-   app.setPath(
-     "userData",
-@@ -203,7 +206,10 @@ const main = Effect.gen(function* () {
-   const shellEnv = preferAppEnv(app.getPath("userData"))
+-  if (app.isPackaged || process.env.OPENCODE_DESKTOP_DISABLE_PROTOCOL_REGISTRATION !== "1")
++  if (app.isPackaged || process.env.OPENCODE_DESKTOP_DISABLE_PROTOCOL_REGISTRATION !== "1") {
+     app.setAsDefaultProtocolClient("opencode")
++    // [cx] US-013: 注册自定义 dokng:// 深链协议（网站「一键导入 key」入口），复用上游同一套
++    // deep-link 分发机制（open-url / second-instance → emitDeepLinks → sendDeepLinks）。
++    // 与上游 opencode:// 共用同一个开关：上游用 OPENCODE_DESKTOP_DISABLE_PROTOCOL_REGISTRATION=1
++    // 让测试/并行安装不抢系统协议注册，dokng:// 没有理由例外。
++    app.setAsDefaultProtocolClient("dokng")
++  }
+   const runFork = Effect.runForkWith(yield* Effect.context())
+   setProtocolReporter((level, message, data) =>
+     runFork(scoped("protocol", level === "error" ? Effect.logError(message, data) : Effect.logWarning(message, data))),
+diff --git a/packages/desktop/src/main/lifecycle/index.ts b/packages/desktop/src/main/lifecycle/index.ts
+index 5ed4fb312b..f58018270b 100644
+--- a/packages/desktop/src/main/lifecycle/index.ts
++++ b/packages/desktop/src/main/lifecycle/index.ts
+@@ -77,7 +77,11 @@ const runtime = Layer.effect(
+     }
  
-   app.on("second-instance", (_event: Event, argv: string[]) => {
--    const urls = argv.filter((arg: string) => arg.startsWith("opencode://"))
-+    // [cx] US-013: 深链一键导入。除上游 opencode:// 外，追加识别本项目自定义的 dokng://
-+    // 协议（网站「一键导入 key」深链）。二者都经既有 emitDeepLinks → sendDeepLinks 送到
-+    // renderer，由 renderer 侧按 scheme 分派（dokng:// 走导入确认流程，见 cx-account-import.tsx）。
-+    const urls = argv.filter((arg: string) => arg.startsWith("opencode://") || arg.startsWith("dokng://"))
-     if (urls.length) {
-       logger.log("deep link received via second-instance", { urls })
-       emitDeepLinks(urls)
-@@ -269,6 +275,9 @@ const main = Effect.gen(function* () {
-     ),
-   )
-   app.setAsDefaultProtocolClient("opencode")
-+  // [cx] US-013: 注册自定义 dokng:// 深链协议（网站「一键导入 key」入口），复用上游同一套
-+  // deep-link 分发机制（open-url / second-instance → emitDeepLinks → sendDeepLinks）。
-+  app.setAsDefaultProtocolClient("dokng")
-   registerRendererProtocol()
-   setDockIcon()
-   const updater = setupAutoUpdater(stopSidecars)
+     const secondInstance = (_event: Event, argv: string[]) => {
+-      const urls = argv.filter((arg) => arg.startsWith("opencode://"))
++      // [cx] US-013: 深链一键导入。除上游 opencode:// 外，追加识别本项目自定义的 dokng://
++      // 协议（网站「一键导入 key」深链）。二者都经既有 emitDeepLinks → sendDeepLinks 送到
++      // renderer，由 renderer 侧按 scheme 分派（dokng:// 走导入确认流程，见 cx-account-import.tsx）。
++      // 注：open-url（macOS）走的是 Electron 按注册协议回调，无需在此过滤，故只改这一处。
++      const urls = argv.filter((arg) => arg.startsWith("opencode://") || arg.startsWith("dokng://"))
+ 
+       if (urls.length) {
+         runFork(Effect.logInfo("deep link received via second-instance", { urls }))
+diff --git a/packages/desktop/src/main/lifecycle/configure.ts b/packages/desktop/src/main/lifecycle/configure.ts
+index 878d184a4f..f67d11253f 100644
+--- a/packages/desktop/src/main/lifecycle/configure.ts
++++ b/packages/desktop/src/main/lifecycle/configure.ts
+@@ -32,6 +32,10 @@ export function configureApplication() {
+   const testRoot = createTestRoot()
+   app.setPath("userData", testRoot ? path.join(testRoot, "desktop") : path.join(app.getPath("appData"), APP_ID))
+ 
++  // [dokng] Namespace the v2 service discovery before the early probe runs. A compatible
++  // upstream service would otherwise be reused without this app's channel environment.
++  if (!testRoot) process.env.XDG_STATE_HOME = app.getPath("userData")
++
+   if (testRoot) {
+     app.setPath("sessionData", path.join(testRoot, "session"))
+ 

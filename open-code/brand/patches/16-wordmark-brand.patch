@@ -1,29 +1,27 @@
-diff --git a/packages/app/src/pages/new-session/new-session-view.tsx b/packages/app/src/pages/new-session/new-session-view.tsx
-index 84c671e140..a3ee429d29 100644
---- a/packages/app/src/pages/new-session/new-session-view.tsx
-+++ b/packages/app/src/pages/new-session/new-session-view.tsx
-@@ -2,8 +2,7 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
- import { Tooltip } from "@opencode-ai/ui/tooltip"
- import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
- import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
--import { WordmarkV2 } from "@opencode-ai/ui/v2/wordmark-v2"
--import { Show, createMemo, createSignal, type Accessor } from "solid-js"
-+import { Show, createMemo, createSignal, createUniqueId, type Accessor } from "solid-js"
- import { createStore } from "solid-js/store"
- import { Portal } from "solid-js/web"
- import createPresence from "solid-presence"
-@@ -26,6 +25,90 @@ import type { NewSessionWorkspaceController } from "./new-session-workspace-cont
+diff --git a/packages/app/src/new-session/wordmark.tsx b/packages/app/src/new-session/wordmark.tsx
+index f691cbe0c2..026a85812e 100644
+--- a/packages/app/src/new-session/wordmark.tsx
++++ b/packages/app/src/new-session/wordmark.tsx
+@@ -1,4 +1,4 @@
+-import { Logo } from "@opencode/ui/logo"
++import { createUniqueId } from "solid-js"
+ import "./wordmark.css"
  
- const providerTipDismissalDuration = 30 * 24 * 60 * 60 * 1000
- 
-+// [cx] 品牌字标：新会话空状态原用上游 @opencode-ai/ui 的 WordmarkV2（"opencode" 六字母
-+// 矢量路径）。11-rebrand 的 i18n 运行时替换只覆盖文案，够不到 SVG 路径，故此处按 14-splash
-+// 同款范式——不动共享 ui 组件（避免影响其它用处），只在唯一引用处内联品牌字标。
-+//
-+// 字形：DOKNG 像素网格（源件 brand/wordmark/wordmark-svg.txt，viewBox 1024×200，每字母
-+// 9列×14行、y 起点 44）。配色融入主题：去掉源件自带的 #0a0a0a 黑底与近黑渐变字，改用
-+// fill=currentColor 继承外层 text-v2-background-bg-inverse（浅色主题深字 / 深色主题浅字），
-+// 并保留上游 opacity 0.6 + 底部渐变淡出遮罩，维持低调水印质感、与上游字标同款。
+ export function NewSessionWordmark() {
+@@ -9,9 +9,86 @@ export function NewSessionWordmark() {
+       class="pointer-events-none mx-auto w-full max-w-[720px] text-v2-background-bg-inverse"
+     >
+       <div data-slot="wordmark-reveal" class="relative mx-auto w-4/5">
+-        <Logo class="block aspect-[720/129] w-full opacity-[0.16]" />
+-        <Logo class="wordmark-shimmer absolute inset-0 aspect-[720/129] w-full" />
++        <WordmarkBrand class="block aspect-[720/129] w-full opacity-[0.16]" />
++        <WordmarkBrand class="wordmark-shimmer absolute inset-0 aspect-[720/129] w-full" />
+       </div>
+     </div>
+   )
+ }
++
++// [dokng] Preserve the branded pixel wordmark inside the v2 reveal and shimmer layers.
 +function WordmarkBrand(props: { class?: string }) {
 +  const mask = createUniqueId()
 +  const maskGradient = createUniqueId()
@@ -99,16 +97,3 @@ index 84c671e140..a3ee429d29 100644
 +    </svg>
 +  )
 +}
-+
- export function NewSessionView(props: {
-   input: NewSessionDraftController["input"]
-   project: PromptProjectController
-@@ -39,7 +122,7 @@ export function NewSessionView(props: {
-       >
-         <div class="absolute inset-x-0 top-[25.375%] flex justify-center px-6">
-           <div class={NEW_SESSION_CONTENT_WIDTH}>
--            <WordmarkV2 class="h-auto w-full text-v2-background-bg-inverse" />
-+            <WordmarkBrand class="h-auto w-full text-v2-background-bg-inverse" />
-             <div class="mt-8 flex flex-col gap-8">
-               <PromptInputV2Composer controller={props.input} />
-               <Show when={props.project.empty()}>

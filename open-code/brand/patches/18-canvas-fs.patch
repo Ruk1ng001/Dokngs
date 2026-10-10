@@ -1,7 +1,7 @@
-diff --git a/packages/app/src/pages/canvas-embed.tsx b/packages/app/src/pages/canvas-embed.tsx
-index 05f6175b26..567ce6a4a3 100644
---- a/packages/app/src/pages/canvas-embed.tsx
-+++ b/packages/app/src/pages/canvas-embed.tsx
+diff --git a/packages/app/src/canvas/host.tsx b/packages/app/src/canvas/host.tsx
+index 8423dedf6c..e1a2b58035 100644
+--- a/packages/app/src/canvas/host.tsx
++++ b/packages/app/src/canvas/host.tsx
 @@ -46,6 +46,64 @@ const CANVAS_ORIGIN = "oc://renderer"
  // 画布路由路径：常驻宿主靠它切显隐。
  const CANVAS_PATH = "/canvas"
@@ -23,7 +23,7 @@ index 05f6175b26..567ce6a4a3 100644
 +
 +// 断言访问器：web 等无 preload 的平台返回 undefined，调用方一律可选链兜底。
 +function canvasFsApi() {
-+  return (window as unknown as { api?: Partial<CanvasFsApi> }).api
++  return (window as unknown as { __cxChannelApi?: Partial<CanvasFsApi> }).__cxChannelApi
 +}
 +
 +// 落盘请求的 op 白名单 → 各自的参数校验与转发。放在宿主而非画布侧：
@@ -104,55 +104,56 @@ index 05f6175b26..567ce6a4a3 100644
        }
      }
      window.addEventListener("message", onMessage)
-diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
-index 96865081f7..8ced760981 100644
---- a/packages/desktop/src/main/ipc.ts
-+++ b/packages/desktop/src/main/ipc.ts
-@@ -26,6 +26,17 @@ import {
- // [cx] 内置渠道热重载：增删 key 后重写 OPENCODE_CONFIG 文件 + POST /global/dispose，
- // 让内核重建 instance 读到新 provider——不重启进程（切换已注册 key 走前端桥、零打断）。
- import { reloadChannelConfig, refreshKeyModelsAndReload } from "./server"
-+// [dokng] 画布落盘：图片/视频/音频字节与画布状态 JSON 落到 userData 下的固定路径，
-+// 取代原先「blob 存 IndexedDB + blob: URL 存节点」的易失方案（blob: URL 重启即失效，
-+// 且 IndexedDB 未申请持久化配额可被驱逐）。安全底线：key 与状态体量大，一律不打印内容。
+diff --git a/packages/desktop/src/main/ipc-handlers/canvas.ts b/packages/desktop/src/main/ipc-handlers/canvas.ts
+new file mode 100644
+index 0000000000..1621bd6182
+--- /dev/null
++++ b/packages/desktop/src/main/ipc-handlers/canvas.ts
+@@ -0,0 +1,24 @@
++import { Effect } from "effect"
++import { CanvasRpcs } from "../../shared/ipc-rpc/canvas"
 +import {
-+  canvasFileRead,
 +  canvasFileWrite,
++  canvasFileRead,
 +  canvasFileDelete,
 +  canvasFileList,
 +  canvasStateRead,
 +  canvasStateWrite,
-+} from "./store-canvas-files"
- import {
-   getPinchZoomEnabled,
-   getWindowID,
-@@ -203,6 +214,26 @@ export function registerIpcHandlers(deps: Deps) {
-     await reloadChannelConfig()
-   })
- 
-+  // [dokng] 画布落盘 IPC。画布跑在 oc://renderer 的子 iframe 里，preload 不注入子 frame
-+  // （未开 nodeIntegrationInSubFrames），故画布侧无 window.api：由宿主 canvas-embed.tsx
-+  // 经 postMessage 中转到这里。字节以 base64 过 IPC（结构化克隆对 Uint8Array 可行，但
-+  // base64 与既有 store-* 的字符串约定一致、且避免 sandbox 下的可转移对象差异）。
-+  // 一律不打印 key / 内容；错误只回布尔或 null，不外泄绝对路径。
-+  ipcMain.handle("canvas-file-write", async (_event: IpcMainInvokeEvent, key: string, base64: string, mime?: string) => {
-+    return canvasFileWrite(key, base64, mime)
-+  })
-+  ipcMain.handle("canvas-file-read", async (_event: IpcMainInvokeEvent, key: string) => {
-+    return canvasFileRead(key)
-+  })
-+  ipcMain.handle("canvas-file-delete", async (_event: IpcMainInvokeEvent, keys: string[]) => {
-+    return canvasFileDelete(Array.isArray(keys) ? keys : [])
-+  })
-+  ipcMain.handle("canvas-file-list", async () => canvasFileList())
-+  ipcMain.handle("canvas-state-read", async () => canvasStateRead())
-+  ipcMain.handle("canvas-state-write", async (_event: IpcMainInvokeEvent, json: string) => {
-+    return canvasStateWrite(json)
-+  })
++} from "../store-canvas-files"
 +
-   ipcMain.handle(
-     "open-directory-picker",
-     async (_event: IpcMainInvokeEvent, opts?: { multiple?: boolean; title?: string; defaultPath?: string }) => {
++// The storage layer owns key validation, size limits and atomic writes; never log payloads.
++export const canvasHandlers = CanvasRpcs.toLayer(
++  Effect.sync(() =>
++    CanvasRpcs.of({
++      CanvasFileWrite: ({ key, base64, mime }) => Effect.promise(() => canvasFileWrite(key, base64, mime)),
++      CanvasFileRead: ({ key }) => Effect.promise(() => canvasFileRead(key)),
++      CanvasFileDelete: ({ keys }) => Effect.promise(() => canvasFileDelete([...keys])),
++      CanvasFileList: () => Effect.promise(canvasFileList),
++      CanvasStateRead: () => Effect.promise(canvasStateRead),
++      CanvasStateWrite: ({ json }) => Effect.promise(() => canvasStateWrite(json)),
++    }),
++  ),
++)
+diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
+index 1c269fc252..fdbdf56a99 100644
+--- a/packages/desktop/src/main/ipc.ts
++++ b/packages/desktop/src/main/ipc.ts
+@@ -9,6 +9,7 @@ import { Extensions } from "./extension"
+ import { DesktopFiles, openExternalURL } from "./files"
+ import { appHandlers } from "./ipc-handlers/app"
+ // [cx] US-009: 本地 key 管理 handler（二开新增域，见 ipc-handlers/channel-keys.ts）。
++import { canvasHandlers } from "./ipc-handlers/canvas"
+ import { channelKeysHandlers } from "./ipc-handlers/channel-keys"
+ import { eventHandlers } from "./ipc-handlers/events"
+ import { extensionHandlers } from "./ipc-handlers/extensions"
+@@ -35,6 +36,7 @@ const handlers = Layer.mergeAll(
+   extensionHandlers,
+   // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
+   channelKeysHandlers,
++  canvasHandlers,
+ )
+ 
+ export const layer = RpcServer.layer(DesktopRpcs, { disableFatalDefects: true }).pipe(
 diff --git a/packages/desktop/src/main/store-canvas-files.ts b/packages/desktop/src/main/store-canvas-files.ts
 new file mode 100644
 index 0000000000..3faa409e12
@@ -408,105 +409,105 @@ index 0000000000..3faa409e12
 +  if (!key) return null
 +  return findExistingFile(key)
 +}
-diff --git a/packages/desktop/src/main/windows.ts b/packages/desktop/src/main/windows.ts
-index 6e7b8f3ff9..e5050a4084 100644
---- a/packages/desktop/src/main/windows.ts
-+++ b/packages/desktop/src/main/windows.ts
-@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from "node:url"
- import type { TitlebarTheme } from "../preload/types"
- import { exportDebugLogs, write as writeLog } from "./logging"
- import { getStore, removeStoreFile } from "./store"
-+// [dokng] 画布落盘：把 oc://renderer/__canvas-file/<key> 解析到 userData/canvas-files/ 下的真实文件。
-+import { resolveCanvasFilePath } from "./store-canvas-files"
- import { PINCH_ZOOM_ENABLED_KEY, WINDOW_IDS_KEY } from "./store-keys"
- import { createUnresponsiveSampler } from "./unresponsive"
- import { nativeT } from "./native-translations"
-@@ -21,6 +23,8 @@ const root = dirname(fileURLToPath(import.meta.url))
- const rendererRoot = join(root, "../renderer")
- const rendererProtocol = "oc"
- const rendererHost = "renderer"
-+// [dokng] 画布落盘文件在 oc://renderer 下的虚拟路径前缀（不对应 out/renderer 里的真实目录）。
-+const canvasFilePrefix = "/__canvas-file/"
- const clipboardWritePermission = "clipboard-sanitized-write"
- const notificationPermission = "notifications"
- const rendererPermissions = new Set([clipboardWritePermission, notificationPermission])
-@@ -298,7 +302,30 @@ export function registerRendererProtocol() {
-       return new Response("Not found", { status: 404 })
-     }
+diff --git a/packages/desktop/src/main/windows/protocol.ts b/packages/desktop/src/main/windows/protocol.ts
+index 058ddbc7c8..4b60ea4063 100644
+--- a/packages/desktop/src/main/windows/protocol.ts
++++ b/packages/desktop/src/main/windows/protocol.ts
+@@ -85,7 +85,21 @@ async function serve(request: Request, rendererRoot: string) {
+     return new Response("Not found", { status: 404 })
+   }
  
--    const file = resolve(rendererRoot, `.${decodeURIComponent(url.pathname)}`)
-+    // [dokng] 画布落盘文件读取分支：oc://renderer/__canvas-file/<storageKey> → userData/canvas-files/<净化名>。
-+    // 复用既有 origin（oc://renderer）而不新开 scheme/host，故画布 iframe 的 <img src> 可直接引用，
-+    // 无需 blob: URL、无跨源与 CSP 问题，且走浏览器原生缓存。resolveCanvasFilePath 内部做
-+    // 净化与越界校验，返回 null 即拒绝。
-+    const decodedPath = decodeURIComponent(url.pathname)
-+    if (decodedPath.startsWith(canvasFilePrefix)) {
-+      const key = decodedPath.slice(canvasFilePrefix.length)
-+      const canvasFile = await resolveCanvasFilePath(key)
-+      if (!canvasFile) {
-+        writeLog("protocol", "rejected canvas file key", { url: request.url }, "warn")
-+        return new Response("Not found", { status: 404 })
-+      }
-+      try {
-+        const range = request.headers.get("range")
-+        return await net.fetch(pathToFileURL(canvasFile).toString(), {
-+          headers: range ? { range } : undefined,
-+        })
-+      } catch (error) {
-+        writeLog("protocol", "canvas file fetch error", { url: request.url, error }, "error")
-+        return new Response("Not found", { status: 404 })
-+      }
-+    }
+-  const file = path.resolve(rendererRoot, `.${decodeURIComponent(url.pathname)}`)
++  // [dokng] Resolve persisted media through the existing renderer origin. Load storage only
++  // for media requests so the first window's asset burst keeps its upstream startup path.
++  const decodedPath = decodeURIComponent(url.pathname)
++  const canvasFilePrefix = "/__canvas-file/"
++  if (decodedPath.startsWith(canvasFilePrefix)) {
++    const { resolveCanvasFilePath } = await import("../store-canvas-files")
++    const file = await resolveCanvasFilePath(decodedPath.slice(canvasFilePrefix.length))
++    if (!file) return new Response("Not found", { status: 404 })
++    const range = request.headers.get("range")
++    return net.fetch(pathToFileURL(file).toString(), { headers: range ? { range } : undefined }).catch(() =>
++      new Response("Not found", { status: 404 }),
++    )
++  }
 +
-+    const file = resolve(rendererRoot, `.${decodedPath}`)
-     const rel = relative(rendererRoot, file)
-     if (rel.startsWith("..") || isAbsolute(rel)) {
-       writeLog("protocol", "rejected path", { url: request.url, file }, "warn")
-diff --git a/packages/desktop/src/preload/index.ts b/packages/desktop/src/preload/index.ts
-index b1e249f923..07e51a389a 100644
---- a/packages/desktop/src/preload/index.ts
-+++ b/packages/desktop/src/preload/index.ts
-@@ -79,6 +79,16 @@ const api: ElectronAPI = {
-   draftBlobPut: (data) => ipcRenderer.invoke("draft-blob-put", data),
-   draftBlobGet: (id) => ipcRenderer.invoke("draft-blob-get", id),
++  const file = path.resolve(rendererRoot, `.${decodedPath}`)
+   const rel = path.relative(rendererRoot, file)
  
-+  // [dokng] 画布落盘桥。宿主 canvas-embed.tsx 收到画布 iframe 的 postMessage 后调用这些，
-+  // 把字节/状态写到 userData 下的固定路径。画布 iframe 自身拿不到 window.api（preload
-+  // 不进子 frame），故必须经宿主中转。
-+  canvasFileWrite: (key, base64, mime) => ipcRenderer.invoke("canvas-file-write", key, base64, mime),
-+  canvasFileRead: (key) => ipcRenderer.invoke("canvas-file-read", key),
-+  canvasFileDelete: (keys) => ipcRenderer.invoke("canvas-file-delete", keys),
-+  canvasFileList: () => ipcRenderer.invoke("canvas-file-list"),
-+  canvasStateRead: () => ipcRenderer.invoke("canvas-state-read"),
-+  canvasStateWrite: (json) => ipcRenderer.invoke("canvas-state-write", json),
-+
-   // [cx] US-009: 本地 key 列表增删改 + 切换激活（见 types.ts 说明）。
-   channelKeysList: () => ipcRenderer.invoke("channel-keys-list"),
-   channelKeysAdd: (input) => ipcRenderer.invoke("channel-keys-add", input),
-diff --git a/packages/desktop/src/preload/types.ts b/packages/desktop/src/preload/types.ts
-index e0063025cd..94b119a3a8 100644
---- a/packages/desktop/src/preload/types.ts
-+++ b/packages/desktop/src/preload/types.ts
-@@ -70,6 +70,22 @@ export type ElectronAPI = {
-   draftBlobPut: (data: ArrayBuffer) => Promise<string>
-   draftBlobGet: (id: string) => Promise<ArrayBuffer | null>
+   if (rel.startsWith("..") || path.isAbsolute(rel)) {
+diff --git a/packages/desktop/src/renderer/cx-channel-bridge.ts b/packages/desktop/src/renderer/cx-channel-bridge.ts
+index 0f72f1fba5..d2fd9cb17f 100644
+--- a/packages/desktop/src/renderer/cx-channel-bridge.ts
++++ b/packages/desktop/src/renderer/cx-channel-bridge.ts
+@@ -28,6 +28,13 @@ const globalKey = "__cxChannelApi"
+ export function installCxChannelBridge() {
+   // SAFETY: 本进程自己挂的全局，app 包只读它。
+   ;(window as unknown as Record<string, unknown>)[globalKey] = {
++    canvasFileWrite: (key: string, base64: string, mime?: string) =>
++      invoke("CanvasFileWrite", { key, base64, ...(mime ? { mime } : {}) }),
++    canvasFileRead: (key: string) => invoke("CanvasFileRead", { key }),
++    canvasFileDelete: (keys: string[]) => invoke("CanvasFileDelete", { keys }),
++    canvasFileList: () => invoke("CanvasFileList"),
++    canvasStateRead: () => invoke("CanvasStateRead"),
++    canvasStateWrite: (json: string) => invoke("CanvasStateWrite", { json }),
+     channelKeysList: () => invoke("ChannelKeysList"),
+     channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => invoke("ChannelKeysAdd", input),
+     channelKeysRemove: (id: string) => invoke("ChannelKeysRemove", { id }),
+diff --git a/packages/desktop/src/shared/ipc-rpc.ts b/packages/desktop/src/shared/ipc-rpc.ts
+index e13747a7c4..1c74bfbae8 100644
+--- a/packages/desktop/src/shared/ipc-rpc.ts
++++ b/packages/desktop/src/shared/ipc-rpc.ts
+@@ -1,6 +1,7 @@
+ import { RpcClient, RpcClientError } from "effect/unstable/rpc"
+ import { AppRpcs } from "./ipc-rpc/app"
+ // [cx] US-009: 本地 key 管理通道（二开新增域，见 ipc-rpc/channel-keys.ts）。
++import { CanvasRpcs } from "./ipc-rpc/canvas"
+ import { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
+ import { EventRpcs } from "./ipc-rpc/events"
+ import { ExtensionRpcs } from "./ipc-rpc/extensions"
+@@ -34,6 +35,7 @@ export const DesktopRpcs = AppRpcs.merge(
+   ExtensionRpcs,
+   // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
+   ChannelKeysRpcs,
++  CanvasRpcs,
+ )
  
-+  // [dokng] 画布落盘桥（详见 main/store-canvas-files.ts）。
-+  //   canvasFileWrite: 写成功返回 true；key 非法 / 超限 / IO 失败返回 false。
-+  //                    mime 用于定扩展名，进而决定 oc:// 读取时的 Content-Type
-+  //                    （<video>/<audio> 依赖它才能正确解码）。
-+  //   canvasFileRead:  返回 base64；不存在返回 null。渲染不走这里（直接用 oc:// URL），
-+  //                    仅导出 / 同步等需要字节本身的场景用。
-+  //   canvasFileDelete: 返回实际删除数量。
-+  //   canvasFileList:  返回已落盘的 storageKey 列表（供画布做孤儿清理与迁移判定）。
-+  //   canvasStateRead / canvasStateWrite: 画布项目状态 JSON 的整体读写（原子写）。
-+  canvasFileWrite: (key: string, base64: string, mime?: string) => Promise<boolean>
-+  canvasFileRead: (key: string) => Promise<string | null>
-+  canvasFileDelete: (keys: string[]) => Promise<number>
-+  canvasFileList: () => Promise<string[]>
-+  canvasStateRead: () => Promise<string | null>
-+  canvasStateWrite: (json: string) => Promise<boolean>
+ export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>
+diff --git a/packages/desktop/src/shared/ipc-rpc/canvas.ts b/packages/desktop/src/shared/ipc-rpc/canvas.ts
+new file mode 100644
+index 0000000000..a831376368
+--- /dev/null
++++ b/packages/desktop/src/shared/ipc-rpc/canvas.ts
+@@ -0,0 +1,31 @@
++// [dokng] Typed transport for the existing canvas media and state storage.
++import { Schema } from "effect"
++import { Rpc, RpcGroup } from "effect/unstable/rpc"
 +
-   // [cx] US-009: 本地 key 列表增删改 + 切换激活。全部走主进程数据层（store-channel-keys），
-   // 返回值为 JSON.stringify 的最新 ChannelKeysState 字符串，renderer 解析回对象刷新 UI。
-   // 不用通用 storeSet：那会把整个对象存成字符串、破坏主进程侧 readChannelKeysState 的对象读取。
++export const CanvasFileWrite = Rpc.make("CanvasFileWrite", {
++  payload: { key: Schema.String, base64: Schema.String, mime: Schema.optionalKey(Schema.String) },
++  success: Schema.Boolean,
++})
++export const CanvasFileRead = Rpc.make("CanvasFileRead", {
++  payload: { key: Schema.String },
++  success: Schema.NullOr(Schema.String),
++})
++export const CanvasFileDelete = Rpc.make("CanvasFileDelete", {
++  payload: { keys: Schema.Array(Schema.String) },
++  success: Schema.Number,
++})
++export const CanvasFileList = Rpc.make("CanvasFileList", { success: Schema.Array(Schema.String) })
++export const CanvasStateRead = Rpc.make("CanvasStateRead", { success: Schema.NullOr(Schema.String) })
++export const CanvasStateWrite = Rpc.make("CanvasStateWrite", {
++  payload: { json: Schema.String },
++  success: Schema.Boolean,
++})
++
++export const CanvasRpcs = RpcGroup.make(
++  CanvasFileWrite,
++  CanvasFileRead,
++  CanvasFileDelete,
++  CanvasFileList,
++  CanvasStateRead,
++  CanvasStateWrite,
++)

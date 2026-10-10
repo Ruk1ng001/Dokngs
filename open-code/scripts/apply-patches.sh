@@ -157,6 +157,12 @@ run_rebrand_coverage_check() {
   local lang="$tree/packages/app/src/context/language.tsx"
   local nat="$tree/packages/app/src/i18n/desktop-native.ts"
 
+  # v2 moved both sides of the native translation bridge under runtime/i18n.
+  if [ -d "$tree/packages/app/src/runtime/i18n" ]; then
+    lang="$tree/packages/app/src/runtime/i18n/language.tsx"
+    nat="$tree/packages/app/src/runtime/i18n/desktop-native.ts"
+  fi
+
   # 上游还没有原生 i18n 链路（老基线）——无需断言。
   [ -f "$nat" ] || { log "未发现 desktop-native i18n 链路，跳过品牌覆盖校验。"; return 0; }
 

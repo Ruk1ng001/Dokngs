@@ -1,22 +1,22 @@
 diff --git a/packages/app/src/components/cx-account/cx-account-api.ts b/packages/app/src/components/cx-account/cx-account-api.ts
 new file mode 100644
-index 000000000..afeb9fe9a
+index 0000000000..849a7c0326
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-api.ts
-@@ -0,0 +1,643 @@
+@@ -0,0 +1,655 @@
 +// [cx] 账户面板数据层（迁自 desktop 包 renderer/balance/balance-panel.tsx，US-005 → US-013）。
 +//
 +// 纯数据层：零 UI import（不 import solid-js / 上游组件），可离线 typecheck。承载：
 +//   - new-api 只读接口对接：profile（GET /api/app/profile，Bearer sk-）/ models（/v1/models）；
-+//   - 本地 key 列表读取与解析（经 desktop preload 暴露的 window.api.channelKeys*）；
++//   - 本地 key 列表读取与解析（经 desktop 侧跨包桥 __cxChannelApi 的 channelKeys*）；
 +//   - dokng:// 深链解析（parseImportDeepLink）；
 +//   - providerID 派生（channelProviderId，须与主进程 server.ts / store-channel-keys.ts 完全一致）；
 +//   - 单位换算 / 打码 / 使用率等纯函数。
 +//
-+// 跨包类型缺口：app 包看不到 desktop preload 的 window.api.channelKeys* / channelConfig* 与
-+// import.meta.env.NEWAPI_*（那些类型声明在 desktop 包的 preload/types.ts、env.d.ts）。本文件用
-+// 局部 interface + 断言访问器（cxWindowApi() / cxEnv()）解决，不碰上游类型文件；web 端无
-+// window.api，全走可选链兜底、返回空态，绝不抛出。
++// 跨包类型缺口：app 包看不到 desktop 侧的 channelKeys* / channelConfig* 桥（实现在 desktop 包
++// renderer/cx-channel-bridge.ts）与 import.meta.env.NEWAPI_*（类型声明在 desktop 包 env.d.ts）。
++// 本文件用局部 interface + 断言访问器（cxChannelApi() / cxEnv()）解决，不碰上游类型文件；
++// web 端无该桥，全走可选链兜底、返回空态，绝不抛出。
 +
 +// [cx] US-006: new-api 只读 profile 接口路径（站点根下，非 /v1 渠道端点）。走 token 鉴权中间件，
 +// 由 Bearer sk- 定位 token → 返回本人 profile。见 brand/docs/api-app-profile.md。
@@ -27,31 +27,44 @@ index 000000000..afeb9fe9a
 +const QUOTA_PER_UNIT = 500000
 +
 +// ============================================================================
-+// 跨包桥接：desktop preload 注入的 window.api（app 包无其类型）与构建期注入的渠道变量。
++// 跨包桥接：desktop renderer 注入的 __cxChannelApi（app 包无其类型）与构建期注入的渠道变量。
 +// ============================================================================
 +
-+// [cx] desktop preload 暴露的、账户面板要用的 IPC 子集（签名与 05-channel-keys-ipc 的
-+// preload/types.ts 对齐）。app 包不 import desktop 类型，故本地重声明；web 端 window.api 不存在。
++// [cx] desktop 侧跨包桥暴露的、账户面板要用的 IPC 子集（实现见 desktop 包的
++// renderer/cx-channel-bridge.ts，契约见 shared/ipc-rpc/channel-keys.ts）。app 包不 import
++// desktop 类型，故本地重声明；web 端该全局不存在。
++//
++// [cx] 上游 v2 重构：v1 这些挂在 preload contextBridge 注入的 window.api 上。v2 删掉了整个
++// window.api（IPC 换成 Effect RpcServer over MessagePort），故改读 desktop 侧新挂的
++// __cxChannelApi 全局。写操作的返回值随之从 JSON 字符串变成类型化的 ChannelKeysState 对象，
++// 调用方少一次 JSON.parse。
 +interface CxChannelApi {
-+  channelKeysList: () => Promise<string>
-+  channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => Promise<string>
-+  channelKeysRemove: (id: string) => Promise<string>
-+  channelKeysUpdateLabel: (id: string, label: string) => Promise<string>
-+  channelKeysSetActive: (id: string) => Promise<string>
-+  channelKeysSetModels: (id: string, models: string[]) => Promise<string>
++  channelKeysList: () => Promise<CxChannelKeysState>
++  channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => Promise<CxChannelKeysState>
++  channelKeysRemove: (id: string) => Promise<CxChannelKeysState>
++  channelKeysUpdateLabel: (id: string, label: string) => Promise<CxChannelKeysState>
++  channelKeysSetActive: (id: string) => Promise<CxChannelKeysState>
++  channelKeysSetModels: (id: string, models: string[]) => Promise<CxChannelKeysState>
 +  channelConfigRefreshKey: (id: string) => Promise<void>
 +  channelConfigReload: () => Promise<void>
-+  // 名字必须与上游 preload 的实际导出一致：这里是本地重声明 + Partial + 可选链调用，
-+  // 上游改名不会引发类型错误也不会让补丁冲突，只会让充值链接点了没反应（静默失效）。
-+  // 上游 v1.18.10→v1.18.11 就把 openLink 改成了 openExternal，升基线时务必核对此行。
++  // 名字必须与 desktop 侧桥的实际导出一致：这里是本地重声明 + Partial + 可选链调用，
++  // 对侧改名不会引发类型错误也不会让补丁冲突，只会让充值链接点了没反应（静默失效）。
 +  openExternal: (url: string) => void
 +}
 +
-+// [cx] 断言访问器：取 window.api 的账户面板子集。web 等无 preload 的平台返回 undefined，
-+// 调用方全走可选链兜底。不抛出。
++// 过线后的状态（结构同 shared/ipc-rpc/channel-keys.ts 的 ChannelKeysState；此处是本地重声明，
++// 字段用 unknown 收口，解析仍走下面的 isStoredChannelKey 逐字段校验，脏数据不会漏进 UI）。
++type CxChannelKeysState = { keys?: unknown; activeKeyId?: unknown }
++
++// [cx] 全局名与 desktop 侧的 cx-channel-bridge.ts 写死的同一字符串——跨包运行时桥没有共享类型，
++// 改名要同时改两处。
++const channelApiGlobal = "__cxChannelApi"
++
++// [cx] 断言访问器：取跨包桥的账户面板子集。web 等无桥的平台返回 undefined，调用方全走可选链
++// 兜底。不抛出。
 +export function cxChannelApi(): Partial<CxChannelApi> | undefined {
 +  if (typeof window === "undefined") return undefined
-+  return (window as unknown as { api?: Partial<CxChannelApi> }).api
++  return (window as unknown as Record<string, Partial<CxChannelApi> | undefined>)[channelApiGlobal]
 +}
 +
 +// [cx] 构建期由 electron.vite renderer.define 注入的渠道变量（02 补丁）。app 包 env.d.ts 无这些
@@ -98,8 +111,8 @@ index 000000000..afeb9fe9a
 +  return resolveSiteUrl(activeBaseURL)
 +}
 +
-+// [cx] US-007: 在系统默认浏览器打开充值页面。renderer 是浏览器上下文，经 preload 暴露的
-+// openExternal（→ 主进程 shell.openExternal）打开。客户端内不实现任何支付逻辑。
++// [cx] US-007: 在系统默认浏览器打开充值页面。renderer 是浏览器上下文，经跨包桥的 openExternal
++// （→ FilesOpenExternal → 主进程 shell.openExternal）打开。客户端内不实现任何支付逻辑。
 +export function openTopup(url: string): void {
 +  if (!url) return
 +  try {
@@ -339,13 +352,12 @@ index 000000000..afeb9fe9a
 +// 本地 key 列表读取与解析
 +// ============================================================================
 +
-+// [cx] US-009: 读本地 key 列表状态。经专用 IPC channelKeysList 拿 JSON 字符串再解析；任何
-+// 异常/脏数据都吞掉返回空状态，绝不抛出。web 端无 window.api 时同样返回空状态。
++// [cx] US-009: 读本地 key 列表状态。经专用 IPC channelKeysList 拿到状态对象（v2 的 RPC 是
++// schema 驱动的，直接回对象，不再是 v1 的 JSON 字符串）；任何异常/脏数据都吞掉返回空状态，
++// 绝不抛出。web 端无跨包桥时同样返回空状态。
 +export async function loadChannelState(): Promise<ChannelState> {
 +  try {
-+    const raw = await cxChannelApi()?.channelKeysList?.()
-+    if (!raw) return { keys: [], activeKeyId: null }
-+    const parsed = JSON.parse(raw) as { keys?: unknown; activeKeyId?: unknown }
++    const parsed = await cxChannelApi()?.channelKeysList?.()
 +    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.keys)) {
 +      return { keys: [], activeKeyId: null }
 +    }
@@ -649,30 +661,35 @@ index 000000000..afeb9fe9a
 +}
 diff --git a/packages/app/src/components/cx-account/cx-account-dialog.tsx b/packages/app/src/components/cx-account/cx-account-dialog.tsx
 new file mode 100644
-index 000000000..0073fb3cf
+index 0000000000..fa8bfc5d46
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-dialog.tsx
-@@ -0,0 +1,863 @@
+@@ -0,0 +1,869 @@
 +// [cx] 账户面板（迁自 desktop 包 renderer/balance/balance-panel.tsx，US-005 → US-013）。
 +//
-+// 本文件是账户面板从 desktop 包迁入 @opencode-ai/app 包的落地：改用原生 v2 组件
-+// （@opencode-ai/ui/v2 的 Dialog / ButtonV2 / TextInputV2 / IconButtonV2 / Tag）+
++// 本文件是账户面板从 desktop 包迁入 @opencode/app 包的落地：改用原生 v2 组件
++// （@opencode/ui 的 Dialog / Button / TextInput / IconButton / Badge）+
 +// useDialog() 外壳，配色全走 v2 语义变量（cx-account.css），跟随明暗主题、与原生设置页视觉统一。
 +// 不再自绘悬浮层 / 不再硬编码颜色（旧 desktop 面板 84 处硬编码金色内联样式已全部退役）。
 +//
-+// 数据层在 cx-account-api.ts（纯函数 + new-api 请求 + 本地 key 列表 + 跨包 window.api 桥接）。
-+// 接线（侧边栏账户按钮 dialog.show、dokng:// 深链）在 07 补丁的 layout.tsx；本文件只导出面板组件。
++// 数据层在 cx-account-api.ts（纯函数 + new-api 请求 + 本地 key 列表 + 跨包 __cxChannelApi 桥接）。
++// 接线（标题栏账户按钮 dialog.show、dokng:// 深链）在 07 补丁的 cx-account-launcher.tsx；
++// 本文件只导出面板组件。
 +//
 +// 低冲突：独立目录 packages/app/src/components/cx-account/，全部 Cx 前缀，对上游现有文件零改动。
 +
 +import { createSignal, onMount, For, Show, Switch, Match } from "solid-js"
-+import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
-+import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
-+import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
-+import { Tag } from "@opencode-ai/ui/v2/badge-v2"
-+import { Icon } from "@opencode-ai/ui/v2/icon"
-+import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
-+import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
++// [cx] 上游 v2 把 v1/v2 两条组件轨合并进 @opencode/ui：路径去掉 /v2 段，组件名去掉 V2 后缀
++// （ButtonV2→Button、TextInputV2→TextInput、IconButtonV2→IconButton、TooltipV2→Tooltip），
++// badge-v2 的 Tag 并入 ./badge 的 Badge（渲染出的 data-component="tag" 不变，css 选择器无需改）。
++// props 面逐一核对过，与 v1 的 v2 轨一致（size/variant/placement/fit/closeLabel 全部保留）。
++import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode/ui/dialog"
++import { Button } from "@opencode/ui/button"
++import { TextInput } from "@opencode/ui/text-input"
++import { Badge } from "@opencode/ui/badge"
++import { Icon } from "@opencode/ui/icon"
++import { IconButton } from "@opencode/ui/icon-button"
++import { Tooltip } from "@opencode/ui/tooltip"
 +import "./cx-account.css"
 +import {
 +  avatarInitial,
@@ -775,19 +792,19 @@ index 000000000..0073fb3cf
 +          <Show
 +            when={confirmingDelete()}
 +            fallback={
-+              <TooltipV2 value="删除 Key" placement="top">
-+                <IconButtonV2
++              <Tooltip value="删除 Key" placement="top">
++                <IconButton
 +                  aria-label="删除 Key"
 +                  variant="neutral"
 +                  size="small"
 +                  onClick={() => setConfirmingDelete(true)}
 +                  icon={<Icon name="xmark-small" size="small" />}
 +                />
-+              </TooltipV2>
++              </Tooltip>
 +            }
 +          >
-+            <TooltipV2 value="确认删除" placement="top">
-+              <IconButtonV2
++            <Tooltip value="确认删除" placement="top">
++              <IconButton
 +                data-slot="cx-delete-confirm-button"
 +                aria-label="确认删除"
 +                variant="neutral"
@@ -798,16 +815,16 @@ index 000000000..0073fb3cf
 +                }}
 +                icon={<Icon name="check" size="small" />}
 +              />
-+            </TooltipV2>
-+            <TooltipV2 value="取消删除" placement="top">
-+              <IconButtonV2
++            </Tooltip>
++            <Tooltip value="取消删除" placement="top">
++              <IconButton
 +                aria-label="取消删除"
 +                variant="neutral"
 +                size="small"
 +                onClick={() => setConfirmingDelete(false)}
 +                icon={<Icon name="close" size="small" />}
 +              />
-+            </TooltipV2>
++            </Tooltip>
 +          </Show>
 +        </div>
 +      </Show>
@@ -823,7 +840,7 @@ index 000000000..0073fb3cf
 +                <div data-slot="cx-key-masked-row">
 +                  <span data-slot="cx-key-masked">{maskKey(props.entry.key)}</span>
 +                  <Show when={groupTag()}>
-+                    {(g) => <Tag data-slot="cx-group-tag">{g()}</Tag>}
++                    {(g) => <Badge data-slot="cx-group-tag">{g()}</Badge>}
 +                  </Show>
 +                </div>
 +              </>
@@ -831,7 +848,7 @@ index 000000000..0073fb3cf
 +          >
 +            {/* 内联编辑 label —— 点击输入区不触发列表项切换。 */}
 +            <div onClick={(e) => e.stopPropagation()}>
-+              <TextInputV2
++              <TextInput
 +                value={labelDraft()}
 +                placeholder="key 名称"
 +                onInput={(e) => setLabelDraft(e.currentTarget.value)}
@@ -844,9 +861,9 @@ index 000000000..0073fb3cf
 +            <div data-slot="cx-key-meta">
 +              <For each={metaTags()}>
 +                {(tag) => (
-+                  <Tag data-slot={tag.slot} data-level={tag.level}>
++                  <Badge data-slot={tag.slot} data-level={tag.level}>
 +                    {tag.text}
-+                  </Tag>
++                  </Badge>
 +                )}
 +              </For>
 +            </div>
@@ -908,7 +925,7 @@ index 000000000..0073fb3cf
 +                </div>
 +
 +                <div data-slot="cx-key-quota">
-+                  <Show when={!ready.keyUnlimitedQuota} fallback={<Tag data-slot="cx-unlimited-tag">额度不限</Tag>}>
++                  <Show when={!ready.keyUnlimitedQuota} fallback={<Badge data-slot="cx-unlimited-tag">额度不限</Badge>}>
 +                    <div data-slot="cx-key-bar-row">
 +                      <span>
 +                        额度 {keyUsedPercent(ready.keyUsedQuota, ready.keyRemainingQuota)}% · 剩余{" "}
@@ -936,35 +953,35 @@ index 000000000..0073fb3cf
 +          <Show
 +            when={editing()}
 +            fallback={
-+              <TooltipV2 value="编辑名称" placement="top">
-+                <IconButtonV2
++              <Tooltip value="编辑名称" placement="top">
++                <IconButton
 +                  aria-label="编辑名称"
 +                  variant="neutral"
 +                  size="small"
 +                  onClick={startEdit}
 +                  icon={<Icon name="edit" size="small" />}
 +                />
-+              </TooltipV2>
++              </Tooltip>
 +            }
 +          >
-+            <TooltipV2 value="保存名称" placement="top">
-+              <IconButtonV2
++            <Tooltip value="保存名称" placement="top">
++              <IconButton
 +                aria-label="保存名称"
 +                variant="contrast"
 +                size="small"
 +                onClick={saveEdit}
 +                icon={<Icon name="check" size="small" />}
 +              />
-+            </TooltipV2>
-+            <TooltipV2 value="取消编辑" placement="top">
-+              <IconButtonV2
++            </Tooltip>
++            <Tooltip value="取消编辑" placement="top">
++              <IconButton
 +                aria-label="取消编辑"
 +                variant="neutral"
 +                size="small"
 +                onClick={() => setEditing(false)}
 +                icon={<Icon name="close" size="small" />}
 +              />
-+            </TooltipV2>
++            </Tooltip>
 +          </Show>
 +        </div>
 +      </Show>
@@ -1025,13 +1042,13 @@ index 000000000..0073fb3cf
 +    <Show
 +      when={open()}
 +      fallback={
-+        <ButtonV2 variant="neutral" size="normal" icon="plus" class="cx-add-key-trigger" onClick={() => setOpen(true)}>
++        <Button variant="neutral" size="normal" icon="plus" class="cx-add-key-trigger" onClick={() => setOpen(true)}>
 +          新增 key
-+        </ButtonV2>
++        </Button>
 +      }
 +    >
 +      <div data-slot="cx-add-form">
-+        <TextInputV2
++        <TextInput
 +          value={key()}
 +          type="password"
 +          autocomplete="off"
@@ -1043,7 +1060,7 @@ index 000000000..0073fb3cf
 +          }}
 +          aria-label="API Key"
 +        />
-+        <TextInputV2
++        <TextInput
 +          value={label()}
 +          placeholder="名称（可选）"
 +          onInput={(e) => setLabel(e.currentTarget.value)}
@@ -1053,10 +1070,10 @@ index 000000000..0073fb3cf
 +          <div data-slot="cx-form-error">{error()}</div>
 +        </Show>
 +        <div data-slot="cx-form-actions">
-+          <ButtonV2 variant="contrast" size="normal" class="cx-flex-1" disabled={saving()} onClick={submit}>
++          <Button variant="contrast" size="normal" class="cx-flex-1" disabled={saving()} onClick={submit}>
 +            {saving() ? "保存中…" : "添加"}
-+          </ButtonV2>
-+          <ButtonV2
++          </Button>
++          <Button
 +            variant="neutral"
 +            size="normal"
 +            onClick={() => {
@@ -1065,14 +1082,15 @@ index 000000000..0073fb3cf
 +            }}
 +          >
 +            取消
-+          </ButtonV2>
++          </Button>
 +        </div>
 +      </div>
 +    </Show>
 +  )
 +}
 +
-+// [cx] 账户面板主体。经 useDialog().show(() => <CxDialogAccount/>) 弹出（接线在 07 的 layout.tsx）。
++// [cx] 账户面板主体。经 useDialog().show(() => <CxDialogAccount/>) 弹出（接线在 07 的
++// cx-account-launcher.tsx）。
 +// 用 v2 Dialog(size=large) 外壳组织账户摘要、token 统计与响应式紧凑 key 列表。
 +export function CxDialogAccount() {
 +  const [initializing, setInitializing] = createSignal(true)
@@ -1179,12 +1197,12 @@ index 000000000..0073fb3cf
 +    const addKey = cxChannelApi()?.channelKeysAdd
 +    if (!addKey) throw new Error("当前环境无法保存 Key，请在桌面客户端中重试")
 +
-+    // channelKeysAdd 返回最新 ChannelKeysState 的 JSON，解析出新条目 id（按明文 key 反向匹配）。
++    // channelKeysAdd 返回最新 ChannelKeysState（v2 的 RPC 回类型化对象，不再是 JSON 字符串），
++    // 从中取出新条目 id（按明文 key 反向匹配）。
 +    let addedId: string | undefined
 +    try {
-+      const raw = await addKey(input)
-+      const state = JSON.parse(raw) as { keys?: Array<{ id: string; key: string }> }
-+      const list = Array.isArray(state.keys) ? state.keys : []
++      const state = await addKey(input)
++      const list = Array.isArray(state?.keys) ? (state.keys as Array<{ id: string; key: string }>) : []
 +      addedId = [...list].reverse().find((k) => k.key === input.key)?.id
 +    } catch {
 +      throw new Error("Key 保存失败，请检查桌面客户端状态后重试")
@@ -1309,10 +1327,10 @@ index 000000000..0073fb3cf
 +                先在 Dokng 控制台创建 API Key，再将它粘贴到下方。Key 只保存在本机，并会自动读取账户余额与可用模型。
 +              </div>
 +              <Show when={siteUrl()}>
-+                <ButtonV2 variant="neutral" size="normal" class="cx-site-button" onClick={() => openTopup(siteUrl())}>
++                <Button variant="neutral" size="normal" class="cx-site-button" onClick={() => openTopup(siteUrl())}>
 +                  前往 Dokng 获取 API Key
 +                  <Icon name="outline-square-arrow" size="small" />
-+                </ButtonV2>
++                </Button>
 +              </Show>
 +              <div data-slot="cx-onboard-divider">
 +                <span>已有 API Key</span>
@@ -1373,14 +1391,14 @@ index 000000000..0073fb3cf
 +                            {activeEntry()?.label || ready.tokenName || "未命名 key"}
 +                          </div>
 +                        </div>
-+                        <Tag data-slot="cx-connection-tag">已连接</Tag>
++                        <Badge data-slot="cx-connection-tag">已连接</Badge>
 +                      </div>
 +                    )}
 +                  </Match>
 +                </Switch>
 +                <div data-slot="cx-dashboard-actions">
-+                  <TooltipV2 value="刷新全部账户数据" placement="bottom">
-+                    <IconButtonV2
++                  <Tooltip value="刷新全部账户数据" placement="bottom">
++                    <IconButton
 +                      aria-label="刷新全部账户数据"
 +                      variant="neutral"
 +                      size="normal"
@@ -1388,21 +1406,21 @@ index 000000000..0073fb3cf
 +                      onClick={refreshAll}
 +                      icon={<Icon name="reset" size="small" />}
 +                    />
-+                  </TooltipV2>
++                  </Tooltip>
 +                  <Show when={siteUrl()}>
-+                    <ButtonV2 variant="neutral" size="normal" onClick={() => openTopup(siteUrl() + "/dashboard")}>
++                    <Button variant="neutral" size="normal" onClick={() => openTopup(siteUrl() + "/dashboard")}>
 +                      控制台
 +                      <Icon name="outline-square-arrow" size="small" />
-+                    </ButtonV2>
++                    </Button>
 +                  </Show>
-+                  <ButtonV2
++                  <Button
 +                    variant="contrast"
 +                    size="normal"
 +                    disabled={!topupUrl()}
 +                    onClick={() => openTopup(topupUrl())}
 +                  >
 +                    充值
-+                  </ButtonV2>
++                  </Button>
 +                </div>
 +              </div>
 +
@@ -1485,9 +1503,9 @@ index 000000000..0073fb3cf
 +                    <div data-slot="cx-key-col-tip">管理凭据、查看实际 Token 用量与模型能力</div>
 +                  </div>
 +                  {/* [cx] 新增按钮放在标题行右侧；展开表单在标题下、紧凑列表上方。 */}
-+                  <ButtonV2 variant="neutral" size="small" icon="plus" onClick={() => setAddingKey((prev) => !prev)}>
++                  <Button variant="neutral" size="small" icon="plus" onClick={() => setAddingKey((prev) => !prev)}>
 +                    新增 key
-+                  </ButtonV2>
++                  </Button>
 +                </div>
 +                <Show when={addingKey()}>
 +                  <div data-slot="cx-key-col-form">
@@ -1518,26 +1536,28 @@ index 000000000..0073fb3cf
 +}
 diff --git a/packages/app/src/components/cx-account/cx-account-import.tsx b/packages/app/src/components/cx-account/cx-account-import.tsx
 new file mode 100644
-index 000000000..2a4abd208
+index 0000000000..bc5f6b9c4d
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-import.tsx
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,175 @@
 +// [cx] US-013: dokng:// 深链一键导入确认框（迁自 desktop 包 balance-panel.tsx 的 ImportDialog）。
 +//
 +// 网站点击「一键导入」→ 系统唤起 App（dokng:// 协议，06 补丁在主进程注册）→ opencode 既有 deep-link
-+// 分发把 URL 送到渲染层 → 07 补丁的 layout.tsx handleDeepLinks 解析出 dokng:// 后动态 import 本组件
-+// 弹确认框。安全（US-013 验收 #3）：解析成功不静默写入，先展示 label / 打码 key / baseURL，
-+// 用户确认后才 channelKeysAdd 写入本地列表，避免恶意深链偷偷灌 key。
++// 分发把 URL 送到渲染层 → 07 补丁的 cx-account-launcher.tsx handleDeepLinks 解析出 dokng:// 后
++// 动态 import 本组件弹确认框。安全（US-013 验收 #3）：解析成功不静默写入，先展示 label /
++// 打码 key / baseURL，用户确认后才 channelKeysAdd 写入本地列表，避免恶意深链偷偷灌 key。
 +//
 +// 用原生 v2 Dialog 外壳，配色走 v2 语义变量（cx-account.css），与账户面板视觉一致。
-+// 自闭合：用同作用域 useDialog().close() 关闭，不接 onClose prop——layout.tsx 直接
++// 自闭合：用同作用域 useDialog().close() 关闭，不接 onClose prop——cx-account-launcher.tsx 直接
 +// dialog.show(() => <CxDialogImport request={req} />)，无需注入关闭回调。
 +
 +import { createSignal } from "solid-js"
 +import { Switch, Match } from "solid-js"
-+import { useDialog } from "@opencode-ai/ui/context/dialog"
-+import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
-+import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
++// [cx] 上游 v2 合并了 v1/v2 两条组件轨：包名 @opencode-ai/ui→@opencode/ui，路径去掉 /v2 段，
++// ButtonV2→Button（props 面一致）。useDialog 的 context 路径不变，只换包名。
++import { useDialog } from "@opencode/ui/context/dialog"
++import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode/ui/dialog"
++import { Button } from "@opencode/ui/button"
 +import "./cx-account.css"
 +import {
 +  cxChannelApi,
@@ -1564,14 +1584,14 @@ index 000000000..2a4abd208
 +  async function confirmImport() {
 +    setPhase({ status: "saving" })
 +    try {
-+      // channelKeysAdd 返回最新 ChannelKeysState 的 JSON。解析出新条目 id（用于「设为激活」）。
-+      const raw = await cxChannelApi()?.channelKeysAdd?.({
++      // channelKeysAdd 返回最新 ChannelKeysState（v2 的 RPC 回类型化对象，不再是 JSON 字符串）。
++      // 从中取出新条目 id（用于「设为激活」）。
++      const state = await cxChannelApi()?.channelKeysAdd?.({
 +        label: props.request.label,
 +        key: props.request.key,
 +        baseURL: props.request.baseURL,
 +      })
-+      const state = raw ? (JSON.parse(raw) as { keys?: Array<{ id: string; key: string }> }) : { keys: [] }
-+      const list = Array.isArray(state.keys) ? state.keys : []
++      const list = Array.isArray(state?.keys) ? (state.keys as Array<{ id: string; key: string }>) : []
 +      // 新增条目排在末尾；按明文 key 匹配取回 id（key 仅内存比对，不外传）。
 +      const added = [...list].reverse().find((k) => k.key === props.request.key)
 +      const addedId = added?.id ?? ""
@@ -1627,7 +1647,7 @@ index 000000000..2a4abd208
 +                key？
 +              </p>
 +              <div data-slot="cx-form-actions">
-+                <ButtonV2
++                <Button
 +                  variant="contrast"
 +                  size="normal"
 +                  class="cx-flex-1"
@@ -1638,10 +1658,10 @@ index 000000000..2a4abd208
 +                  }}
 +                >
 +                  {phase().status === "activating" ? "设置中…" : "设为激活"}
-+                </ButtonV2>
-+                <ButtonV2 variant="neutral" size="normal" onClick={close}>
++                </Button>
++                <Button variant="neutral" size="normal" onClick={close}>
 +                  暂不
-+                </ButtonV2>
++                </Button>
 +              </div>
 +            </div>
 +          </Match>
@@ -1649,9 +1669,9 @@ index 000000000..2a4abd208
 +          <Match when={phase().status === "error"}>
 +            <div data-slot="cx-state-box">
 +              <div data-slot="cx-form-error">{(phase() as { status: "error"; message: string }).message}</div>
-+              <ButtonV2 variant="neutral" size="normal" class="cx-flex-1" onClick={close}>
++              <Button variant="neutral" size="normal" class="cx-flex-1" onClick={close}>
 +                关闭
-+              </ButtonV2>
++              </Button>
 +            </div>
 +          </Match>
 +
@@ -1674,7 +1694,7 @@ index 000000000..2a4abd208
 +              </div>
 +            </div>
 +            <div data-slot="cx-form-actions">
-+              <ButtonV2
++              <Button
 +                variant="contrast"
 +                size="normal"
 +                class="cx-flex-1"
@@ -1682,10 +1702,10 @@ index 000000000..2a4abd208
 +                onClick={confirmImport}
 +              >
 +                {phase().status === "saving" ? "导入中…" : "确认导入"}
-+              </ButtonV2>
-+              <ButtonV2 variant="neutral" size="normal" onClick={close}>
++              </Button>
++              <Button variant="neutral" size="normal" onClick={close}>
 +                取消
-+              </ButtonV2>
++              </Button>
 +            </div>
 +          </Match>
 +        </Switch>
@@ -1697,15 +1717,18 @@ index 000000000..2a4abd208
 +export { CxDialogImport }
 diff --git a/packages/app/src/components/cx-account/cx-account.css b/packages/app/src/components/cx-account/cx-account.css
 new file mode 100644
-index 000000000..f073cd07f
+index 0000000000..70e6506d8e
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account.css
-@@ -0,0 +1,956 @@
-+/* [cx] 账户工作台：完全复用 OpenCode v2 语义 token，不引入品牌外配色。 */
-+@import "@opencode-ai/ui/v2/button-v2.css";
-+@import "@opencode-ai/ui/v2/icon-button-v2.css";
-+@import "@opencode-ai/ui/v2/text-input-v2.css";
-+@import "@opencode-ai/ui/v2/tooltip-v2.css";
+@@ -0,0 +1,959 @@
++/* [cx] 账户工作台：完全复用 OpenCode v2 语义 token，不引入品牌外配色。
++   上游 v2 的 @opencode/ui 导出表只放出了 ./button.css 与 ./text-input.css，icon-button /
++   tooltip 的 css 没有对外路径（v1 的 "./v2/*.css" 通配导出已删）。但这几个组件的 tsx 自己
++   就 import 了同目录 css，本文件也没有需要压在它们之后的覆盖规则（下方唯一碰上游选择器的
++   [data-component="button-v2"]{flex:1} 带 1 类 + 2 属性，specificity 高于 button.css 里的
++   任何规则，不依赖 @import 顺序），所以这里直接删掉四条 @import，不改写成 v2 路径。
++   注：v2 组件名去了 V2 后缀，但渲染出的 data-component 仍是 *-v2（button-v2 / tag /
++   dialog-v2 等），下方选择器无需跟着改。 */
 +
 +/* [cx] 账户弹窗固定高度；三个区域（账户头 / 用量总览 / Keys）打开即定位，
 +   仅 Keys 列表在内部滚动，key 增多不会向上挤压覆盖上方区域。 */
@@ -2657,3 +2680,75 @@ index 000000000..f073cd07f
 +    flex: 1;
 +  }
 +}
+diff --git a/packages/desktop/src/renderer/cx-channel-bridge.ts b/packages/desktop/src/renderer/cx-channel-bridge.ts
+new file mode 100644
+index 0000000000..0f72f1fba5
+--- /dev/null
++++ b/packages/desktop/src/renderer/cx-channel-bridge.ts
+@@ -0,0 +1,43 @@
++// [cx] US-009: 账户面板（app 包 components/cx-account/*）到本地 key 管理 IPC 的跨包桥。
++//
++// 为什么需要这个文件：
++//   账户面板住在 app 包，key 管理的 RPC 契约与 invoke() 都在 desktop 包。app 包是被 desktop 包
++//   消费的下游，不能反向 import desktop（会成环），所以两者只能在**运行时**对接。v1 用的是
++//   preload contextBridge 暴露的 window.api.channelKeys*；v2 删掉了整个 window.api（IPC 换成
++//   Effect RpcServer over MessagePort，renderer 侧入口是 invoke()），于是这里按同样的「挂一个
++//   全局、app 包可选链读取」的办法重建那座桥，只是实现从 ipcRenderer.invoke 换成了 v2 的
++//   invoke(tag, payload)。
++//
++// 为什么不走 app 包的 Platform 抽象（@/runtime/platform/platform 那组 desktop-only 可选方法）：
++//   那是 v2 给跨平台能力准备的正道，但它要经 usePlatform() 这个 solid context 取用，而
++//   cx-account-api.ts 是刻意零 UI import 的纯数据层（可离线 typecheck、可被非组件代码调用）。
++//   为了一组 desktop 专属通道把数据层绑到 solid 的组件树上不值得，且 Platform 类型是上游文件，
++//   改它等于把补丁面扩大到上游类型定义。
++//
++// 与 v1 的差异：返回值从 JSON 字符串换成了类型化对象（见 shared/ipc-rpc/channel-keys.ts 的
++// 说明），所以 app 侧少一次 JSON.parse。
++//
++// 安全底线：本文件只转发，不打印任何入参（key 明文绝不进日志）。
++
++import { invoke, send } from "./ipc-client"
++
++// app 包按这个全局名做可选链读取（见 cx-account-api.ts 的 cxChannelApi()）。两侧都写死此字符串，
++// 没有共享类型——这正是跨包运行时桥的代价：改名要同时改两处，故此处与 app 侧互相注明。
++const globalKey = "__cxChannelApi"
++
++export function installCxChannelBridge() {
++  // SAFETY: 本进程自己挂的全局，app 包只读它。
++  ;(window as unknown as Record<string, unknown>)[globalKey] = {
++    channelKeysList: () => invoke("ChannelKeysList"),
++    channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => invoke("ChannelKeysAdd", input),
++    channelKeysRemove: (id: string) => invoke("ChannelKeysRemove", { id }),
++    channelKeysUpdateLabel: (id: string, label: string) => invoke("ChannelKeysUpdateLabel", { id, label }),
++    channelKeysSetActive: (id: string) => invoke("ChannelKeysSetActive", { id }),
++    channelKeysSetModels: (id: string, models: string[]) => invoke("ChannelKeysSetModels", { id, models }),
++    channelConfigRefreshKey: (id: string) => invoke("ChannelConfigRefreshKey", { id }),
++    channelConfigReload: () => invoke("ChannelConfigReload"),
++    // 账户面板的充值 / 控制台入口要在系统浏览器里打开。用 send（fire-and-forget）与上游
++    // renderer/api.ts 的 openExternal 一致。
++    openExternal: (url: string) => send("FilesOpenExternal", { url }),
++  }
++}
+diff --git a/packages/desktop/src/renderer/index.tsx b/packages/desktop/src/renderer/index.tsx
+index 6b9e5e2c82..1659bb1a5b 100644
+--- a/packages/desktop/src/renderer/index.tsx
++++ b/packages/desktop/src/renderer/index.tsx
+@@ -4,6 +4,8 @@ import "./diagnostics"
+ import "./styles.css"
+ import { render } from "solid-js/web"
+ import { api } from "./api"
++// [cx] 账户面板（app 包）到本地 key 管理 IPC 的跨包桥。见 cx-channel-bridge.ts 的头注释。
++import { installCxChannelBridge } from "./cx-channel-bridge"
+ import { DesktopApp } from "./desktop-app"
+ import { startDesktopMenu } from "./platform/menu"
+ import { startDeepLinks } from "./startup/deep-links"
+@@ -18,6 +20,9 @@ startDesktopMenu(api)
+ 
+ startDeepLinks(api)
+ 
++// 必须在 render 之前：首启无 key 时账户面板会在挂载期就读这座桥（见 cx-account-launcher.tsx）。
++installCxChannelBridge()
++
+ render(() => <DesktopApp api={api} version={version} />, root)
+ 
+ void initializeSentry(version)

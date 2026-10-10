@@ -306,8 +306,8 @@ jobs:
             echo "bun install 第 $attempt 次失败，$((attempt * 15))s 后重试…" >&2
             sleep $((attempt * 15))
           done
-          # 只 typecheck 定制涉及的两个包，快速验证补丁应用后类型仍自洽。
-          bun turbo typecheck --filter=@opencode-ai/app --filter=@opencode-ai/desktop
+          # v2 的包名已迁到 @opencode/*；同时覆盖品牌身份、图标与更新扩展。
+          bun turbo typecheck --concurrency=3 --filter=@opencode/app --filter=@opencode/desktop --filter=@opencode/core --filter=@opencode/ui --filter=@opencode/gui-extensions
 
       - name: 校验通过 → 更新基线、提交并推送 main + 打 dokng tag
         if: steps.detect.outputs.need == 'true'
@@ -727,6 +727,7 @@ jobs:
           - os: macos-latest
             platform_flag: "--mac"
             arch_flag: "--arm64"
+            cli_target: opencode-darwin-arm64
             # [monorepo] artifact_glob 一律「workspace 根相对」（带 open-code/ 前缀）：它同时被
             # uses: 型 upload-artifact（基准恒为 workspace 根，不受 defaults.run 影响）与 R2
             # 直传 run 步骤消费。两者基准必须一致，故统一按根相对，并让那个 run 步骤显式
@@ -744,6 +745,7 @@ jobs:
           - os: macos-15-intel
             platform_flag: "--mac"
             arch_flag: "--x64"
+            cli_target: opencode-darwin-x64-baseline
             artifact_glob: |
               open-code/opencode/packages/desktop/dist/*.dmg
               open-code/opencode/packages/desktop/dist/*.zip
@@ -753,6 +755,7 @@ jobs:
           - os: windows-latest
             platform_flag: "--win"
             arch_flag: ""
+            cli_target: opencode-windows-x64-baseline
             artifact_glob: "open-code/opencode/packages/desktop/dist/*.exe"
             artifact_name: dokng-exe
             meta_subdir: latest-yml-x86_64-pc-windows-msvc
@@ -760,6 +763,7 @@ jobs:
           - os: ubuntu-latest
             platform_flag: "--linux"
             arch_flag: ""
+            cli_target: opencode-linux-x64-baseline
             artifact_glob: "open-code/opencode/packages/desktop/dist/*.AppImage"
             artifact_name: dokng-appimage
             meta_subdir: latest-yml-x86_64-unknown-linux-gnu
@@ -774,6 +778,8 @@ jobs:
       CX_UNSIGNED: "1"
       # 上游 electron-builder 配置按 prod 通道出品牌 appId / 无后缀名。
       OPENCODE_CHANNEL: prod
+      # v2 desktop embeds a separately built native CLI instead of building the old Node sidecar.
+      OPENCODE_CLI_DIST: ${{ github.workspace }}/open-code/opencode/packages/cli/dist
       # 渠道值经 Secret 注入为环境变量（构建期由 electron.vite renderer.define
       # 内联进 renderer bundle，供余额面板读取；绝不进 git / 不进日志）。
       NEWAPI_BASE_URL: ${{ secrets.NEWAPI_BASE_URL }}
@@ -868,6 +874,11 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
 
+      - name: 安装 Node（v2 原生依赖要求 Node 22 以上）
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
       - name: 安装依赖
         working-directory: ${{ github.workspace }}/open-code/opencode
         shell: bash
@@ -890,16 +901,32 @@ jobs:
             sleep $((attempt * 15))
           done
 
-      - name: 注入 dokng 版本号到 package.json
+      - name: 检查补丁后的完整 v2 工作区
+        if: runner.os == 'Linux'
+        working-directory: ${{ github.workspace }}/open-code/opencode
+        shell: bash
+        run: bun run check
+
+      - name: 构建品牌 CLI（v2 desktop 必需的原生内核）
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          export OPENCODE_VERSION="${VERSION#v}"
+          export OPENCODE_CHANNEL=latest
+          bun opencode/packages/cli/script/build.ts --target=${{ matrix.cli_target }} --skip-install
+
+      - name: 准备 desktop 资源与 dokng 版本号
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
         shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
         run: |
-          # electron-builder 用 package.json 的 version 作为产物版本，并写进 latest*.yml。
-          # 硬编码的 1.17.15 会让所有产物版本一致、自更新永远「已是最新」。故用 detect 算出的
-          # dokng 版本号覆盖（剥掉前导 v，semver version 不能带 v）。npm 随 npx 可用。
-          VER="${{ needs.detect.outputs.version }}"
-          npm pkg set version="${VER#v}"
-          echo "package.json version = $(npm pkg get version)"
+          set -euo pipefail
+          export OPENCODE_VERSION="${VERSION#v}"
+          # 上游 prepare 复制 CLI/图标并更新版本；品牌 prebuild 同时构建内嵌画布。
+          bun scripts/prepare.ts
 
       - name: 构建 desktop（bun run build）
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop

@@ -20,12 +20,23 @@
 # 依赖：独立文件，不与 01/02/03 共享文件，可在其之后按序应用。
 # 应用（在 opencode/ 内，基线为 brand/BASE_SHA，按 01→02→03→04→05 顺序）：
 #   git -C opencode apply --3way brand/patches/04-channel-keys-store.patch
+diff --git a/packages/desktop/src/main/storage/keys.ts b/packages/desktop/src/main/storage/keys.ts
+index 25af0f2eb9..47292d9240 100644
+--- a/packages/desktop/src/main/storage/keys.ts
++++ b/packages/desktop/src/main/storage/keys.ts
+@@ -9,3 +9,6 @@ export const BACKGROUND_COLOR_KEY = "backgroundColor"
+ export const WINDOW_IDS_KEY = "windowIds"
+ 
+ export const BUNDLED_CLI_VERSION_KEY = "bundledCliVersion"
++
++// [cx] US-003: 本地 key 列表存储键（值为 ChannelKeysState 对象，见 store-channel-keys.ts）。
++export const CHANNEL_KEYS_KEY = "channelKeys"
 diff --git a/packages/desktop/src/main/store-channel-keys.ts b/packages/desktop/src/main/store-channel-keys.ts
 new file mode 100644
-index 000000000..deef7f087
+index 0000000000..8d672a211c
 --- /dev/null
 +++ b/packages/desktop/src/main/store-channel-keys.ts
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,146 @@
 +// [cx] US-003: 本地 key 列表存储模型 —— 多渠道 API Key 的持久化读写封装。
 +//
 +// 目的：让用户导入的多个 `sk-…` API Token 持久保存在本地，重启 App 后仍在，
@@ -45,8 +56,11 @@ index 000000000..deef7f087
 +//     严禁把 `key` 字段带进日志或网络请求（调 AI 由内核 sidecar 经 config 注入完成）。
 +
 +import { randomUUID } from "node:crypto"
-+import { getStore } from "./store"
-+import { CHANNEL_KEYS_KEY } from "./store-keys"
++// [cx] 上游 v2 把 main 进程模块化（commit 76e7b556b6）：store.ts → storage/store.ts、
++// store-keys.ts → storage/keys.ts。本文件仍留在 main/ 根下（它是二开新增文件，不属上游
++// storage/ 那组），只跟随改 import 路径。
++import { getStore } from "./storage/store"
++import { CHANNEL_KEYS_KEY } from "./storage/keys"
 +
 +// 单个渠道 key 条目。`key` 为 new-api 的 API Token（`sk-…`），仅本地持有。
 +// [cx] US-009: 新增可选 `models` —— 切换激活 key 时拉取该 key 的 /v1/models 得到的可用
@@ -169,13 +183,3 @@ index 000000000..deef7f087
 +  const cleaned = Array.from(new Set(entry.models.filter((m): m is string => typeof m === "string" && m.length > 0)))
 +  return { ...entry, models: cleaned }
 +}
-diff --git a/packages/desktop/src/main/store-keys.ts b/packages/desktop/src/main/store-keys.ts
-index 506924b74..8e727adb4 100644
---- a/packages/desktop/src/main/store-keys.ts
-+++ b/packages/desktop/src/main/store-keys.ts
-@@ -4,3 +4,5 @@ export const FIRST_LAUNCH_ONBOARDING_COMPLETE_KEY = "firstLaunchOnboardingComple
- export const WSL_SERVERS_KEY = "wslServers"
- export const PINCH_ZOOM_ENABLED_KEY = "pinchZoomEnabled"
- export const WINDOW_IDS_KEY = "windowIds"
-+// [cx] US-003: 本地 key 列表存储键（值为 ChannelKeysState 对象，见 store-channel-keys.ts）。
-+export const CHANNEL_KEYS_KEY = "channelKeys"
