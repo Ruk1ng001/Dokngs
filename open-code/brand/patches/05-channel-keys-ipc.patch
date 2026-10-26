@@ -96,7 +96,7 @@ index 0000000000..9d9b6ccdda
 +  ),
 +)
 diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
-index e09f6cdf0d..1c269fc252 100644
+index 824061a2af..ac26c0e060 100644
 --- a/packages/desktop/src/main/ipc.ts
 +++ b/packages/desktop/src/main/ipc.ts
 @@ -8,6 +8,8 @@ import { DragCancelEvent, IpcTransportPort } from "../shared/ipc-transport"
@@ -118,11 +118,11 @@ index e09f6cdf0d..1c269fc252 100644
  
  export const layer = RpcServer.layer(DesktopRpcs, { disableFatalDefects: true }).pipe(
 diff --git a/packages/desktop/src/shared/ipc-rpc.ts b/packages/desktop/src/shared/ipc-rpc.ts
-index 5475342e97..e13747a7c4 100644
+index b105514190..a573e72978 100644
 --- a/packages/desktop/src/shared/ipc-rpc.ts
 +++ b/packages/desktop/src/shared/ipc-rpc.ts
 @@ -1,5 +1,7 @@
- import { RpcClient, RpcClientError } from "effect/unstable/rpc"
+ import { RpcClient, RpcClientError } from "effect/rpc"
  import { AppRpcs } from "./ipc-rpc/app"
 +// [cx] US-009: 本地 key 管理通道（二开新增域，见 ipc-rpc/channel-keys.ts）。
 +import { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
@@ -157,7 +157,7 @@ index 5475342e97..e13747a7c4 100644
  export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>
 diff --git a/packages/desktop/src/shared/ipc-rpc/channel-keys.ts b/packages/desktop/src/shared/ipc-rpc/channel-keys.ts
 new file mode 100644
-index 0000000000..2b2ed0e7d7
+index 0000000000000000000000000000000000000000..d7b823b0ca8dc00a8f8a37b697b3f2ccbfeb2abe
 --- /dev/null
 +++ b/packages/desktop/src/shared/ipc-rpc/channel-keys.ts
 @@ -0,0 +1,90 @@
@@ -178,7 +178,7 @@ index 0000000000..2b2ed0e7d7
 +// （渲染侧 key 管理 UI 需要回显/编辑），绝不上传、绝不写日志。handler 侧不打印任何入参。
 +
 +import { Schema } from "effect"
-+import { Rpc, RpcGroup } from "effect/unstable/rpc"
++import { Rpc, RpcGroup } from "effect/rpc"
 +
 +// 单个渠道 key 条目。与 main/store-channel-keys.ts 的 ChannelKey 同构——那边是被同步读写的
 +// 纯数据层（不引 Schema），此处是过线的编解码契约；两者结构不一致时 handler 处 typecheck 即报错。

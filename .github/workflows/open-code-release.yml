@@ -168,13 +168,6 @@ jobs:
             echo "need=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 安装 Bun
-        if: steps.detect.outputs.need == 'true'
-        uses: oven-sh/setup-bun@v2
-        with:
-          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
-          bun-version-file: open-code/opencode/package.json
-
       - name: 切到新 tag 并按 NN 序重放补丁（strict apply）
         id: replay
         if: steps.detect.outputs.need == 'true'
@@ -288,6 +281,14 @@ jobs:
           EOF
           )"
           echo "已创建 issue。"
+
+      # 必须在切换目标 tag 后安装：新版 packageManager/typecheck 可能要求新版 Bun。
+      - name: 安装 Bun
+        if: steps.detect.outputs.need == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
+          bun-version-file: open-code/opencode/package.json
 
       - name: 安装依赖 + typecheck（app + desktop）
         if: steps.detect.outputs.need == 'true'

@@ -1,25 +1,23 @@
 diff --git a/packages/gui-extensions/src/updater/platform.ts b/packages/gui-extensions/src/updater/platform.ts
-index d3726d82c5..ae823b3cbb 100644
+index 047c13eb0d..3d63bf0463 100644
 --- a/packages/gui-extensions/src/updater/platform.ts
 +++ b/packages/gui-extensions/src/updater/platform.ts
 @@ -1,4 +1,4 @@
--import { app, autoUpdater, shell } from "electron"
+-import { app, autoUpdater } from "electron"
 +import { app, autoUpdater, dialog, shell } from "electron"
  import pkg from "electron-updater"
  import { Effect } from "effect"
  import type { Platform } from "./machine"
-@@ -10,6 +10,10 @@ const restartTimeout = 10_000
+@@ -6,6 +6,8 @@ import type { Platform } from "./machine"
+ const updateClient = pkg.autoUpdater
  
- const stableArtifact = "https://opencode.ai/update/api/latest/desktop/opencode"
- 
-+// [dokng] 自更新装不上时的兜底入口：引导用户去官网下载新包覆盖安装（覆盖安装不动 userData，
-+// 本地 key 列表与画布数据都在）。
+ const restartTimeout = 10_000
++// [dokng] 自动安装失败时提供覆盖安装入口，保留用户数据。
 +const downloadPage = "https://dokng.com/"
-+
+ 
  export const make = Effect.fn("Updater.platform")(function* (channel: string) {
-   const external = requiresStableMacInstaller(process.platform, channel)
    const userAgent = `opencode/${channel === "prod" ? "latest" : channel}/${app.getVersion()}/desktop`
-@@ -22,7 +26,9 @@ export const make = Effect.fn("Updater.platform")(function* (channel: string) {
+@@ -18,7 +20,9 @@ export const make = Effect.fn("Updater.platform")(function* (channel: string) {
    }
    updateClient.channel = "latest"
    updateClient.requestHeaders = { "User-Agent": userAgent }
@@ -30,20 +28,14 @@ index d3726d82c5..ae823b3cbb 100644
    updateClient.allowDowngrade = true
    updateClient.autoDownload = false
    updateClient.autoInstallOnAppQuit = process.platform === "darwin"
-@@ -132,8 +138,37 @@ const installAndRestart = Effect.callback<void, Error>((resume) => {
+@@ -130,4 +134,27 @@ const installAndRestart = Effect.callback<void, Error>((resume) => {
          Effect.andThen(Effect.fail(new Error("Update restart did not start"))),
        ),
    }),
-+  // [dokng] macOS 上 ad-hoc 签名包（CI 以 CX_UNSIGNED=1 出包）的自更新在架构上必然失败：
-+  // Squirrel.Mac 安装前会用正在运行 app 的 designated requirement 校验新包，ad-hoc 签名的
-+  // cdhash 必然随版本变化，校验永远不会通过。失败后 machine.ts 把状态退回 ready，用户只会
-+  // 原地重复点「安装并重启」，所以这里给一次明确的手动覆盖安装引导。
-+  // 挂在 installAndRestart 而非 renderer 的 actions.tsx：prod 渠道下「检查更新」既能从标题栏
-+  // 触发（renderer，失败有 toast），也能从应用菜单触发（main.ts 的 show，失败没有任何 UI），
-+  // 这里是两条路径唯一的汇合点。
++  // [dokng] ad-hoc 签名包等安装失败时，菜单和界面两条入口都能得到下载指引。
 +  Effect.tapError(notifyInstallFailure),
  )
- 
++
 +function notifyInstallFailure(error: Error) {
 +  return Effect.gen(function* () {
 +    const result = yield* Effect.promise(() =>
@@ -58,13 +50,9 @@ index d3726d82c5..ae823b3cbb 100644
 +      }),
 +    )
 +
-+    if (result.response === 0) yield* openExternal(downloadPage)
++    if (result.response === 0) yield* Effect.tryPromise(() => shell.openExternal(downloadPage))
 +  }).pipe(
-+    // 引导本身失败不该盖掉真正的安装错误：tapError 要原样放行上游的 error。
++    // 指引失败仍保留原始安装错误。
 +    Effect.catchCause((cause) => Effect.logError("could not show the install failure guidance", { cause, error })),
 +  )
 +}
-+
- // Only web links leave the app; a failure to open one is not an install error.
- function openExternal(url: string) {
-   if (!URL.canParse(url) || !["http:", "https:"].includes(new URL(url).protocol))

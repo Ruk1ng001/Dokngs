@@ -237,7 +237,7 @@ index 353119cf06..a2ee4fa565 100644
  
  interface ImportMeta {
 diff --git a/packages/desktop/src/main/service/background-service.ts b/packages/desktop/src/main/service/background-service.ts
-index 2d156b25e8..da9bae9f35 100644
+index 7bcc6ef16e..e89fba9afa 100644
 --- a/packages/desktop/src/main/service/background-service.ts
 +++ b/packages/desktop/src/main/service/background-service.ts
 @@ -1,5 +1,7 @@
@@ -268,8 +268,8 @@ index 2d156b25e8..da9bae9f35 100644
    const ensure = () =>
      client.Service.ensure({
        file:
-@@ -48,6 +63,7 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
-           ? path.join(app.getPath("userData"), "opencode", "service-local.json")
+@@ -52,6 +67,7 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
+             )
            : undefined,
        version,
 +      env: channelEnv,

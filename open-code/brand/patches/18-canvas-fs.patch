@@ -135,7 +135,7 @@ index 0000000000..1621bd6182
 +  ),
 +)
 diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
-index 1c269fc252..fdbdf56a99 100644
+index ac26c0e060..d26457a957 100644
 --- a/packages/desktop/src/main/ipc.ts
 +++ b/packages/desktop/src/main/ipc.ts
 @@ -9,6 +9,7 @@ import { Extensions } from "./extension"
@@ -455,11 +455,11 @@ index 0f72f1fba5..d2fd9cb17f 100644
      channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => invoke("ChannelKeysAdd", input),
      channelKeysRemove: (id: string) => invoke("ChannelKeysRemove", { id }),
 diff --git a/packages/desktop/src/shared/ipc-rpc.ts b/packages/desktop/src/shared/ipc-rpc.ts
-index e13747a7c4..1c74bfbae8 100644
+index a573e72978..ea2837793b 100644
 --- a/packages/desktop/src/shared/ipc-rpc.ts
 +++ b/packages/desktop/src/shared/ipc-rpc.ts
 @@ -1,6 +1,7 @@
- import { RpcClient, RpcClientError } from "effect/unstable/rpc"
+ import { RpcClient, RpcClientError } from "effect/rpc"
  import { AppRpcs } from "./ipc-rpc/app"
  // [cx] US-009: 本地 key 管理通道（二开新增域，见 ipc-rpc/channel-keys.ts）。
 +import { CanvasRpcs } from "./ipc-rpc/canvas"
@@ -476,13 +476,13 @@ index e13747a7c4..1c74bfbae8 100644
  export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>
 diff --git a/packages/desktop/src/shared/ipc-rpc/canvas.ts b/packages/desktop/src/shared/ipc-rpc/canvas.ts
 new file mode 100644
-index 0000000000..a831376368
+index 0000000000000000000000000000000000000000..c9ab4adc1d01b213b2785cad608a212be943f493
 --- /dev/null
 +++ b/packages/desktop/src/shared/ipc-rpc/canvas.ts
 @@ -0,0 +1,31 @@
 +// [dokng] Typed transport for the existing canvas media and state storage.
 +import { Schema } from "effect"
-+import { Rpc, RpcGroup } from "effect/unstable/rpc"
++import { Rpc, RpcGroup } from "effect/rpc"
 +
 +export const CanvasFileWrite = Rpc.make("CanvasFileWrite", {
 +  payload: { key: Schema.String, base64: Schema.String, mime: Schema.optionalKey(Schema.String) },

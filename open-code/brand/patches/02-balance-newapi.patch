@@ -1,106 +1,82 @@
 diff --git a/packages/desktop/electron.vite.config.ts b/packages/desktop/electron.vite.config.ts
-index abc14f75e9..1ee272ad70 100644
+index d238411283..9f5b46487f 100644
 --- a/packages/desktop/electron.vite.config.ts
 +++ b/packages/desktop/electron.vite.config.ts
-@@ -1,5 +1,7 @@
+@@ -1,4 +1,5 @@
  import { defineConfig } from "electron-vite"
- import { pickerPlugin } from "./scripts/picker"
-+// [dokng] 画布产物拷贝插件用（上游原先为 copy-server-assets 导入过 fs，该插件移除后导入也没了）。
 +import { access, cp, rm } from "node:fs/promises"
+ import type { Plugin } from "vite"
+ import { pickerPlugin } from "./scripts/picker"
+ import { nodePtyPackage } from "./scripts/utils"
+@@ -13,6 +14,19 @@ function resolveChannel() {
+   return "dev"
+ }
  
- const channel = (() => {
-   const raw = process.env.OPENCODE_CHANNEL
-@@ -13,6 +15,32 @@ const channel = (() => {
- 
- const nodePtyPkg = `@lydell/node-pty-${process.platform}-${process.arch}`
- 
-+// [cx] US-003: 默认 locale 由品牌配置集中控制；缺失或非字符串时回退中文。
-+// renderer 运行时无法读取父仓库 brand.json，故在构建期注入 import.meta.env。
++// [dokng] 品牌配置和渠道值在构建时注入，桌面运行时无需访问父仓库或 CI 环境变量。
 +const brandConfig = await import("../../../brand/brand.json", { with: { type: "json" } })
 +const DEFAULT_LOCALE = typeof brandConfig.default.defaultLocale === "string" ? brandConfig.default.defaultLocale : "zh"
-+// [cx] 品牌产品名：集中在 brand.json 的 productName，构建期注入 renderer（i18n runtime 替换）
-+// 与主进程（应用菜单）。缺失时回退 "OpenCode"（等于不改名，保持上游原样）。
 +const PRODUCT_NAME = typeof brandConfig.default.productName === "string" ? brandConfig.default.productName : "OpenCode"
-+
-+// [cx] 内置默认渠道地址：未配置 NEWAPI_BASE_URL 时（如未设 CI Secret），回退到内置中转站。
-+// 必须带 /v1（OpenAI 兼容路径）：openai-compatible SDK 以 <base>/chat/completions 发请求，
-+// 模型查询走 <base>/models（见 balance-panel 的 deriveModelsUrl）。配了 Secret 则以 Secret 为准。
 +const DEFAULT_NEWAPI_BASE_URL = "https://dokng.com/v1"
-+
-+// [cx] US-006: 把 US-003 注入的同名渠道变量在构建期喂给 renderer（浏览器上下文读不到
-+// process.env）。baseURL 缺失回退内置默认；key 缺失即空串，余额面板据此显示「未配置凭据」态。
-+// 凭据仅内联到打包产物，与上游 OPENCODE_CHANNEL / VITE_SENTRY_* 的 define 注入方式一致。
 +const newapiDefine = {
 +  "import.meta.env.DEFAULT_LOCALE": JSON.stringify(DEFAULT_LOCALE),
-+  // [cx] 品牌产品名，供 renderer 侧 i18n runtime 替换（context/language.tsx）与账户面板等使用。
 +  "import.meta.env.PRODUCT_NAME": JSON.stringify(PRODUCT_NAME),
 +  "import.meta.env.NEWAPI_BASE_URL": JSON.stringify(process.env.NEWAPI_BASE_URL || DEFAULT_NEWAPI_BASE_URL),
 +  "import.meta.env.NEWAPI_API_KEY": JSON.stringify(process.env.NEWAPI_API_KEY ?? ""),
-+  // [cx] US-007: 充值页面 URL。缺省时余额面板回退到由 NEWAPI_BASE_URL 推导的站点根。
 +  "import.meta.env.NEWAPI_TOPUP_URL": JSON.stringify(process.env.NEWAPI_TOPUP_URL ?? ""),
 +}
 +
  const appPlugin = (await import("@opencode/app/vite")).default
  
  const sentry =
-@@ -71,6 +99,16 @@ export default defineConfig(({ command }) => ({
-     define: {
-       // Local renderer/server mode still uses the dev application identity and updater policy.
-       "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel === "local" ? "dev" : channel),
-+      // [cx] US-锁定渠道: 主进程运行时读不到 process.env 里的渠道值（打包产物在用户机器上
-+      // 无这些环境变量），故与 renderer 同款在构建期内联。main/channel-config.ts 据此构造
-+      // 内置渠道 config 文件、经 OPENCODE_CONFIG 注入内核 sidecar，使 App 默认走内置渠道。
-+      // 三者缺失即不写有效配置、退回 opencode 原生行为（不破坏 dev）。
-+      // baseURL 缺失回退内置默认（DEFAULT_NEWAPI_BASE_URL，带 /v1）；key / model 缺失即空串。
-+      "import.meta.env.NEWAPI_BASE_URL": JSON.stringify(process.env.NEWAPI_BASE_URL || DEFAULT_NEWAPI_BASE_URL),
-+      "import.meta.env.NEWAPI_API_KEY": JSON.stringify(process.env.NEWAPI_API_KEY ?? ""),
-+      "import.meta.env.NEWAPI_MODEL": JSON.stringify(process.env.NEWAPI_MODEL ?? ""),
-+      // [cx] 品牌名注入主进程（desktop-menu 的菜单 label 用；主进程读不到 process.env 里的品牌值）。
-+      "import.meta.env.PRODUCT_NAME": JSON.stringify(PRODUCT_NAME),
-     },
-     build: {
-       minify: command === "build",
-@@ -135,8 +173,39 @@ const require = __cjs_mod__.createRequire(import.meta.url);
-       "import.meta.env.OPENCODE_TEST_ONBOARDING": JSON.stringify(
-         command === "serve" && process.env.OPENCODE_TEST_ONBOARDING === "1",
-       ),
-+      // [cx] US-006: 把 US-003 注入的同名渠道变量透传到 renderer 的 import.meta.env，
-+      // 供独立余额面板拉取 new-api 余额/用量用。renderer 是浏览器上下文读不到 process.env，
-+      // 故在构建期 define 注入；未注入时为空串，面板据此显示「未配置凭据」。不硬编码任何值。
-+      // 展开而非另设 define 键：上游 v2 给 renderer 加了自己的 define（版本/渠道/onboarding），
-+      // 同名键会相互覆盖，必须合并在一个对象里。
-+      ...newapiDefine,
-     },
--    plugins: [pickerPlugin(), appPlugin, sentry],
-+    plugins: [
-+      pickerPlugin(),
-+      appPlugin,
-+      sentry,
-+      // [dokng] 画布产物拷贝（待办 4）：把 prebuild 阶段以 VITE_BASE=/canvas/ 构建出的
-+      // infinite-canvas web/dist/ 递归拷进 out/renderer/canvas/。因 oc:// 特权协议已白名单
-+      // out/renderer 全子树，iframe 以 oc://renderer/canvas/index.html 加载，主进程/协议零改。
-+      // 放 writeBundle（renderer 构建后 out/renderer 已存在、不会被 emptyOutDir 清掉）。
-+      {
-+        name: "dokng:copy-canvas",
-+        async writeBundle() {
-+          const CANVAS_DIST = "../../../infinite-canvas/web/dist"
-+          const DEST = "./out/renderer/canvas"
-+          try {
-+            await access(CANVAS_DIST)
-+          } catch {
-+            // dev（electron-vite dev 不跑 prebuild）或未构建画布时跳过，不阻断桌面构建。
-+            console.warn(`[dokng:copy-canvas] 未找到画布产物 ${CANVAS_DIST}，跳过拷贝（dev 或未构建画布时正常）。`)
-+            return
-+          }
-+          await rm(DEST, { recursive: true, force: true })
-+          await cp(CANVAS_DIST, DEST, { recursive: true })
-+          console.log(`[dokng:copy-canvas] 已拷贝画布产物 → ${DEST}`)
+@@ -62,6 +76,11 @@ export default defineConfig(({ command }) => {
+       define: {
+         // Local renderer/server mode still uses the dev application identity and updater policy.
+         "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel === "local" ? "dev" : channel),
++        // [dokng] main 使用这些值生成 sidecar 的渠道配置与品牌菜单。
++        "import.meta.env.NEWAPI_BASE_URL": newapiDefine["import.meta.env.NEWAPI_BASE_URL"],
++        "import.meta.env.NEWAPI_API_KEY": newapiDefine["import.meta.env.NEWAPI_API_KEY"],
++        "import.meta.env.NEWAPI_MODEL": JSON.stringify(process.env.NEWAPI_MODEL ?? ""),
++        "import.meta.env.PRODUCT_NAME": newapiDefine["import.meta.env.PRODUCT_NAME"],
+       },
+       build: {
+         minify: command === "build",
+@@ -121,13 +140,35 @@ const require = __cjs_mod__.createRequire(import.meta.url);
+         bundledDev: true,
+       },
+       define: {
++        ...newapiDefine,
+         "import.meta.env.OPENCODE_VERSION": JSON.stringify(process.env.OPENCODE_VERSION),
+         "import.meta.env.VITE_OPENCODE_CHANNEL": JSON.stringify(channel),
+         "import.meta.env.OPENCODE_TEST_ONBOARDING": JSON.stringify(
+           command === "serve" && process.env.OPENCODE_TEST_ONBOARDING === "1",
+         ),
+       },
+-      plugins: [pickerPlugin(), appPlugin, initialChunk, sentry],
++      plugins: [
++        pickerPlugin(),
++        appPlugin,
++        initialChunk,
++        sentry,
++        {
++          name: "dokng:copy-canvas",
++          async writeBundle() {
++            const source = "../../../infinite-canvas/web/dist"
++            const dest = "./out/renderer/canvas"
++            try {
++              await access(source)
++            } catch {
++              console.warn(`[dokng:copy-canvas] 未找到画布产物 ${source}，跳过拷贝。`)
++              return
++            }
++            await rm(dest, { recursive: true, force: true })
++            await cp(source, dest, { recursive: true })
++            console.log(`[dokng:copy-canvas] 已拷贝画布产物 → ${dest}`)
++          },
 +        },
-+      },
-+    ],
-     publicDir: "../../../app/public",
-     root: "src/renderer",
-     build: {
++      ],
+       publicDir: "../../../app/public",
+       root: "src/renderer",
+       build: {
 diff --git a/packages/desktop/src/renderer/env.d.ts b/packages/desktop/src/renderer/env.d.ts
 index ba7836cbfe..d461388fec 100644
 --- a/packages/desktop/src/renderer/env.d.ts
