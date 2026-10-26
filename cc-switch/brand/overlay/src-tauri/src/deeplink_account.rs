@@ -20,8 +20,7 @@
 // React 挂载、动态 import("@tauri-apps/api/event") 完成才存在。以下三条路径都会踩空：
 //   1. Windows/Linux 冷启动（应用没在跑时点按钮——最典型场景）：OS 把 URL 作 argv 启动进程，
 //      single_instance 只对第 2+ 个实例触发，deep-link 插件在自己的 init 阶段就 emit 了，
-//      而上游 on_open_url 注册在 setup（晚于插件 init）。上游从不调 get_current()，
-//      所以这条 URL 根本无人接手；
+//      上游 setup 通过 get_current() 补取，再交给 handle_deeplink_url，但前端可能尚未挂载；
 //   2. macOS 冷启动：RunEvent::Opened 到达时 webview 存在但 JS 尚未挂监听器；
 //   3. 轻量模式唤醒：exit_lightweight_mode 用 WebviewWindowBuilder 重建了全新 webview，
 //      紧接着 emit，页面 JS 必然还没加载完。
@@ -29,12 +28,10 @@
 // PENDING；前端 hook 挂载时先调 take_pending_account_import 取一次。哪条先到都不丢，
 // 且 PENDING 被取走即清空，配合下面的 dedup 不会重复导入。
 //
-// 冷启动那条还需要 lib.rs 在 setup 里补一次 deep_link().get_current() 的检查（补丁 02），
-// 否则 Windows/Linux 上根本没有任何代码碰过那条 URL。
+// 上游已将 on_open_url、get_current 和 single_instance 汇入 handle_deeplink_url；
+// macOS 的 Opened 也由插件转成 on_open_url，补丁 02 只需在统一入口拦截一次。
 //
-// 去重：macOS 上同一个 URL 会被投递两次——deep-link 插件的 on_event 和上游 app.run 闭包的
-// RunEvent::Opened 分支都会触发（插件在 macOS 没有自己的 objc handler，它的 on_event 就是
-// 把 RunEvent::Opened 转成 emit）。加上 emit/PENDING 双轨本身也可能重叠，故按 apiKey 记
+// 去重：get_current 与 on_open_url 可能投递同一链接；emit/PENDING 双轨也可能重叠，故按 apiKey 记
 // 最近一次处理时间，窗口内重复到达只聚焦窗口、不再投递。
 //
 // 契约（new-api 侧 data-table-row-actions.tsx 的「导入到 Dokng 桌面端」按钮生成该 URL）：
@@ -82,7 +79,7 @@ const ACCOUNT_IMPORT_EVENT: &str = "ccs-account-import";
 /// 解析失败时的前端事件名（前端弹 toast，避免用户点了按钮毫无反应）。
 const ACCOUNT_ERROR_EVENT: &str = "ccs-account-import-error";
 
-/// 同一 key 在此窗口内重复到达即视为重复投递（macOS 双入口 + emit/PENDING 双轨）。
+/// 同一 key 在此窗口内重复到达即视为重复投递（启动补取/热事件 + emit/PENDING 双轨）。
 /// 3 秒足够覆盖两条入口的时间差，又不会把用户「导入 → 删除 → 立刻重新导入」判成重复。
 const DEDUP_WINDOW: Duration = Duration::from_secs(3);
 
@@ -127,56 +124,6 @@ fn set_pending(request: AccountImportRequest) {
     match PENDING.lock() {
         Ok(mut guard) => *guard = Some(request),
         Err(poisoned) => *poisoned.into_inner() = Some(request),
-    }
-}
-
-/// [ccs] 冷启动补扫：把插件在 init 阶段已经吃掉的启动 URL 捞回来。
-///
-/// Windows/Linux 冷启动时 OS 把 URL 作为 argv 传给新进程，deep-link 插件在自己的 init 里
-/// 就 emit 掉了（此时上游的 on_open_url 尚未注册、webview 也不存在），上游从不调
-/// get_current，所以那条 URL 事实上无人接手——功能在「应用没开着时点按钮」这个最典型的
-/// 场景下会完全失效。在 setup 里调一次本函数即可补上：命中则写入 PENDING，前端挂载后取走。
-///
-/// 此处不显示窗口：冷启动的窗口本来就会显示，且 setup 阶段窗口可能还没建好。
-pub fn drain_launch_deeplinks(app: &tauri::AppHandle) {
-    use tauri_plugin_deep_link::DeepLinkExt;
-
-    let urls = match app.deep_link().get_current() {
-        Ok(Some(urls)) => urls,
-        Ok(None) => return,
-        Err(e) => {
-            log::debug!("· [ccs] 读取启动深链接失败（通常表示没有）: {e}");
-            return;
-        }
-    };
-
-    for url in urls {
-        let url_str = url.as_str();
-        let Ok(parsed) = Url::parse(url_str) else {
-            continue;
-        };
-        if !is_account_deeplink(&parsed) {
-            // 非 account 的启动链接交回上游语义（上游目前不处理冷启动，这里不越界代劳）。
-            continue;
-        }
-        match parse_account_deeplink(&parsed) {
-            Ok(request) => {
-                if is_duplicate_delivery(&request.api_key) {
-                    continue;
-                }
-                log::info!(
-                    "✓ [ccs] 冷启动账户导入深链接：name={:?}, key 长度={}",
-                    request.name,
-                    request.api_key.len()
-                );
-                set_pending(request);
-            }
-            Err(e) => {
-                log::error!("✗ [ccs] 冷启动账户导入深链接解析失败: {e}");
-            }
-        }
-        // 只取第一条 account 链接，与上游 on_open_url 的 break 语义一致。
-        break;
     }
 }
 

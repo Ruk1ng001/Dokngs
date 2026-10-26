@@ -12,8 +12,8 @@
 [02-account-backend-anchors]
 # overlay 提供 commands/account.rs + services/account.rs + deeplink_account.rs，
 # 本补丁只做接线锚点：命令注册 + services/commands mod 声明 + deeplink_account mod
-# 声明 + 两处深链接入口的 account 拦截（handle_deeplink_url、macOS RunEvent::Opened）
-# + setup 内 drain_launch_deeplinks 冷启动补扫（emit 不重放，见补丁头注释）。
+# 声明 + 统一 handle_deeplink_url 入口的 account 拦截。
+# 上游负责 get_current 冷启动补取和 macOS 事件转发；overlay 负责 pending 领取与去重。
 file = src-tauri/src/commands/mod.rs
 file = src-tauri/src/lib.rs
 file = src-tauri/src/services/mod.rs

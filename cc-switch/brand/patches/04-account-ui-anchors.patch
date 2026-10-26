@@ -14,8 +14,8 @@
 #     CcsAccountMount 内，上游升级零纠缠。
 #   - src/components/shell/Sidebar.tsx（2 处）：import openAccountPanel；底栏「设置」之后
 #     加一个 NavItem 直接调它。
-#   - src/icons/extracted/index.ts / metadata.ts：注册 dokng 品牌图标（上游高频文件，
-#     若冲突通常是上游新增了其它图标条目，rebase 时只需保住 dokng 两段插入）。
+#   - src/icons/extracted/index.ts / metadata.ts：注册 dokng 品牌图标。
+#     SVG 在 icons 对象之后独立赋值，不以其它供应商的 SVG 内容作为补丁上下文。
 #
 # 入口按钮为什么落在 Sidebar.tsx 而不在 overlay 里：上游 v4.0.0 删掉了顶栏工具条（齿轮
 #   按钮 + UpdateBadge 整条移除），改为侧栏导航 + 每屏 52px 的 AppPageHeader，账户入口
@@ -28,52 +28,34 @@
 # 应用（在 upstream/ 内，基线为 brand/BASE_SHA）：
 #   git -C upstream apply brand/patches/04-account-ui-anchors.patch
 diff --git a/src/App.tsx b/src/App.tsx
-index cde4ba9f..2d7dcef7 100644
+index 2c33b7417d18309bf9adf6230e2e0339d9c008d1..9f4aed85448c8e9fc29b587b68eb8701ecc78488 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -106,6 +106,9 @@ import UnifiedSkillsPanel from "@/components/skills/UnifiedSkillsPanel";
- import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
- import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
+@@ -109,2 +109,5 @@ import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
  import { WhatsNewNotice } from "@/components/WhatsNewDialog";
 +// [ccs] 账户功能唯一挂载点（面板 Dialog + 首启自动弹出 + 托盘事件监听），见 components/account/*。
 +// 入口按钮在侧栏底栏（见 components/shell/Sidebar.tsx 的 [ccs] NavItem）。
 +import { CcsAccountMount } from "@/components/account/CcsAccountMount";
  import { Badge } from "@/components/ui/badge";
- import { Button } from "@/components/ui/button";
- import { HoverTip } from "@/components/ui/hover-tip";
-@@ -1685,6 +1688,8 @@ function App() {
-       <FirstRunNoticeDialog />
-       <NewLayoutDialog />
+@@ -1896,2 +1899,4 @@ function App() {
        <WhatsNewNotice />
 +      {/* [ccs] 账户面板挂载（Dialog + 首启自动弹出 + 托盘 "ccs-open-account" 监听） */}
 +      <CcsAccountMount />
      </WindowControlsContext.Provider>
-   );
- }
 diff --git a/src/components/shell/Sidebar.tsx b/src/components/shell/Sidebar.tsx
-index 19ae4728..bc7fce20 100644
+index 164410ffd6a2ffaa6f0509644c4559a9e540beaa..4b31e1dacc92764c6db42eb4ef42218ceaa3dd56 100644
 --- a/src/components/shell/Sidebar.tsx
 +++ b/src/components/shell/Sidebar.tsx
-@@ -20,6 +20,7 @@ import {
-   Server,
-   Settings,
+@@ -22,2 +22,3 @@ import {
    SlidersHorizontal,
 +  UserCircle,
  } from "lucide-react";
- import type { AppId } from "@/lib/api";
- import type { VisibleApps } from "@/types";
-@@ -27,6 +28,8 @@ import { APP_IDS } from "@/config/appConfig";
- import type { GlobalPage, SettingsSection, View } from "@/lib/navigation";
- import { isAppPage } from "@/lib/navigation";
+@@ -29,2 +30,4 @@ import { isAppPage } from "@/lib/navigation";
  import { SkillsIcon } from "@/components/BrandIcons";
 +// [ccs] 账户面板开关（模块级微 store，不需要 Context/props 透传），见 components/account/*。
 +import { openAccountPanel } from "@/components/account/CcsAccountMount";
  import { useUpdate } from "@/contexts/UpdateContext";
- import { sidebarWidth, useSidebarCollapsed } from "@/hooks/useSidebarCollapsed";
- import { useSidebarStatus, type AppNavStatus } from "@/hooks/useSidebarStatus";
-@@ -332,6 +335,17 @@ function MainDirectory({
-           dotTone="success"
-           onClick={() => onSelectPage("settings")}
+@@ -385,2 +388,13 @@ function MainDirectory({
          />
 +        {/* [ccs] 账户入口：面板是 overlay 自管的 Dialog，不是一个 GlobalPage，故不走
 +            onSelectPage、selected 恒 false，直接调模块级 openAccountPanel()。 */}
@@ -87,29 +69,21 @@ index 19ae4728..bc7fce20 100644
 +          onClick={openAccountPanel}
 +        />
        </div>
-     </>
-   );
 diff --git a/src/icons/extracted/index.ts b/src/icons/extracted/index.ts
-index 34ea3490..de96f675 100644
+index 7675bbb9089ec412e83357dad0d4b9eaf2a19cda..51860a8082f16a5d7d32906caa1137e92881b405 100644
 --- a/src/icons/extracted/index.ts
 +++ b/src/icons/extracted/index.ts
-@@ -123,6 +123,9 @@ export const icons: Record<string, string> = {
-   qwencloud: `<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" style="flex:none;line-height:1" viewBox="0 0 28 28" fill="none"><defs><clipPath id="master_svg0_946_6412"><rect x="0.416" y="0" width="27.168" height="28" rx="0"/></clipPath><linearGradient x1="-0.948" y1="-1.094" x2="1.293" y2="0.905" id="master_svg1_946_6315"><stop offset="1%" stop-color="#4F21FF"/><stop offset="100%" stop-color="#D75BFE"/></linearGradient><linearGradient x1="-0.445" y1="-0.717" x2="2.066" y2="1.232" id="master_svg2_946_6328"><stop offset="1%" stop-color="#4F21FF"/><stop offset="100%" stop-color="#D75BFE"/></linearGradient><linearGradient x1="-0.127" y1="0.114" x2="1.363" y2="2.901" id="master_svg3_946_6325"><stop offset="1%" stop-color="#4F21FF"/><stop offset="100%" stop-color="#D75BFE"/></linearGradient><linearGradient x1="0" y1="-0.09" x2="2.241" y2="1.908" id="master_svg4_946_6318"><stop offset="1%" stop-color="#4F21FF"/><stop offset="100%" stop-color="#D75BFE"/></linearGradient><linearGradient x1="-0.503" y1="-0.792" x2="2.007" y2="1.157" id="master_svg6_946_6331"><stop offset="1%" stop-color="#4F21FF"/><stop offset="100%" stop-color="#D75BFE"/></linearGradient><linearGradient x1="-2.119" y1="-0.848" x2="-0.63" y2="1.939" id="master_svg7_946_6321"><stop offset="1%" stop-color="#4F21FF"/><stop offset="100%" stop-color="#D75BFE"/></linearGradient></defs><g clip-path="url(#master_svg0_946_6412)"><path d="M27.048,16.092L23.281,13.917C23.373,13.757,23.424,13.573,23.424,13.381L23.424,12.217C23.424,11.834,23.22,11.48,22.888,11.289L21.88,10.707C21.548,10.515,21.14,10.515,20.808,10.707L17.719,12.49C17.388,12.681,17.184,13.035,17.184,13.417L17.184,14.582C17.184,14.965,17.388,15.318,17.719,15.509L24.968,19.694C25.3,19.886,25.708,19.886,26.039,19.694L27.048,19.112C27.38,18.92,27.584,18.567,27.584,18.184L27.584,17.02C27.584,16.637,27.38,16.283,27.048,16.092L27.048,16.092Z" fill="url(#master_svg1_946_6315)"/><path d="M22.336,3.746L18.569,5.921C18.476,5.761,18.342,5.624,18.176,5.528L17.168,4.946C16.836,4.755,16.428,4.755,16.096,4.946L15.087,5.528C14.756,5.72,14.552,6.074,14.552,6.456L14.552,10.022C14.552,10.405,14.756,10.759,15.087,10.95L16.096,11.532C16.428,11.724,16.836,11.724,17.168,11.532L24.416,7.348C24.748,7.156,24.952,6.802,24.952,6.42L24.952,5.255C24.952,4.872,24.748,4.519,24.416,4.328L23.407,3.746C23.076,3.554,22.668,3.554,22.336,3.746L22.336,3.746Z" fill="url(#master_svg2_946_6328)"/><path d="M9.288,1.653L9.288,6.004C9.103,6.004,8.918,6.052,8.752,6.147L7.743,6.73C7.412,6.921,7.208,7.275,7.208,7.657L7.208,8.822C7.208,9.205,7.412,9.558,7.743,9.749L10.832,11.532C11.164,11.724,11.572,11.724,11.904,11.532L12.912,10.95C13.244,10.759,13.448,10.405,13.448,10.022L13.448,1.653C13.448,1.27,13.244,0.917,12.912,0.726L11.904,0.144C11.572,-0.048,11.164,-0.048,10.832,0.144L9.823,0.726C9.492,0.917,9.288,1.271,9.288,1.653Z" fill="url(#master_svg3_946_6325)"/><path d="M0.952,11.907L4.72,14.083C4.627,14.243,4.576,14.427,4.576,14.618L4.576,15.783C4.576,16.166,4.78,16.52,5.112,16.71L6.121,17.293C6.452,17.484,6.86,17.484,7.192,17.293L10.281,15.51C10.612,15.318,10.816,14.965,10.816,14.582L10.816,13.418C10.816,13.035,10.612,12.681,10.281,12.49L3.032,8.305C2.7,8.113,2.292,8.113,1.96,8.305L0.952,8.887C0.62,9.079,0.416,9.432,0.416,9.815L0.416,10.979C0.416,11.362,0.62,11.716,0.952,11.907L0.952,11.907Z" fill="url(#master_svg4_946_6318)"/><path d="M27.048,16.092L23.281,13.917C23.373,13.757,23.424,13.573,23.424,13.381L23.424,12.217C23.424,11.834,23.22,11.48,22.888,11.289L21.88,10.707C21.548,10.515,21.14,10.515,20.808,10.707L17.719,12.49C17.388,12.681,17.184,13.035,17.184,13.417L17.184,14.582C17.184,14.965,17.388,15.318,17.719,15.509L24.968,19.694C25.3,19.886,25.708,19.886,26.039,19.694L27.048,19.112C27.38,18.92,27.584,18.567,27.584,18.184L27.584,17.02C27.584,16.637,27.38,16.283,27.048,16.092L27.048,16.092Z" fill="url(#master_svg1_946_6315)"/><path d="M5.664,24.253L9.432,22.078C9.524,22.238,9.658,22.375,9.824,22.47L10.833,23.053C11.164,23.244,11.572,23.244,11.904,23.053L12.913,22.47C13.244,22.279,13.448,21.925,13.448,21.543L13.448,17.977C13.448,17.594,13.244,17.24,12.913,17.049L11.904,16.467C11.572,16.275,11.164,16.275,10.833,16.467L3.584,20.651C3.253,20.843,3.049,21.197,3.049,21.579L3.049,22.744C3.049,23.127,3.253,23.48,3.584,23.671L4.593,24.253C4.925,24.445,5.333,24.445,5.664,24.253L5.664,24.253Z" fill="url(#master_svg6_946_6331)"/><path d="M18.712,26.346L18.712,21.995C18.897,21.995,19.082,21.948,19.248,21.852L20.256,21.27C20.588,21.078,20.792,20.725,20.792,20.342L20.792,19.178C20.792,18.795,20.588,18.441,20.256,18.25L17.168,16.467C16.836,16.276,16.428,16.276,16.096,16.467L15.087,17.049C14.756,17.241,14.552,17.595,14.552,17.977L14.552,26.347C14.552,26.73,14.756,27.083,15.087,27.274L16.096,27.856C16.428,28.048,16.836,28.048,17.168,27.856L18.176,27.274C18.508,27.083,18.712,26.729,18.712,26.347L18.712,26.346Z" fill="url(#master_svg7_946_6321)"/></g></svg>`,
-   therouter: `<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" style="flex:none;line-height:1" viewBox="0 0 512 512" fill="none"><title>TheRouter</title><path d="M179.883 259.836H456.879M456.879 259.836L302.56 138.854M456.879 259.836L302.56 373.828" stroke="currentColor" stroke-width="43.0159" stroke-linecap="round"/><path d="M50 120L138.311 170.986C156.278 181.36 167.346 200.531 167.346 221.278V289.722C167.346 310.469 156.278 329.64 138.311 340.014L50 391" stroke="currentColor" stroke-width="20.9489" stroke-linecap="round"/></svg>`,
-   together: `<svg height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><title>together.ai</title><path d="M23.197 4.503A6 6 0 0015 2.307a5.973 5.973 0 00-2.995 4.933l5.996.008v.515h-5.996c.039.937.298 1.87.8 2.74a6 6 0 1010.39-6z" fill="#EF2CC1"></path><path d="M.805 4.5A6 6 0 003 12.697a5.972 5.972 0 005.77.127L5.779 7.627l.446-.257 2.997 5.192A6 6 0 10.804 4.5z" fill="#CAAEF5"></path><path d="M12 23.894a6 6 0 005.999-6c0-2.13-1.1-3.996-2.775-5.06l-3.005 5.189-.444-.258 2.997-5.192A6 6 0 1012 23.894z" fill="#FC4C02"></path></svg>`,
-+  // [ccs] Dokng 品牌图标。来自 brand/icons/logo.svg（open-code 同款），压单行 + defs id 加
-+  // dokng- 前缀防与页面其它 inline SVG 的 gradient/filter id 冲突 + 尺寸改 1em 适配图标系统。
-+  dokng: `<svg width="1em" height="1em" style="flex:none;line-height:1" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><title>Dokng</title><defs><linearGradient id="dokng-bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse"><stop stop-color="#f8fafc"/><stop offset=".5" stop-color="#eff6ff"/><stop offset="1" stop-color="#e0e7ff"/></linearGradient><linearGradient id="dokng-main" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#06b6d4"/><stop offset=".5" stop-color="#3b82f6"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient><linearGradient id="dokng-sheen" x1="8" y1="6" x2="40" y2="42" gradientUnits="userSpaceOnUse"><stop stop-color="#ffffff" stop-opacity=".92"/><stop offset=".5" stop-color="#ffffff" stop-opacity=".18"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient><radialGradient id="dokng-glow" cx="0.34" cy="0.28" r="0.8"><stop stop-color="#38bdf8" stop-opacity=".2"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></radialGradient><filter id="dokng-soft" x="-35%" y="-35%" width="170%" height="170%"><feGaussianBlur stdDeviation=".8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#dokng-bg)" stroke="#c7d2fe"/><rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#dokng-glow)"/><rect x="2.4" y="2.4" width="43.2" height="43.2" rx="13.1" fill="url(#dokng-sheen)" opacity=".55"/><rect x="2.8" y="2.8" width="42.4" height="42.4" rx="12.7" fill="none" stroke="#ffffff" stroke-opacity=".5" stroke-width=".75"/><circle cx="24" cy="24" r="17.6" fill="none" stroke="#e0e7ff" stroke-width=".85" stroke-dasharray="1.5 2.3"/><circle cx="24" cy="24" r="15.35" fill="none" stroke="#c7d2fe" stroke-width="1" opacity=".68"/><circle cx="24" cy="24" r="13.35" fill="none" stroke="#ddd6fe" stroke-width="1.1" opacity=".82"/><path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#dokng-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#dokng-soft)"/><path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#dokng-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#dokng-soft)"/><path d="M11.8 15 A15.05 15.05 0 0 1 17.7 9.2" fill="none" stroke="#67e8f9" stroke-width="1.1" stroke-linecap="round" opacity=".5"/><path d="M36.2 33 A15.05 15.05 0 0 1 30.3 38.8" fill="none" stroke="#c4b5fd" stroke-width="1.1" stroke-linecap="round" opacity=".5"/><g filter="url(#dokng-soft)"><circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4"/><circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6"/></g><circle cx="38.05" cy="17.05" r="1" fill="#ecfeff"/><circle cx="9.95" cy="30.95" r="1" fill="#f5f3ff"/><circle cx="17.7" cy="9.2" r=".9" fill="#22d3ee" opacity=".65"/><circle cx="30.3" cy="38.8" r=".9" fill="#a78bfa" opacity=".65"/><path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#dokng-main)" stroke-width="2.25" stroke-linecap="round"/><path d="M15.6 22 C13.1 22 13.4 26.6 15.3 27.8" fill="none" stroke="url(#dokng-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4"/><path d="M32.4 22 C34.9 22 34.6 26.6 32.7 27.8" fill="none" stroke="url(#dokng-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4"/><circle cx="20.2" cy="22.1" r="1.5" fill="#06b6d4"/><circle cx="20.2" cy="22.1" r=".52" fill="#ffffff" opacity=".75"/><circle cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6"/><circle cx="27.8" cy="22.1" r=".52" fill="#ffffff" opacity=".75"/><ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#dokng-main)"/><ellipse cx="24" cy="27.35" rx="1.35" ry=".6" fill="#ffffff" opacity=".65"/><circle cx="14.8" cy="12.4" r=".7" fill="#22d3ee" opacity=".55"/><circle cx="33.2" cy="35.6" r=".7" fill="#a78bfa" opacity=".55"/><path d="M9 24h1.8M37.2 24h1.8" stroke="#93c5fd" stroke-width=".8" stroke-linecap="round" opacity=".35"/></svg>`,
- };
+@@ -158,2 +158,5 @@ export const icons: Record<string, string> = {
  
++// [ccs] 独立注册品牌图标，补丁不依赖上游 SVG 条目的内容或顺序。
++icons.dokng = `<svg width="1em" height="1em" style="flex:none;line-height:1" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><title>Dokng</title><defs><linearGradient id="dokng-bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse"><stop stop-color="#f8fafc"/><stop offset=".5" stop-color="#eff6ff"/><stop offset="1" stop-color="#e0e7ff"/></linearGradient><linearGradient id="dokng-main" x1="10" y1="8" x2="38" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#06b6d4"/><stop offset=".5" stop-color="#3b82f6"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient><linearGradient id="dokng-sheen" x1="8" y1="6" x2="40" y2="42" gradientUnits="userSpaceOnUse"><stop stop-color="#ffffff" stop-opacity=".92"/><stop offset=".5" stop-color="#ffffff" stop-opacity=".18"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient><radialGradient id="dokng-glow" cx="0.34" cy="0.28" r="0.8"><stop stop-color="#38bdf8" stop-opacity=".2"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></radialGradient><filter id="dokng-soft" x="-35%" y="-35%" width="170%" height="170%"><feGaussianBlur stdDeviation=".8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#dokng-bg)" stroke="#c7d2fe"/><rect x="1.5" y="1.5" width="45" height="45" rx="14" fill="url(#dokng-glow)"/><rect x="2.4" y="2.4" width="43.2" height="43.2" rx="13.1" fill="url(#dokng-sheen)" opacity=".55"/><rect x="2.8" y="2.8" width="42.4" height="42.4" rx="12.7" fill="none" stroke="#ffffff" stroke-opacity=".5" stroke-width=".75"/><circle cx="24" cy="24" r="17.6" fill="none" stroke="#e0e7ff" stroke-width=".85" stroke-dasharray="1.5 2.3"/><circle cx="24" cy="24" r="15.35" fill="none" stroke="#c7d2fe" stroke-width="1" opacity=".68"/><circle cx="24" cy="24" r="13.35" fill="none" stroke="#ddd6fe" stroke-width="1.1" opacity=".82"/><path d="M24 8.95 A15.05 15.05 0 0 1 38.05 17.05" fill="none" stroke="url(#dokng-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#dokng-soft)"/><path d="M24 39.05 A15.05 15.05 0 0 1 9.95 30.95" fill="none" stroke="url(#dokng-main)" stroke-width="2.45" stroke-linecap="round" filter="url(#dokng-soft)"/><path d="M11.8 15 A15.05 15.05 0 0 1 17.7 9.2" fill="none" stroke="#67e8f9" stroke-width="1.1" stroke-linecap="round" opacity=".5"/><path d="M36.2 33 A15.05 15.05 0 0 1 30.3 38.8" fill="none" stroke="#c4b5fd" stroke-width="1.1" stroke-linecap="round" opacity=".5"/><g filter="url(#dokng-soft)"><circle cx="38.05" cy="17.05" r="2.35" fill="#06b6d4"/><circle cx="9.95" cy="30.95" r="2.35" fill="#8b5cf6"/></g><circle cx="38.05" cy="17.05" r="1" fill="#ecfeff"/><circle cx="9.95" cy="30.95" r="1" fill="#f5f3ff"/><circle cx="17.7" cy="9.2" r=".9" fill="#22d3ee" opacity=".65"/><circle cx="30.3" cy="38.8" r=".9" fill="#a78bfa" opacity=".65"/><path d="M17.2 21.5 C17.2 16 20 14 24 14 C28 14 30.8 16 30.8 21.5" fill="none" stroke="url(#dokng-main)" stroke-width="2.25" stroke-linecap="round"/><path d="M15.6 22 C13.1 22 13.4 26.6 15.3 27.8" fill="none" stroke="url(#dokng-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4"/><path d="M32.4 22 C34.9 22 34.6 26.6 32.7 27.8" fill="none" stroke="url(#dokng-main)" stroke-width="1.45" stroke-linecap="round" opacity=".4"/><circle cx="20.2" cy="22.1" r="1.5" fill="#06b6d4"/><circle cx="20.2" cy="22.1" r=".52" fill="#ffffff" opacity=".75"/><circle cx="27.8" cy="22.1" r="1.5" fill="#8b5cf6"/><circle cx="27.8" cy="22.1" r=".52" fill="#ffffff" opacity=".75"/><ellipse cx="24" cy="28" rx="3.25" ry="2.4" fill="url(#dokng-main)"/><ellipse cx="24" cy="27.35" rx="1.35" ry=".6" fill="#ffffff" opacity=".65"/><circle cx="14.8" cy="12.4" r=".7" fill="#22d3ee" opacity=".55"/><circle cx="33.2" cy="35.6" r=".7" fill="#a78bfa" opacity=".55"/><path d="M9 24h1.8M37.2 24h1.8" stroke="#93c5fd" stroke-width=".8" stroke-linecap="round" opacity=".35"/></svg>`;
++
  export const iconUrls: Record<string, string> = {
 diff --git a/src/icons/extracted/metadata.ts b/src/icons/extracted/metadata.ts
-index a896a53b..0dc8138d 100644
+index acb803c9fa369371c31c3b20bbfd4de1307d885d..223cd5cf058d1d3afa707907b0fd3c2598325b3c 100644
 --- a/src/icons/extracted/metadata.ts
 +++ b/src/icons/extracted/metadata.ts
-@@ -536,6 +536,15 @@ export const iconMetadata: Record<string, IconMetadata> = {
-     keywords: [],
-     defaultColor: "currentColor",
+@@ -600,2 +600,11 @@ export const iconMetadata: Record<string, IconMetadata> = {
    },
 +  // [ccs] Dokng 品牌图标元数据。defaultColor 用品牌主色（青蓝渐变中段），
 +  // 无自定义 color 时 ProviderIcon 会取它着色。
@@ -121,5 +95,3 @@ index a896a53b..0dc8138d 100644
 +    defaultColor: "#3b82f6",
 +  },
    notion: {
-     name: "notion",
-     displayName: "notion",
