@@ -72,6 +72,10 @@ on:
         required: false
         type: boolean
         default: false
+      reuse_run_id:
+        description: "【release 模式】复用该 run 的四平台 R2 产物，仅补发；必须同时指定原 force_version"
+        required: false
+        type: string
   push:
     tags:
       - "v*-dokng.*"
@@ -95,6 +99,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read
   # 补丁冲突时自动开 issue 通知维护者（定时任务失败只有红叉，实测能连挂多晚无人发现）。
   issues: write
 
@@ -657,16 +662,49 @@ jobs:
           echo "已有 dokng tag：$(git tag -l "${BASE_TAG}-dokng.*" | tr '\n' ' ')"
           bash scripts/next-dokng-version.sh --base "$BASE_TAG"
 
+      - name: 校验待复用构建与发布 tag
+        if: inputs.reuse_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.reuse_run_id }}
+          FORCE_VERSION: ${{ inputs.force_version }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::reuse_run_id 必须为运行编号"; exit 1; }
+          [[ "$FORCE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dokng\.[0-9]+$ ]] || { echo "::error::补发必须指定原 force_version tag"; exit 1; }
+          [ -n "$R2_ACCESS_KEY_ID" ] || { echo "::error::复用构建需要 R2 暂存区"; exit 1; }
+          SOURCE_TAG_SHA="$(git rev-parse --verify "refs/tags/${FORCE_VERSION}^{commit}")"
+          export SOURCE_TAG_SHA
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$RUNNER_TEMP/source-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" > "$RUNNER_TEMP/source-jobs.json"
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          run = json.loads((root / "source-run.json").read_text())
+          jobs = json.loads((root / "source-jobs.json").read_text())["jobs"]
+          if run["path"] != ".github/workflows/open-code-release.yml" or run["status"] != "completed":
+              raise SystemExit("来源必须为已结束的 open-code release 运行")
+          if run["head_sha"] != os.environ["SOURCE_TAG_SHA"]:
+              raise SystemExit("来源构建与指定发布 tag 的提交不一致")
+          packages = [job for job in jobs if job["name"].startswith("package (")]
+          if len(packages) != 4 or any(job["conclusion"] != "success" for job in packages):
+              raise SystemExit("来源运行的四个平台必须全部构建成功")
+          print(f"复用 run {run['id']} 的四平台产物，版本 {os.environ['FORCE_VERSION']}")
+          PYTHON
+
       - name: 判断是否需要发布
         id: decide
         env:
           FORCE_RELEASE: ${{ inputs.force_release }}
+          SOURCE_RUN_ID: ${{ inputs.reuse_run_id }}
           TAG: ${{ steps.calc.outputs.tag }}
         run: |
-          # push tag 或手动 force_release → 一定发布。
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] || [ "$FORCE_RELEASE" = "true" ]; then
+          # 已验证的补发沿用原 tag；普通 tag 推送/force_release 同样进入发布。
+          if [ -n "$SOURCE_RUN_ID" ] || [ "${GITHUB_REF_TYPE:-}" = "tag" ] || [ "$FORCE_RELEASE" = "true" ]; then
             echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "触发发布：tag 触发或 force_release。"
+            echo "触发发布：复用已验证产物、tag 触发或 force_release。"
             exit 0
           fi
           # 否则：目标 tag 已存在则跳过（幂等），不存在则发布。
@@ -716,7 +754,7 @@ jobs:
   # ── package：四平台各出安装包（矩阵对齐验收标准 #4）────────────────
   package:
     needs: detect
-    if: needs.detect.outputs.should_release == 'true'
+    if: needs.detect.outputs.should_release == 'true' && inputs.reuse_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -1089,9 +1127,14 @@ jobs:
     needs:
       - detect
       - package
-    if: needs.detect.outputs.should_release == 'true'
+    if: >-
+      !cancelled() && needs.detect.result == 'success' &&
+      needs.detect.outputs.should_release == 'true' &&
+      (needs.package.result == 'success' ||
+       (inputs.reuse_run_id != '' && needs.package.result == 'skipped'))
     runs-on: ubuntu-latest
     env:
+      STAGING_RUN_ID: ${{ inputs.reuse_run_id || github.run_id }}
       # [dokng] 提到 job 级：产物取回步骤用 if: env.R2_ACCESS_KEY_ID 在 R2 直传与 artifact
       # 回退之间二选一。step 级 env 对同一 step 的 if 不可见（if 在 step env 求值前判定），
       # uses: 型步骤更没有 env 块可写，故必须在 job 级声明。
@@ -1100,21 +1143,20 @@ jobs:
       run:
         working-directory: open-code
     steps:
-      # [monorepo] submodules: false —— 本 job 只需要 opencode（跑它里面的
-      # finalize-latest-yml.ts + 读 package.json 定 bun 版本），不需要画布与 cc-switch/upstream。
+      # 只初始化 opencode 来读取 packageManager 中的 Bun 版本；元数据合并由本仓脚本负责。
       - name: Checkout（不带 submodule）
         uses: actions/checkout@v5
         with:
           submodules: false
 
-      - name: 初始化 open-code/opencode submodule（需 finalize-latest-yml.ts）
+      - name: 初始化 open-code/opencode submodule（读取 Bun 版本）
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           git submodule update --init open-code/opencode
           echo "opencode：$(git -C open-code/opencode rev-parse --short HEAD)"
 
-      - name: 安装 Bun（跑 finalize-latest-yml.ts）
+      - name: 安装 Bun（合并更新清单）
         uses: oven-sh/setup-bun@v2
         with:
           # [monorepo] uses: 型步骤路径以 workspace 根为基准，须带 open-code/ 前缀。
@@ -1148,7 +1190,7 @@ jobs:
             [ -n "$v" ] && echo "::add-mask::$v" || true
           done
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          stage="s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}"
+          stage="s3://${R2_BUCKET}/_staging/open-code/${STAGING_RUN_ID}"
 
           # 安装包：各平台子目录 → 平铺到 /tmp/artifacts（等价 merge-multiple: true）。
           mkdir -p /tmp/artifacts /tmp/stage-in/pkg
@@ -1205,33 +1247,12 @@ jobs:
       - name: 合并更新元数据 latest*.yml
         env:
           LATEST_YML_DIR: /tmp/latest-yml
-          # GH_REPO 仍必须非空：finalize-latest-yml.ts 开头硬校验（缺则 throw）。它只被下面
-          # 那个被 shim 吞掉的 gh 调用使用，值本身已无实际作用。
-          GH_REPO: ${{ github.repository }}
           OPENCODE_VERSION: ${{ needs.detect.outputs.version }}
         run: |
           set -euo pipefail
-          # finalize-latest-yml.ts：把 mac 双架构 latest-mac.yml 合并成单个（含两架构 files），
-          # win/linux 透传，写到 ${RUNNER_TEMP}（供下一步 R2 上传取用）。
-          #
-          # [monorepo] gh no-op shim：该脚本是上游原文件（brand/patches.manifest 明确记录不打
-          # 补丁），它在写盘之后还会 `gh release upload` 传到 Release。本仓不发 Release，这个
-          # 调用必然失败并让整步非 0 退出。关键在于脚本的执行顺序是「先 Bun.write 落盘、再调
-          # gh」（源码 119→120 行），故只要让 gh 恒成功即可保住落盘产物，无需改上游源码。
-          # shim 只 export 进本步的 PATH（不写 GITHUB_PATH），不影响其它步骤。
-          shim="$RUNNER_TEMP/gh-shim"
-          mkdir -p "$shim"
-          cat > "$shim/gh" <<'SH'
-          #!/usr/bin/env bash
-          echo "[gh no-op shim] 本仓不发 GitHub Release，已忽略：gh $*" >&2
-          exit 0
-          SH
-          chmod +x "$shim/gh"
-          export PATH="$shim:$PATH"
-          # OPENCODE_VERSION 需不带 v；detect 输出带 v，这里剥掉。
-          export OPENCODE_VERSION="${OPENCODE_VERSION#v}"
-          bun opencode/packages/desktop/scripts/finalize-latest-yml.ts
-          echo "合并后的 yml（供 R2 上传）："; ls -la "$RUNNER_TEMP"/latest*.yml || true
+          # 上游已移除 finalize-latest-yml.ts；本仓独立维护 R2 的四平台清单契约。
+          bun test scripts/finalize-latest-yml.test.ts
+          bun scripts/finalize-latest-yml.ts
 
       # [cx] R2 上传：安装包 + blockmap 推到 open-code/<version>/，合并后的 latest*.yml 推到
       # open-code/ 根 —— [monorepo] 本仓不发 Release，R2 是 electron-updater 的唯一更新源。
@@ -1292,8 +1313,8 @@ jobs:
           #   与下载页按「baseUrl + url」拼地址，裸名会漏掉 <version>/ 这层 → 404。故给每个 url 补
           #   <version>/ 前缀，让 electron-updater 自更新与下载页 DL_BASE 都指向
           #   open-code/<version>/<file>。
-          # [monorepo] 改写只作用于 /tmp/r2-meta 这份副本，不动 $RUNNER_TEMP 原文，也不改上游
-          #   finalize-latest-yml.ts（它是未打补丁的上游文件，裸名是它的既定行为）。
+          # [monorepo] 改写只作用于 /tmp/r2-meta 这份副本，不动 $RUNNER_TEMP 原文，也不改
+          #   scripts/finalize-latest-yml.ts（它只合并原始元数据，URL 前缀在发布时统一添加）。
           mkdir -p /tmp/r2-meta
           for y in latest.yml latest-mac.yml latest-linux.yml latest-linux-arm64.yml; do
             [ -f "$RUNNER_TEMP/$y" ] || continue
@@ -1453,8 +1474,8 @@ jobs:
           done
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-          echo "删除本次 run 的暂存区：_staging/open-code/${GITHUB_RUN_ID}/"
-          aws s3 rm "s3://${R2_BUCKET}/_staging/open-code/${GITHUB_RUN_ID}/" \
+          echo "删除本次 run 的暂存区：_staging/open-code/${STAGING_RUN_ID}/"
+          aws s3 rm "s3://${R2_BUCKET}/_staging/open-code/${STAGING_RUN_ID}/" \
             --recursive --endpoint-url "$endpoint" --only-show-errors || true
 
           # 陈旧暂存回收：按对象 LastModified 判龄（aws s3 ls --recursive 输出 "日期 时间 大小 key"），

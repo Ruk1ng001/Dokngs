@@ -208,7 +208,7 @@ packages/app/src/shell/titlebar/titlebar.tsx
 #   version 比对、忽略此开关），故本补丁现为冗余。**仍然保留**：删补丁要重排后续补丁序号、
 #   重验 strict 重放，为一个无副作用的布尔值付这个代价不值。
 #   注意：R2 的「安装包下沉 open-code/<version>/ 子目录」的 url 前缀改写**不在补丁层**——
-#   release job 不重放补丁（finalize-latest-yml.ts 跑的是上游原版，写出的 yml 是裸文件名），
+#   release job 不重放补丁（scripts/finalize-latest-yml.ts 由本仓维护，写出的 yml 是裸文件名），
 #   前缀仅由 open-code-release.yml 的 R2 上传步骤对 R2 副本 sed 添加。历史上曾把该改动放进
 #   本补丁的 finalize-latest-yml.ts，属死代码且与 workflow 方案矛盾，已删除。
 #   配套（父仓库，非补丁）：brand publish 源改 R2 generic 单源 + mac 加 zip；

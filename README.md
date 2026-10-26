@@ -78,6 +78,10 @@ dl.dokng.com/
 四个定时任务错峰排布，互不抢 runner；concurrency group 全部带产品前缀，
 两个产品的流水线互不排队、互不取消。
 
+OpenCode 四平台已构建成功、仅发布失败时，可补发同一批 R2 暂存产物：
+`gh workflow run open-code-release.yml -f mode=release -f force_version=vX.Y.Z-dokng.N -f reuse_run_id=<原运行编号>`。
+流程会核对原运行与 tag 的提交、四个平台的构建状态及清单版本，跳过重新编译；成功发布后才清理暂存区。
+
 **monorepo 约定**：每个 job 都设 `defaults.run.working-directory: <product>`，
 所以 `run:` 里的路径照产品内相对路径写。两类例外必须显式处理 ——
 `uses:` 步骤的路径参数（基准恒为 workspace 根，不受 `defaults` 影响）要带 `<product>/` 前缀；
