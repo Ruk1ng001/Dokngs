@@ -1,30 +1,7 @@
-# 03-lock-channel —— 内核注入 / 默认锁定内置渠道（token 来源：本地激活 key，回退构建期内置）
-#
-# 职责：让桌面产物开箱即走内置 newapi 渠道，无需用户手动配置；并让内核用「当前激活 key」发请求。
-#   1. 主进程渠道值 (NEWAPI_BASE_URL / NEWAPI_API_KEY / NEWAPI_MODEL) 由 02 补丁的
-#      electron.vite main.define 内联进 import.meta.env（主进程运行时读不到打包机的
-#      process.env）——vite 注入统一收敛在 02，本补丁不触碰 electron.vite.config.ts。
-#   2. server.ts buildChannelConfigContent() —— 拼装一份 opencode config,
-#      结构对齐 brand/opencode.template.json;createSidecarEnv() 经 OPENCODE_CONFIG_CONTENT
-#      传给内核 sidecar,在 config 合并链末端覆盖用户同名配置,实现「默认注入内置渠道」。
-#      baseURL / apiKey 优先取「本地激活 key」(US-003 的 store-channel-keys,主进程侧
-#      electron-store,直接同步读、无需 IPC);本地无激活 key 时回退到构建期内置默认值;
-#      两者都无则不注入,退回 opencode 原生行为(不破坏本地开发)。
-#      US-009：可选模型集合优先取激活 key 缓存的 models(切换激活 key 时拉该 key 的 /v1/models
-#      落盘,见 store-channel-keys 的 setChannelKeyModels);无缓存时回退构建期内置 NEWAPI_MODEL
-#      合成单条。列出的每个模型都写进 provider.newapi.models,成为内核里「该 key 的可选模型」;
-#      默认 model 取 NEWAPI_MODEL(若在列表内)否则列表首项。切换激活 key / 更新模型集合后须重启
-#      sidecar 才生效(US-002 结论)。
-#   3. main/env.d.ts —— 为上述内联变量补 ImportMetaEnv 类型声明,保证 typecheck 通过。
-#
-# 依赖:02-balance-newapi(主进程渠道值经其 electron.vite main.define 注入);
-#      server.ts 引用 04-channel-keys-store 的 store-channel-keys.ts(按 NN 序 03→04 应用,
-#      git apply 只做文本操作不校验 import,typecheck 在全部补丁应用后才跑)。
-# 应用(在 opencode/ 内,基线为 brand/BASE_SHA,按 01→02→03→04 顺序):
-#   git -C opencode apply --3way brand/patches/03-lock-channel.patch
+# 多渠道配置文件与内核环境注入（含 PRODUCT_NAME），保留上游服务探测和版本重试。
 diff --git a/packages/desktop/src/main/channel-config.ts b/packages/desktop/src/main/channel-config.ts
 new file mode 100644
-index 0000000000..41a1bd0a8d
+index 0000000000000000000000000000000000000000..41a1bd0a8db57a3d5ea68964df1cf00bb8b7efdd
 --- /dev/null
 +++ b/packages/desktop/src/main/channel-config.ts
 @@ -0,0 +1,192 @@
@@ -221,11 +198,10 @@ index 0000000000..41a1bd0a8d
 +  writeChannelConfigFile()
 +}
 diff --git a/packages/desktop/src/main/env.d.ts b/packages/desktop/src/main/env.d.ts
-index 353119cf06..a2ee4fa565 100644
+index 353119cf06788182e8f7ac1090ae3a01d4f359c1..a2ee4fa565abed1ab2a339c7259c8fc041e11fb6 100644
 --- a/packages/desktop/src/main/env.d.ts
 +++ b/packages/desktop/src/main/env.d.ts
-@@ -1,6 +1,11 @@
- interface ImportMetaEnv {
+@@ -2,4 +2,9 @@ interface ImportMetaEnv {
    readonly OPENCODE_CHANNEL: string
    readonly OPENCODE_VERSION?: string
 +  // [cx] 内置渠道锁定：构建期内联的 newapi 渠道值，供主进程启动内核 sidecar 时
@@ -235,44 +211,33 @@ index 353119cf06..a2ee4fa565 100644
 +  readonly NEWAPI_MODEL: string
  }
  
- interface ImportMeta {
 diff --git a/packages/desktop/src/main/service/background-service.ts b/packages/desktop/src/main/service/background-service.ts
-index 7bcc6ef16e..e89fba9afa 100644
+index f6002ba6bbd9577270530bb8e1041d4092904f89..84315e1f1a934ae6e9ba2e591ee1f40a17dc2817 100644
 --- a/packages/desktop/src/main/service/background-service.ts
 +++ b/packages/desktop/src/main/service/background-service.ts
-@@ -1,5 +1,7 @@
- import { app } from "electron"
- import { Context, Effect, FileSystem, Layer, Path } from "effect"
+@@ -2,4 +2,6 @@ import { app } from "electron"
+ import { Context, Effect, FileSystem, Layer, Option, Path, Schema } from "effect"
+ import { CHANNEL } from "../constants"
 +// [cx] 内置渠道：起内核前写 config 文件并用 OPENCODE_CONFIG 指向它（见下方注入点）。
 +import { getChannelConfigPath, writeChannelConfigFile } from "../channel-config"
  import { BackgroundServiceState } from "./background-service-state"
  import { cleanStages } from "./cli-stages"
- import { DesktopCli } from "./desktop-cli"
-@@ -41,6 +43,19 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
-   if (isolated) process.env.XDG_STATE_HOME = app.getPath("userData")
+@@ -47,4 +49,12 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
    const client = yield* Effect.promise(() => import("@opencode/client/service"))
  
-+  // [cx] 内置渠道注入：起内核前写好 config 文件，用 OPENCODE_CONFIG 环境变量指向它。
-+  //   不用 OPENCODE_CONFIG_CONTENT（值在合并链里覆盖一切、且进程启动后不可变，换 key 必须重启）；
-+  //   改用 OPENCODE_CONFIG 指向文件——v2 内核把该文件纳入 config watch（core/src/config/watch.ts
-+  //   的 plan() 收 sources.explicit），增删 key 后主进程重写文件即热重载生效，无需重启进程。
-+  //   关键：**始终**设 OPENCODE_CONFIG（即便当前无 key，writeChannelConfigFile 也会写 `{}`）。
-+  //   内核只在进程启动时读一次 Flag.OPENCODE_CONFIG；若首启无 key 时不设该变量，则该进程整个
-+  //   生命周期都不认这个文件——之后写文件也不会被 watch 到，导致后加的 key 永不生效。
-+  //   清掉可能从 process.env 继承来的旧注入方式，避免 CONTENT 覆盖文件配置（env 选项只能增补
-+  //   键、不能删，故在 process.env 上删——与上面 XDG_STATE_HOME 同样是上游既有的改 env 写法）。
++  // [dokng] 文件配置可热重载；首启无 key 时也注册 watcher，后续添加渠道无需重启。
 +  if (!writeChannelConfigFile()) yield* Effect.logInfo("no built-in channel configured")
 +  delete process.env.OPENCODE_CONFIG_CONTENT
-+  const channelEnv = { OPENCODE_CONFIG: getChannelConfigPath() }
++  const channelEnv = {
++    OPENCODE_CONFIG: getChannelConfigPath(),
++    PRODUCT_NAME: import.meta.env.PRODUCT_NAME || "Dokng",
++  }
 +
-   const ensure = () =>
-     client.Service.ensure({
-       file:
-@@ -52,6 +67,7 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
-             )
-           : undefined,
-       version,
+   const file =
+     process.env.OPENCODE_DESKTOP_SERVER_CHANNEL === "local"
+@@ -60,4 +70,5 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
+       file,
+       version: required,
 +      env: channelEnv,
        // A fixed port makes a second contender fail to bind and back off; port 0 never collides, so two
        // services could boot against the same database.
-       command: [

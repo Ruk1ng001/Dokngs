@@ -148,27 +148,33 @@ release。凡是必须改动 submodule 内源码的定制，都导出为 `brand/
 `brand/patches.manifest` 登记每个补丁覆盖的文件（`--preflight` 会机器校验「manifest 文件
 列表 == 补丁实际 diff 文件集」，两边必须完全一致）。当前补丁（详细说明见 manifest 各 section）：
 
+同一个源码文件只归一个补丁，`--preflight` 会拒绝重复归属。账户、画布和身份在同一文件的
+接线已经合并。旧 `13-fix-solidjs-dep` 已删除，SolidStart 版本跟随上游。
+
 | 补丁 | 功能一句话 |
 |------|-----------|
 | `02-balance-newapi` | 构建期注入统一承载（`electron.vite.config.ts` 的唯一补丁）+ renderer 凭据注入 |
-| `03-lock-channel` | 内核锁定内置渠道：server.ts 按本地 key 合成 provider、写 `OPENCODE_CONFIG`、热重载 |
+| `03-lock-channel` | 渠道配置文件与后台服务环境注入，包含 `OPENCODE_CONFIG` 和 `PRODUCT_NAME` |
 | `04-channel-keys-store` | 主进程多 key 数据层（electron-store `channelKeys`） |
-| `05-channel-keys-ipc` | key 管理专用 IPC + preload 桥（`window.api.channelKeys*`） |
+| `05-channel-keys-ipc` | 渠道 RPC/handler，以及渠道和画布的统一 IPC 注册 |
 | `06-deeplink-cx` | 运行时品牌名 / appId + `dokng://` 深链协议注册 |
-| `07-provider-switch-bridge` | `cx:select-provider` 切换桥 + 新旧布局账户入口接线 |
-| `08-self-update-prerelease` | `allowPrerelease=true`（GitHub 回退源能选中 `-dokng.N`） |
-| `09-cx-account-app` | 账户面板全量实现（app 包 `cx-account/` 四个新文件） |
+| `07-provider-switch-bridge` | provider 切换桥、账户/画布 Shell 和标题栏接线 |
+| `08-self-update-prerelease` | `gui-plugins` 更新器的品牌版本与安装失败指引 |
+| `09-cx-account-app` | 账户面板、画布模型槽位、样式与桌面 RPC 桥 |
 | `10-default-locale-zh` | 首启默认中文 locale |
 | `11-rebrand` | i18n 运行时品牌名替换 + macOS 菜单 |
 | `12-identity` | 系统提示词身份覆盖（"You are Dokng…"） |
-| `13-fix-solidjs-dep` | 修上游 `@solidjs/start` 死链依赖（上游修复后可删） |
 | `14-splash-brand` | 品牌开屏动画（狗脸 + 爪印） |
-| `15-account-icon` | 共享 icon 表新增 `user` / `palette` 图标 |
-| `16-wordmark-brand` | 新会话空状态 DOKNG 字标 |
-| `17-canvas-embed` | infinite-canvas 画布嵌入（iframe 保活 + 四槽位 + 构建接线） |
+| `15-account-icon` | 账户、画布和模型槽位图标，云端调用上游生成器同步 SDK 类型 |
+| `16-wordmark-brand` | 独立 DOKNG 字标组件与新会话页入口 |
+| `17-canvas-embed` | 常驻画布宿主、文件桥、路由与窗口恢复 |
+| `18-canvas-fs` | 画布文件持久化、媒体协议与 RPC 实现 |
+
+画布构建由本仓 `scripts/build-canvas.ts` 在 desktop 构建完成后执行并复制到
+`out/renderer/canvas/`。不再修改上游 prebuild，也不再使用 Vite 的复制 hook；缺少画布产物会中止打包。
 
 画布侧同理：`brand/canvas-patches/` + `brand/canvas-patches.manifest`（01 宿主注入 /
-02 嵌入态 UI 与图片代理 / 03 提示词预览渲染 / 04 media 子域改写），应用于
+02 嵌入态 UI 与图片代理 / 03 提示词预览渲染 / 04 media 子域改写 / 05 文件桥），应用于
 `infinite-canvas/`（基线 `brand/CANVAS_BASE_SHA`）。
 
 ### 应用 / 验证补丁（统一走脚本，勿手写循环）

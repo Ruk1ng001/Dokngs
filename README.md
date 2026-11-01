@@ -82,6 +82,17 @@ OpenCode 四平台已构建成功、仅发布失败时，可补发同一批 R2 �
 `gh workflow run open-code-release.yml -f mode=release -f force_version=vX.Y.Z-dokng.N -f reuse_run_id=<原运行编号>`。
 流程会核对原运行与 tag 的提交、四个平台的构建状态及清单版本，跳过重新编译；成功发布后才清理暂存区。
 
+维护分支可以直接使用云端验证：
+
+```bash
+gh workflow run cc-switch-upgrade.yml --ref <分支> -f validate_only=true
+gh workflow run open-code-release.yml --ref <分支> -f mode=release -f build_only=true
+```
+
+前者验证当前 CC Switch 基线的品牌重放、前端类型和 Rust；后者检查 OpenCode 并构建四平台
+安装包，产物留在 R2 暂存区。两者均不推进 main、不创建 tag、不更新下载源。
+OpenCode 验证成功后，可从同一提交用上述 `reuse_run_id` 命令发布，无需重复构建。
+
 **monorepo 约定**：每个 job 都设 `defaults.run.working-directory: <product>`，
 所以 `run:` 里的路径照产品内相对路径写。两类例外必须显式处理 ——
 `uses:` 步骤的路径参数（基准恒为 workspace 根，不受 `defaults` 影响）要带 `<product>/` 前缀；

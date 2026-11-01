@@ -1,31 +1,9 @@
-# 04-channel-keys-store —— 本地多 key 列表存储模型（US-003 / US-009）
-#
-# 职责：为「多 key 内置渠道」提供本地持久化的数据层与读写封装，供后续
-# key 列表 UI / 切换联动 / 内核注入改造（token 来源改为读本地激活 key）复用。
-#   1. store-keys.ts —— 新增 store 键常量 CHANNEL_KEYS_KEY（值为 ChannelKeysState）。
-#   2. store-channel-keys.ts（新增）—— 读写封装：
-#      - 类型 ChannelKey { id, label, key, baseURL, models? } 与 ChannelKeysState { keys, activeKeyId }。
-#      - readChannelKeysState / readActiveChannelKey / addChannelKey / removeChannelKey /
-#        updateChannelKeyLabel / setActiveChannelKey / setChannelKeyModels。
-#      - channelProviderId(keyId) —— 由 key.id 算出稳定 providerID（`newapi-<id前8位>`）。
-#        主进程 server.ts 注入多 provider、renderer 派发 cx:select-provider 切换事件都用它，
-#        两端必须同源同算法，否则切换事件匹配不到 provider。
-#      - 复用既有 electron-store（store.ts），数据写在默认 settings store，明文仅存本地。
-#      - 无 key 时读取激活项返回 null，不报错（读取做了结构校验与容错）。
-#   US-009 增补：ChannelKey 新增可选 models（切换激活 key 时拉该 key 的 /v1/models 缓存），
-#   新增 setChannelKeyModels(id, models) 落盘；读取时对 models 做规整（只留字符串、去重、
-#   脏数据归 undefined），供 server.ts 构造内核 config 时注入「可选模型」。
-#
-# 安全底线：key 明文仅存本地用户设备，绝不上传 / 绝不写日志；本模块不打印任何 key 值。
-# 依赖：独立文件，不与 01/02/03 共享文件，可在其之后按序应用。
-# 应用（在 opencode/ 内，基线为 brand/BASE_SHA，按 01→02→03→04→05 顺序）：
-#   git -C opencode apply --3way brand/patches/04-channel-keys-store.patch
+# 主进程多 key 存储与 provider ID。03 的配置构造和 05 的 IPC 共用。
 diff --git a/packages/desktop/src/main/storage/keys.ts b/packages/desktop/src/main/storage/keys.ts
-index 25af0f2eb9..47292d9240 100644
+index f8f823f2783ad54356854cbd563155ffeacdd8d5..9b70df940abaf9302a3c7e77092f6569b5a664a3 100644
 --- a/packages/desktop/src/main/storage/keys.ts
 +++ b/packages/desktop/src/main/storage/keys.ts
-@@ -9,3 +9,6 @@ export const BACKGROUND_COLOR_KEY = "backgroundColor"
- export const WINDOW_IDS_KEY = "windowIds"
+@@ -16,2 +16,5 @@ export const WINDOW_IDS_KEY = "windowIds"
  
  export const BUNDLED_CLI_VERSION_KEY = "bundledCliVersion"
 +
@@ -33,7 +11,7 @@ index 25af0f2eb9..47292d9240 100644
 +export const CHANNEL_KEYS_KEY = "channelKeys"
 diff --git a/packages/desktop/src/main/store-channel-keys.ts b/packages/desktop/src/main/store-channel-keys.ts
 new file mode 100644
-index 0000000000..8d672a211c
+index 0000000000000000000000000000000000000000..8d672a211c6560ef24252a891d023f88e59a60ca
 --- /dev/null
 +++ b/packages/desktop/src/main/store-channel-keys.ts
 @@ -0,0 +1,146 @@

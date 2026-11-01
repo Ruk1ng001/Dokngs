@@ -1,29 +1,7 @@
-# 05-channel-keys-ipc —— key 管理 IPC 通道（US-009）
-#
-# 职责：把 04 的本地 key 数据层（store-channel-keys）经专用 IPC 暴露给 renderer，
-# 支撑「增删改 key + 手动切换激活 key」的账户面板 UI（01 补丁 balance-panel）。
-#   1. main/ipc.ts —— import 04 的 store-channel-keys，新增 channel-keys-* handler：
-#      channel-keys-list / -add / -remove / -update-label / -set-active / -set-models。
-#      每个 handler 走主进程数据层增删改后，返回 JSON.stringify 的最新 ChannelKeysState
-#      字符串（与 store-get 对非字符串 JSON.stringify 的约定一致），renderer 解析回对象刷新 UI。
-#   2. preload/types.ts —— ElectronAPI 增补 channelKeys* 方法签名。
-#   3. preload/index.ts —— 经 ipcRenderer.invoke 桥接上述 IPC。
-#
-# 为什么不复用通用 store-set：通用 store-set 会把整个 channelKeys 对象存成 JSON 字符串，
-# 破坏主进程侧 readChannelKeysState 的「对象读取」（04 用 getStore().get 期望对象）。故为
-# key 管理开专用 IPC，写入统一走 04 的数据层，保证主/渲染两侧对同一份对象态的读写一致。
-#
-# 切换激活 key 的「重启内核」：复用既有 window.api.relaunch（stopSidecars → app.relaunch，
-# US-002 结论：内核 config 启动期一次性注入，换 key 必须重启 sidecar 才生效），不新增重启 IPC。
-#
-# 安全底线：key 管理 handler 一律不打印任何入参（尤其 sk- 明文），仅透传给数据层。
-# 依赖：引用 04 的 store-channel-keys（按 NN 序 04→05 应用，git apply 只做文本操作不校验 import，
-#      typecheck 在全部补丁应用后才跑）。独立于 01/02/03 的文件。
-# 应用（在 opencode/ 内，基线为 brand/BASE_SHA，按 01→02→03→04→05 顺序）：
-#   git -C opencode apply --3way brand/patches/05-channel-keys-ipc.patch
+# 渠道 RPC/handler；渠道与画布的 IPC 注册统一在此补丁，画布实现由 18 提供。
 diff --git a/packages/desktop/src/main/ipc-handlers/channel-keys.ts b/packages/desktop/src/main/ipc-handlers/channel-keys.ts
 new file mode 100644
-index 0000000000..9d9b6ccdda
+index 0000000000000000000000000000000000000000..9d9b6ccdda38742e8ca487856fb236faaccc7238
 --- /dev/null
 +++ b/packages/desktop/src/main/ipc-handlers/channel-keys.ts
 @@ -0,0 +1,68 @@
@@ -96,62 +74,58 @@ index 0000000000..9d9b6ccdda
 +  ),
 +)
 diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
-index 824061a2af..ac26c0e060 100644
+index 6c68d43357b11643b72cdd511b49260a9909e90d..deab8ae40271ebbbf5a6b0dc5d6d0b0e78d81145 100644
 --- a/packages/desktop/src/main/ipc.ts
 +++ b/packages/desktop/src/main/ipc.ts
-@@ -8,6 +8,8 @@ import { DragCancelEvent, IpcTransportPort } from "../shared/ipc-transport"
- import { Extensions } from "./extension"
+@@ -9,4 +9,7 @@ import { Plugins } from "./plugin"
  import { DesktopFiles, openExternalURL } from "./files"
  import { appHandlers } from "./ipc-handlers/app"
 +// [cx] US-009: 本地 key 管理 handler（二开新增域，见 ipc-handlers/channel-keys.ts）。
++import { canvasHandlers } from "./ipc-handlers/canvas"
 +import { channelKeysHandlers } from "./ipc-handlers/channel-keys"
  import { eventHandlers } from "./ipc-handlers/events"
- import { extensionHandlers } from "./ipc-handlers/extensions"
- import { fileHandlers } from "./ipc-handlers/files"
-@@ -31,6 +33,8 @@ const handlers = Layer.mergeAll(
-   menuHandlers,
+ import { pluginHandlers } from "./ipc-handlers/plugins"
+@@ -32,4 +35,7 @@ const handlers = Layer.mergeAll(
    eventHandlers,
-   extensionHandlers,
+   pluginHandlers,
 +  // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
 +  channelKeysHandlers,
++  canvasHandlers,
  )
  
- export const layer = RpcServer.layer(DesktopRpcs, { disableFatalDefects: true }).pipe(
 diff --git a/packages/desktop/src/shared/ipc-rpc.ts b/packages/desktop/src/shared/ipc-rpc.ts
-index b105514190..a573e72978 100644
+index 9338ad52b40dea7583d6a3f10392a8b697a7eae8..55d28cd6d0d3bfc04ea1831b7ee82d209973a94d 100644
 --- a/packages/desktop/src/shared/ipc-rpc.ts
 +++ b/packages/desktop/src/shared/ipc-rpc.ts
-@@ -1,5 +1,7 @@
+@@ -1,4 +1,7 @@
  import { RpcClient, RpcClientError } from "effect/rpc"
  import { AppRpcs } from "./ipc-rpc/app"
 +// [cx] US-009: 本地 key 管理通道（二开新增域，见 ipc-rpc/channel-keys.ts）。
++import { CanvasRpcs } from "./ipc-rpc/canvas"
 +import { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
  import { EventRpcs } from "./ipc-rpc/events"
- import { ExtensionRpcs } from "./ipc-rpc/extensions"
- import { FileRpcs } from "./ipc-rpc/files"
-@@ -9,6 +11,8 @@ import { WindowRpcs } from "./ipc-rpc/window"
- 
+ import { PluginRpcs } from "./ipc-rpc/plugins"
+@@ -10,4 +13,6 @@ import { WindowRpcs } from "./ipc-rpc/window"
  export { AppRpcs } from "./ipc-rpc/app"
  
 +export { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
 +
  export { EventRpcs } from "./ipc-rpc/events"
  
- export { ExtensionRpcs } from "./ipc-rpc/extensions"
-@@ -21,6 +25,15 @@ export { StorageRpcs } from "./ipc-rpc/storage"
- 
+@@ -22,5 +27,15 @@ export { StorageRpcs } from "./ipc-rpc/storage"
  export { WindowRpcs } from "./ipc-rpc/window"
  
--export const DesktopRpcs = AppRpcs.merge(StorageRpcs, FileRpcs, WindowRpcs, MenuRpcs, EventRpcs, ExtensionRpcs)
+-export const DesktopRpcs = AppRpcs.merge(StorageRpcs, FileRpcs, WindowRpcs, MenuRpcs, EventRpcs, PluginRpcs)
 +export const DesktopRpcs = AppRpcs.merge(
 +  StorageRpcs,
 +  FileRpcs,
 +  WindowRpcs,
 +  MenuRpcs,
 +  EventRpcs,
-+  ExtensionRpcs,
++  PluginRpcs,
 +  // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
 +  ChannelKeysRpcs,
++  CanvasRpcs,
 +)
  
  export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>

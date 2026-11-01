@@ -1,112 +1,7 @@
-diff --git a/packages/app/src/canvas/host.tsx b/packages/app/src/canvas/host.tsx
-index 8423dedf6c..e1a2b58035 100644
---- a/packages/app/src/canvas/host.tsx
-+++ b/packages/app/src/canvas/host.tsx
-@@ -46,6 +46,64 @@ const CANVAS_ORIGIN = "oc://renderer"
- // 画布路由路径：常驻宿主靠它切显隐。
- const CANVAS_PATH = "/canvas"
- 
-+// [dokng] 画布落盘桥的消息类型（画布侧 lib/host-fs-bridge.ts 与此一一对应）。
-+const CANVAS_FS_REQUEST = "dokng:canvas-fs-request"
-+const CANVAS_FS_RESPONSE = "dokng:canvas-fs-response"
-+
-+// [dokng] 画布落盘桥：desktop preload 暴露的 canvas* 子集。
-+// app 包不 import desktop 类型（跨包类型缺口，同 cx-account-api 的处理），故本地重声明。
-+type CanvasFsApi = {
-+  canvasFileWrite: (key: string, base64: string, mime?: string) => Promise<boolean>
-+  canvasFileRead: (key: string) => Promise<string | null>
-+  canvasFileDelete: (keys: string[]) => Promise<number>
-+  canvasFileList: () => Promise<string[]>
-+  canvasStateRead: () => Promise<string | null>
-+  canvasStateWrite: (json: string) => Promise<boolean>
-+}
-+
-+// 断言访问器：web 等无 preload 的平台返回 undefined，调用方一律可选链兜底。
-+function canvasFsApi() {
-+  return (window as unknown as { __cxChannelApi?: Partial<CanvasFsApi> }).__cxChannelApi
-+}
-+
-+// 落盘请求的 op 白名单 → 各自的参数校验与转发。放在宿主而非画布侧：
-+// 画布 iframe 是不可信输入源，能触达的 IPC 面必须在这里收敛，不能由消息内容自由指定 channel。
-+async function runCanvasFsOp(op: string, args: unknown[]): Promise<unknown> {
-+  const api = canvasFsApi()
-+  if (!api) throw new Error("unavailable")
-+  const str = (v: unknown) => (typeof v === "string" ? v : null)
-+  switch (op) {
-+    case "fileWrite": {
-+      const key = str(args[0])
-+      const base64 = str(args[1])
-+      const mime = str(args[2]) ?? undefined
-+      if (!key || base64 === null) return false
-+      return (await api.canvasFileWrite?.(key, base64, mime)) ?? false
-+    }
-+    case "fileRead": {
-+      const key = str(args[0])
-+      if (!key) return null
-+      return (await api.canvasFileRead?.(key)) ?? null
-+    }
-+    case "fileDelete": {
-+      const keys = Array.isArray(args[0]) ? args[0].filter((k): k is string => typeof k === "string") : []
-+      if (keys.length === 0) return 0
-+      return (await api.canvasFileDelete?.(keys)) ?? 0
-+    }
-+    case "fileList":
-+      return (await api.canvasFileList?.()) ?? []
-+    case "stateRead":
-+      return (await api.canvasStateRead?.()) ?? null
-+    case "stateWrite": {
-+      const json = str(args[0])
-+      if (json === null) return false
-+      return (await api.canvasStateWrite?.(json)) ?? false
-+    }
-+    default:
-+      throw new Error("unsupported op")
-+  }
-+}
-+
- export default function CanvasHost() {
-   const platform = usePlatform()
-   const navigate = useNavigate()
-@@ -110,6 +168,8 @@ export default function CanvasHost() {
-     refreshKeys()
- 
-     // 画布就绪握手：收到 dokng:canvas-ready 才认为可投递（画布 listener 已挂好）。
-+    // 同时承载落盘桥：画布 iframe 无 window.api（preload 不进子 frame，未开
-+    // nodeIntegrationInSubFrames），故读写磁盘必须 iframe → postMessage → 宿主 → IPC → 主进程。
-     const onMessage = (event: MessageEvent) => {
-       if (event.origin !== CANVAS_ORIGIN) return
-       const data = event.data as { type?: unknown } | null
-@@ -117,6 +177,27 @@ export default function CanvasHost() {
-       if (data.type === "dokng:canvas-ready") {
-         setReady(true)
-         post()
-+        return
-+      }
-+      if (data.type === CANVAS_FS_REQUEST) {
-+        const req = data as { id?: unknown; op?: unknown; args?: unknown }
-+        // 只认来自画布 iframe 自身的 source，杜绝同 origin 下其他 frame 借道。
-+        if (event.source !== iframeRef?.contentWindow) return
-+        const id = typeof req.id === "string" ? req.id : null
-+        const op = typeof req.op === "string" ? req.op : null
-+        if (!id || !op) return
-+        const args = Array.isArray(req.args) ? req.args : []
-+        const reply = (payload: { ok: boolean; result?: unknown; error?: string }) => {
-+          // 回帖同样严格限 targetOrigin，且只回给发起的那个 window。
-+          const win = iframeRef?.contentWindow
-+          if (!win) return
-+          win.postMessage({ type: CANVAS_FS_RESPONSE, id, ...payload }, CANVAS_ORIGIN)
-+        }
-+        void runCanvasFsOp(op, args).then(
-+          (result) => reply({ ok: true, result }),
-+          // 不回传原始错误对象/路径：只给一个稳定短码，避免把 userData 绝对路径泄进画布侧。
-+          () => reply({ ok: false, error: "canvas-fs-failed" }),
-+        )
-       }
-     }
-     window.addEventListener("message", onMessage)
+# 画布文件 RPC/handler、持久化与媒体协议；公共 IPC 注册统一归 05。
 diff --git a/packages/desktop/src/main/ipc-handlers/canvas.ts b/packages/desktop/src/main/ipc-handlers/canvas.ts
 new file mode 100644
-index 0000000000..1621bd6182
+index 0000000000000000000000000000000000000000..1621bd6182a380d1c682c43c9ddb42823bda1f80
 --- /dev/null
 +++ b/packages/desktop/src/main/ipc-handlers/canvas.ts
 @@ -0,0 +1,24 @@
@@ -134,29 +29,9 @@ index 0000000000..1621bd6182
 +    }),
 +  ),
 +)
-diff --git a/packages/desktop/src/main/ipc.ts b/packages/desktop/src/main/ipc.ts
-index ac26c0e060..d26457a957 100644
---- a/packages/desktop/src/main/ipc.ts
-+++ b/packages/desktop/src/main/ipc.ts
-@@ -9,6 +9,7 @@ import { Extensions } from "./extension"
- import { DesktopFiles, openExternalURL } from "./files"
- import { appHandlers } from "./ipc-handlers/app"
- // [cx] US-009: 本地 key 管理 handler（二开新增域，见 ipc-handlers/channel-keys.ts）。
-+import { canvasHandlers } from "./ipc-handlers/canvas"
- import { channelKeysHandlers } from "./ipc-handlers/channel-keys"
- import { eventHandlers } from "./ipc-handlers/events"
- import { extensionHandlers } from "./ipc-handlers/extensions"
-@@ -35,6 +36,7 @@ const handlers = Layer.mergeAll(
-   extensionHandlers,
-   // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
-   channelKeysHandlers,
-+  canvasHandlers,
- )
- 
- export const layer = RpcServer.layer(DesktopRpcs, { disableFatalDefects: true }).pipe(
 diff --git a/packages/desktop/src/main/store-canvas-files.ts b/packages/desktop/src/main/store-canvas-files.ts
 new file mode 100644
-index 0000000000..3faa409e12
+index 0000000000000000000000000000000000000000..3faa409e128c27d7c55aaf3e00ded84eac883730
 --- /dev/null
 +++ b/packages/desktop/src/main/store-canvas-files.ts
 @@ -0,0 +1,249 @@
@@ -410,11 +285,10 @@ index 0000000000..3faa409e12
 +  return findExistingFile(key)
 +}
 diff --git a/packages/desktop/src/main/windows/protocol.ts b/packages/desktop/src/main/windows/protocol.ts
-index 058ddbc7c8..4b60ea4063 100644
+index aa933f3bfb8472c4e27456ab89f0160aa2a5b3ec..21a495a3f4b5f0edf714e4fc915499018149e089 100644
 --- a/packages/desktop/src/main/windows/protocol.ts
 +++ b/packages/desktop/src/main/windows/protocol.ts
-@@ -85,7 +85,21 @@ async function serve(request: Request, rendererRoot: string) {
-     return new Response("Not found", { status: 404 })
+@@ -76,5 +76,19 @@ async function serve(request: Request, rendererRoot: string) {
    }
  
 -  const file = path.resolve(rendererRoot, `.${decodeURIComponent(url.pathname)}`)
@@ -435,45 +309,6 @@ index 058ddbc7c8..4b60ea4063 100644
 +  const file = path.resolve(rendererRoot, `.${decodedPath}`)
    const rel = path.relative(rendererRoot, file)
  
-   if (rel.startsWith("..") || path.isAbsolute(rel)) {
-diff --git a/packages/desktop/src/renderer/cx-channel-bridge.ts b/packages/desktop/src/renderer/cx-channel-bridge.ts
-index 0f72f1fba5..d2fd9cb17f 100644
---- a/packages/desktop/src/renderer/cx-channel-bridge.ts
-+++ b/packages/desktop/src/renderer/cx-channel-bridge.ts
-@@ -28,6 +28,13 @@ const globalKey = "__cxChannelApi"
- export function installCxChannelBridge() {
-   // SAFETY: 本进程自己挂的全局，app 包只读它。
-   ;(window as unknown as Record<string, unknown>)[globalKey] = {
-+    canvasFileWrite: (key: string, base64: string, mime?: string) =>
-+      invoke("CanvasFileWrite", { key, base64, ...(mime ? { mime } : {}) }),
-+    canvasFileRead: (key: string) => invoke("CanvasFileRead", { key }),
-+    canvasFileDelete: (keys: string[]) => invoke("CanvasFileDelete", { keys }),
-+    canvasFileList: () => invoke("CanvasFileList"),
-+    canvasStateRead: () => invoke("CanvasStateRead"),
-+    canvasStateWrite: (json: string) => invoke("CanvasStateWrite", { json }),
-     channelKeysList: () => invoke("ChannelKeysList"),
-     channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => invoke("ChannelKeysAdd", input),
-     channelKeysRemove: (id: string) => invoke("ChannelKeysRemove", { id }),
-diff --git a/packages/desktop/src/shared/ipc-rpc.ts b/packages/desktop/src/shared/ipc-rpc.ts
-index a573e72978..ea2837793b 100644
---- a/packages/desktop/src/shared/ipc-rpc.ts
-+++ b/packages/desktop/src/shared/ipc-rpc.ts
-@@ -1,6 +1,7 @@
- import { RpcClient, RpcClientError } from "effect/rpc"
- import { AppRpcs } from "./ipc-rpc/app"
- // [cx] US-009: 本地 key 管理通道（二开新增域，见 ipc-rpc/channel-keys.ts）。
-+import { CanvasRpcs } from "./ipc-rpc/canvas"
- import { ChannelKeysRpcs } from "./ipc-rpc/channel-keys"
- import { EventRpcs } from "./ipc-rpc/events"
- import { ExtensionRpcs } from "./ipc-rpc/extensions"
-@@ -34,6 +35,7 @@ export const DesktopRpcs = AppRpcs.merge(
-   ExtensionRpcs,
-   // [cx] US-009: 本地 key 管理（二开新增，排在上游各组之后，减小升级冲突面）。
-   ChannelKeysRpcs,
-+  CanvasRpcs,
- )
- 
- export type DesktopRpcClient = RpcClient.FromGroup<typeof DesktopRpcs, RpcClientError.RpcClientError>
 diff --git a/packages/desktop/src/shared/ipc-rpc/canvas.ts b/packages/desktop/src/shared/ipc-rpc/canvas.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..c9ab4adc1d01b213b2785cad608a212be943f493

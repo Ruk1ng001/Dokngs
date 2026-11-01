@@ -1,9 +1,9 @@
+# 内核提示词中的 Dokng 身份；桌面 PRODUCT_NAME 注入统一归 03。
 diff --git a/packages/core/src/instructions/builtins.ts b/packages/core/src/instructions/builtins.ts
-index fab4b8dd8c..8e7440962a 100644
+index fab4b8dd8cb615a373f3007dc2b80b9c1960033f..8e7440962a0698354096a983d1a3e001dc51d2ad 100644
 --- a/packages/core/src/instructions/builtins.ts
 +++ b/packages/core/src/instructions/builtins.ts
-@@ -21,6 +21,19 @@ const layer = Layer.effect(
-       load: () =>
+@@ -22,4 +22,17 @@ const layer = Layer.effect(
          Effect.succeed(
            Instructions.combine([
 +            // [dokng] Keep the branded identity in the instruction stream for every provider.
@@ -21,20 +21,3 @@ index fab4b8dd8c..8e7440962a 100644
 +            }),
              Instructions.make({
                key: Instructions.Key.make("core/date"),
-               codec: Schema.toCodecJson(Schema.String),
-diff --git a/packages/desktop/src/main/service/background-service.ts b/packages/desktop/src/main/service/background-service.ts
-index da9bae9f35..00c28526a2 100644
---- a/packages/desktop/src/main/service/background-service.ts
-+++ b/packages/desktop/src/main/service/background-service.ts
-@@ -54,7 +54,10 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
-   //   键、不能删，故在 process.env 上删——与上面 XDG_STATE_HOME 同样是上游既有的改 env 写法）。
-   if (!writeChannelConfigFile()) yield* Effect.logInfo("no built-in channel configured")
-   delete process.env.OPENCODE_CONFIG_CONTENT
--  const channelEnv = { OPENCODE_CONFIG: getChannelConfigPath() }
-+  const channelEnv = {
-+    OPENCODE_CONFIG: getChannelConfigPath(),
-+    PRODUCT_NAME: import.meta.env.PRODUCT_NAME || "Dokng",
-+  }
- 
-   const ensure = () =>
-     client.Service.ensure({

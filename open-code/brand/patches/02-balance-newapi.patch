@@ -1,15 +1,9 @@
+# 构建期品牌、默认语言与渠道注入。electron.vite.config.ts 只在此处修改。
 diff --git a/packages/desktop/electron.vite.config.ts b/packages/desktop/electron.vite.config.ts
-index d238411283..9f5b46487f 100644
+index 1e9dcf6e09088b0ebbf007c0e2d9fef9fcadfd4d..91922ed75c8329f1f788b3ed5b9997c4f948b360 100644
 --- a/packages/desktop/electron.vite.config.ts
 +++ b/packages/desktop/electron.vite.config.ts
-@@ -1,4 +1,5 @@
- import { defineConfig } from "electron-vite"
-+import { access, cp, rm } from "node:fs/promises"
- import type { Plugin } from "vite"
- import { pickerPlugin } from "./scripts/picker"
- import { nodePtyPackage } from "./scripts/utils"
-@@ -13,6 +14,19 @@ function resolveChannel() {
-   return "dev"
+@@ -15,4 +15,17 @@ function resolveChannel() {
  }
  
 +// [dokng] 品牌配置和渠道值在构建时注入，桌面运行时无需访问父仓库或 CI 环境变量。
@@ -27,9 +21,7 @@ index d238411283..9f5b46487f 100644
 +
  const appPlugin = (await import("@opencode/app/vite")).default
  
- const sentry =
-@@ -62,6 +76,11 @@ export default defineConfig(({ command }) => {
-       define: {
+@@ -56,4 +69,9 @@ export default defineConfig(async ({ command }) => {
          // Local renderer/server mode still uses the dev application identity and updater policy.
          "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel === "local" ? "dev" : channel),
 +        // [dokng] main 使用这些值生成 sidecar 的渠道配置与品牌菜单。
@@ -39,50 +31,17 @@ index d238411283..9f5b46487f 100644
 +        "import.meta.env.PRODUCT_NAME": newapiDefine["import.meta.env.PRODUCT_NAME"],
        },
        build: {
-         minify: command === "build",
-@@ -121,13 +140,35 @@ const require = __cjs_mod__.createRequire(import.meta.url);
-         bundledDev: true,
+@@ -117,4 +135,5 @@ export default defineConfig(async ({ command }) => {
        },
        define: {
 +        ...newapiDefine,
          "import.meta.env.OPENCODE_VERSION": JSON.stringify(process.env.OPENCODE_VERSION),
          "import.meta.env.VITE_OPENCODE_CHANNEL": JSON.stringify(channel),
-         "import.meta.env.OPENCODE_TEST_ONBOARDING": JSON.stringify(
-           command === "serve" && process.env.OPENCODE_TEST_ONBOARDING === "1",
-         ),
-       },
--      plugins: [pickerPlugin(), appPlugin, initialChunk, sentry],
-+      plugins: [
-+        pickerPlugin(),
-+        appPlugin,
-+        initialChunk,
-+        sentry,
-+        {
-+          name: "dokng:copy-canvas",
-+          async writeBundle() {
-+            const source = "../../../infinite-canvas/web/dist"
-+            const dest = "./out/renderer/canvas"
-+            try {
-+              await access(source)
-+            } catch {
-+              console.warn(`[dokng:copy-canvas] 未找到画布产物 ${source}，跳过拷贝。`)
-+              return
-+            }
-+            await rm(dest, { recursive: true, force: true })
-+            await cp(source, dest, { recursive: true })
-+            console.log(`[dokng:copy-canvas] 已拷贝画布产物 → ${dest}`)
-+          },
-+        },
-+      ],
-       publicDir: "../../../app/public",
-       root: "src/renderer",
-       build: {
 diff --git a/packages/desktop/src/renderer/env.d.ts b/packages/desktop/src/renderer/env.d.ts
-index ba7836cbfe..d461388fec 100644
+index ba7836cbfe30e1a102ec1c6f7e60f6b7b0baa23f..d461388fecbdd4ccc01b5e7c9ce5894de3976fbf 100644
 --- a/packages/desktop/src/renderer/env.d.ts
 +++ b/packages/desktop/src/renderer/env.d.ts
-@@ -5,6 +5,19 @@ declare global {
-     readonly OPENCODE_TEST_ONBOARDING: boolean
+@@ -6,4 +6,17 @@ declare global {
    }
  
 +  // [cx] US-003: 品牌层默认 locale，经 renderer.define 在构建期注入。
@@ -100,4 +59,3 @@ index ba7836cbfe..d461388fec 100644
 +
    interface Window {
      electron: ElectronNative
-     __OPENCODE__?: {

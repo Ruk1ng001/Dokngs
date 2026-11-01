@@ -138,7 +138,8 @@ const config: Configuration = {
     // （rpm 需 runner 装 rpmbuild 工具）。只保留 AppImage，聚焦验收产物、
     // 避免额外系统依赖。
     target: ["AppImage"],
-    executableName: brandedAppId,
+    // AppImageLauncher 会将 *.desktop 当作启动项，二进制名不能带同样的后缀。
+    executableName: brandedAppId.replace(/\.desktop$/, ""),
     desktop: {
       ...base.linux?.desktop,
       entry: {

@@ -1,25 +1,47 @@
-diff --git a/packages/app/src/new-session/wordmark.tsx b/packages/app/src/new-session/wordmark.tsx
-index f691cbe0c2..026a85812e 100644
---- a/packages/app/src/new-session/wordmark.tsx
-+++ b/packages/app/src/new-session/wordmark.tsx
-@@ -1,4 +1,4 @@
--import { Logo } from "@opencode/ui/logo"
-+import { createUniqueId } from "solid-js"
- import "./wordmark.css"
+# 独立的 Dokng 字标组件及新会话页入口，不再修改上游 wordmark 动画实现。
+diff --git a/packages/app/src/new-session/view.tsx b/packages/app/src/new-session/view.tsx
+index 5d44390bb0b991b3c9c2117dfdf6316bc0add3db..3cca069f31ed6a0d91c7a450a6f6407593b11667 100644
+--- a/packages/app/src/new-session/view.tsx
++++ b/packages/app/src/new-session/view.tsx
+@@ -38,5 +38,6 @@ import { NewSessionBranch } from "./workspace/selector"
+ import { NewSessionBrickBreaker } from "./brick-breaker"
+ import { NewSessionPinBoard, type PinBoardHandle } from "./pin-board"
+-import { NewSessionWordmark, type LodgerBall } from "./wordmark"
++import type { LodgerBall } from "./wordmark"
++import { DokngWordmark } from "./wordmark-brand"
  
- export function NewSessionWordmark() {
-@@ -9,9 +9,86 @@ export function NewSessionWordmark() {
-       class="pointer-events-none mx-auto w-full max-w-[720px] text-v2-background-bg-inverse"
-     >
-       <div data-slot="wordmark-reveal" class="relative mx-auto w-4/5">
--        <Logo class="block aspect-[720/129] w-full opacity-[0.16]" />
--        <Logo class="wordmark-shimmer absolute inset-0 aspect-[720/129] w-full" />
+ const providerTipDismissalDuration = 30 * 24 * 60 * 60 * 1000
+@@ -102,5 +103,5 @@ export function NewSessionView(props: {
+         <div class="absolute inset-x-0 top-[25.375%] flex justify-center px-6">
+           <div class={NEW_SESSION_CONTENT_WIDTH}>
+-            <NewSessionWordmark
++            <DokngWordmark
+               ref={(box) => setWordmark("box", box)}
+               sound={settings.sounds.interfaceEnabled}
+diff --git a/packages/app/src/new-session/wordmark-brand.tsx b/packages/app/src/new-session/wordmark-brand.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..699b0331fbb25dd7c5cb71f45ed08474d69aa046
+--- /dev/null
++++ b/packages/app/src/new-session/wordmark-brand.tsx
+@@ -0,0 +1,95 @@
++import { createUniqueId } from "solid-js"
++import type { NewSessionWordmark } from "./wordmark"
++import "./wordmark.css"
++
++export function DokngWordmark(props: Parameters<typeof NewSessionWordmark>[0]) {
++  return (
++    <div
++      data-component="new-session-wordmark"
++      aria-hidden="true"
++      class="pointer-events-none mx-auto w-full max-w-[720px] text-v2-background-bg-inverse"
++    >
++      <div ref={props.ref} data-slot="wordmark-box" class="relative mx-auto w-4/5">
 +        <WordmarkBrand class="block aspect-[720/129] w-full opacity-[0.16]" />
 +        <WordmarkBrand class="wordmark-shimmer absolute inset-0 aspect-[720/129] w-full" />
-       </div>
-     </div>
-   )
- }
++      </div>
++    </div>
++  )
++}
 +
 +// [dokng] Preserve the branded pixel wordmark inside the v2 reveal and shimmer layers.
 +function WordmarkBrand(props: { class?: string }) {

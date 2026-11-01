@@ -1,24 +1,23 @@
-diff --git a/packages/gui-extensions/src/updater/platform.ts b/packages/gui-extensions/src/updater/platform.ts
-index 047c13eb0d..3d63bf0463 100644
---- a/packages/gui-extensions/src/updater/platform.ts
-+++ b/packages/gui-extensions/src/updater/platform.ts
-@@ -1,4 +1,4 @@
+# gui-plugins 更新器：允许品牌版本后缀，安装失败时提供下载入口。
+diff --git a/packages/gui-plugins/src/updater/platform.ts b/packages/gui-plugins/src/updater/platform.ts
+index e562c5a0db4c286793b458f170e918681d1bb913..63ce525cbac5b55a2c008dfb7464bf6b6860720c 100644
+--- a/packages/gui-plugins/src/updater/platform.ts
++++ b/packages/gui-plugins/src/updater/platform.ts
+@@ -1,5 +1,5 @@
+ import { execFile } from "node:child_process"
+ import { promisify } from "node:util"
 -import { app, autoUpdater } from "electron"
 +import { app, autoUpdater, dialog, shell } from "electron"
  import pkg from "electron-updater"
  import { Effect } from "effect"
- import type { Platform } from "./machine"
-@@ -6,6 +6,8 @@ import type { Platform } from "./machine"
- const updateClient = pkg.autoUpdater
+@@ -11,4 +11,6 @@ const execFileAsync = promisify(execFile)
  
  const restartTimeout = 10_000
 +// [dokng] 自动安装失败时提供覆盖安装入口，保留用户数据。
 +const downloadPage = "https://dokng.com/"
  
- export const make = Effect.fn("Updater.platform")(function* (channel: string) {
-   const userAgent = `opencode/${channel === "prod" ? "latest" : channel}/${app.getVersion()}/desktop`
-@@ -18,7 +20,9 @@ export const make = Effect.fn("Updater.platform")(function* (channel: string) {
-   }
+ const unpackTimeout = 120_000
+@@ -25,5 +27,7 @@ export const make = Effect.fn("Updater.platform")(function* (channel: string) {
    updateClient.channel = "latest"
    updateClient.requestHeaders = { "User-Agent": userAgent }
 -  updateClient.allowPrerelease = false
@@ -27,9 +26,7 @@ index 047c13eb0d..3d63bf0463 100644
 +  updateClient.allowPrerelease = true
    updateClient.allowDowngrade = true
    updateClient.autoDownload = false
-   updateClient.autoInstallOnAppQuit = process.platform === "darwin"
-@@ -130,4 +134,27 @@ const installAndRestart = Effect.callback<void, Error>((resume) => {
-         Effect.andThen(Effect.fail(new Error("Update restart did not start"))),
+@@ -158,3 +162,26 @@ const installAndRestart = Effect.callback<void, Error>((resume) => {
        ),
    }),
 +  // [dokng] ad-hoc 签名包等安装失败时，菜单和界面两条入口都能得到下载指引。

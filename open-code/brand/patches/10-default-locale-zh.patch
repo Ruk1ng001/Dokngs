@@ -1,13 +1,9 @@
-# 10-default-locale-zh —— 品牌层可配置的首启默认 locale（US-003）
-#
-# 默认值来自 brand/brand.json，经 02 补丁在构建期注入 DEFAULT_LOCALE；品牌配置缺失时
-# 由构建配置回退为 zh。本补丁仅修改 desktop renderer 入口的无存储兜底。
+# 首次启动的默认语言；已有语言设置保持不变。
 diff --git a/packages/desktop/src/renderer/startup/locale.ts b/packages/desktop/src/renderer/startup/locale.ts
-index 7911162d59..03821574fb 100644
+index 7911162d5979d2081f3d3f9a65b638363e38317d..03821574fba25c544b9136d701c7066715aa685e 100644
 --- a/packages/desktop/src/renderer/startup/locale.ts
 +++ b/packages/desktop/src/renderer/startup/locale.ts
-@@ -20,7 +20,18 @@ export async function preloadStoredLocale(platform: Platform) {
-   const cached = localStorage.getItem(cacheKey)
+@@ -21,5 +21,16 @@ export async function preloadStoredLocale(platform: Platform) {
    const locale = storedLocale(cached ?? (await fresh))
  
 -  if (!locale) return
@@ -25,4 +21,3 @@ index 7911162d59..03821574fb 100644
 +  }
  
    if (locale !== "en") await loadLocaleDict(locale)
- 

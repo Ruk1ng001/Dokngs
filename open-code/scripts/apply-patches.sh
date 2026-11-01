@@ -85,6 +85,14 @@ run_manifest_check() {
     fi
     return 1
   fi
+
+  local duplicates
+  duplicates="$(awk 'NF && $0 !~ /^[#\[]/ {print}' "$MANIFEST_FILE" | LC_ALL=C sort | uniq -d)"
+  if [ -n "$duplicates" ]; then
+    err "每个源码文件只能由一个补丁维护，请合并以下重复接线："
+    printf '%s\n' "$duplicates" >&2
+    return 1
+  fi
   log "manifest 校验通过：$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l) 个 patch section 一致。"
 }
 

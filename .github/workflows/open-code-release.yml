@@ -72,6 +72,11 @@ on:
         required: false
         type: boolean
         default: false
+      build_only:
+        description: "【release 模式】只在云端检查并构建四平台产物，不创建 tag 或更新下载源"
+        required: false
+        type: boolean
+        default: false
       reuse_run_id:
         description: "【release 模式】复用该 run 的四平台 R2 产物，仅补发；必须同时指定原 force_version"
         required: false
@@ -312,8 +317,9 @@ jobs:
             echo "bun install 第 $attempt 次失败，$((attempt * 15))s 后重试…" >&2
             sleep $((attempt * 15))
           done
-          # v2 的包名已迁到 @opencode/*；同时覆盖品牌身份、图标与更新扩展。
-          bun turbo typecheck --concurrency=3 --filter=@opencode/app --filter=@opencode/desktop --filter=@opencode/core --filter=@opencode/ui --filter=@opencode/gui-extensions
+          # 品牌图标同时进入 GUI SDK 的生成类型；版本和生成器均跟随目标基线。
+          bun run --cwd packages/plugin generate
+          bun turbo typecheck:tsc --concurrency=3 --filter=@opencode/app --filter=@opencode/desktop --filter=@opencode/core --filter=@opencode/ui --filter=@opencode/gui-plugins
 
       - name: 校验通过 → 更新基线、提交并推送 main + 打 dokng tag
         if: steps.detect.outputs.need == 'true'
@@ -669,12 +675,15 @@ jobs:
           SOURCE_RUN_ID: ${{ inputs.reuse_run_id }}
           FORCE_VERSION: ${{ inputs.force_version }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           set -euo pipefail
+          [ "$BUILD_ONLY" != "true" ] || { echo "::error::build_only 不能复用旧产物"; exit 1; }
           [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::reuse_run_id 必须为运行编号"; exit 1; }
           [[ "$FORCE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dokng\.[0-9]+$ ]] || { echo "::error::补发必须指定原 force_version tag"; exit 1; }
           [ -n "$R2_ACCESS_KEY_ID" ] || { echo "::error::复用构建需要 R2 暂存区"; exit 1; }
-          SOURCE_TAG_SHA="$(git rev-parse --verify "refs/tags/${FORCE_VERSION}^{commit}")"
+          # build_only 尚未创建 tag；只允许补发当前提交的产物，校验后再建立 tag。
+          SOURCE_TAG_SHA="$(git rev-parse --verify "refs/tags/${FORCE_VERSION}^{commit}" 2>/dev/null || git rev-parse HEAD)"
           export SOURCE_TAG_SHA
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$RUNNER_TEMP/source-run.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" > "$RUNNER_TEMP/source-jobs.json"
@@ -700,9 +709,10 @@ jobs:
           FORCE_RELEASE: ${{ inputs.force_release }}
           SOURCE_RUN_ID: ${{ inputs.reuse_run_id }}
           TAG: ${{ steps.calc.outputs.tag }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           # 已验证的补发沿用原 tag；普通 tag 推送/force_release 同样进入发布。
-          if [ -n "$SOURCE_RUN_ID" ] || [ "${GITHUB_REF_TYPE:-}" = "tag" ] || [ "$FORCE_RELEASE" = "true" ]; then
+          if [ "$BUILD_ONLY" = "true" ] || [ -n "$SOURCE_RUN_ID" ] || [ "${GITHUB_REF_TYPE:-}" = "tag" ] || [ "$FORCE_RELEASE" = "true" ]; then
             echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "触发发布：复用已验证产物、tag 触发或 force_release。"
             exit 0
@@ -726,7 +736,7 @@ jobs:
       # 正好避免再触发一条 push:tag 发布流水线造成同版本重复出包。
       # push:tag 触发时跳过（tag 本来就存在）；tag 已存在时也跳过（补发场景，幂等）。
       - name: 建立并推送发布 tag（仅手动触发路径）
-        if: steps.decide.outputs.should_release == 'true' && github.ref_type != 'tag'
+        if: steps.decide.outputs.should_release == 'true' && github.ref_type != 'tag' && !inputs.build_only
         env:
           TAG: ${{ steps.calc.outputs.tag }}
         run: |
@@ -766,7 +776,7 @@ jobs:
           - os: macos-latest
             platform_flag: "--mac"
             arch_flag: "--arm64"
-            cli_target: opencode-darwin-arm64
+            cli_target: darwin-arm64
             # [monorepo] artifact_glob 一律「workspace 根相对」（带 open-code/ 前缀）：它同时被
             # uses: 型 upload-artifact（基准恒为 workspace 根，不受 defaults.run 影响）与 R2
             # 直传 run 步骤消费。两者基准必须一致，故统一按根相对，并让那个 run 步骤显式
@@ -784,7 +794,7 @@ jobs:
           - os: macos-15-intel
             platform_flag: "--mac"
             arch_flag: "--x64"
-            cli_target: opencode-darwin-x64-baseline
+            cli_target: darwin-x64-baseline
             artifact_glob: |
               open-code/opencode/packages/desktop/dist/*.dmg
               open-code/opencode/packages/desktop/dist/*.zip
@@ -794,7 +804,7 @@ jobs:
           - os: windows-latest
             platform_flag: "--win"
             arch_flag: ""
-            cli_target: opencode-windows-x64-baseline
+            cli_target: windows-x64-baseline
             artifact_glob: "open-code/opencode/packages/desktop/dist/*.exe"
             artifact_name: dokng-exe
             meta_subdir: latest-yml-x86_64-pc-windows-msvc
@@ -802,7 +812,7 @@ jobs:
           - os: ubuntu-latest
             platform_flag: "--linux"
             arch_flag: ""
-            cli_target: opencode-linux-x64-baseline
+            cli_target: linux-x64-baseline
             artifact_glob: "open-code/opencode/packages/desktop/dist/*.AppImage"
             artifact_name: dokng-appimage
             meta_subdir: latest-yml-x86_64-unknown-linux-gnu
@@ -817,8 +827,6 @@ jobs:
       CX_UNSIGNED: "1"
       # 上游 electron-builder 配置按 prod 通道出品牌 appId / 无后缀名。
       OPENCODE_CHANNEL: prod
-      # v2 desktop embeds a separately built native CLI instead of building the old Node sidecar.
-      OPENCODE_CLI_DIST: ${{ github.workspace }}/open-code/opencode/packages/cli/dist
       # 渠道值经 Secret 注入为环境变量（构建期由 electron.vite renderer.define
       # 内联进 renderer bundle，供余额面板读取；绝不进 git / 不进日志）。
       NEWAPI_BASE_URL: ${{ secrets.NEWAPI_BASE_URL }}
@@ -898,8 +906,8 @@ jobs:
         shell: bash
         run: |
           # [dokng] 画布（第二上游）补丁重放：给 infinite-canvas/ 工作区落地 basename /
-          # postMessage 注入 / persist 不落盘（brand/canvas-patches/）。desktop 构建时 prebuild
-          # 的 build-canvas.ts 会以 VITE_BASE=/canvas/ 构建画布、拷进 out/renderer/canvas/；
+          # postMessage 注入 / persist 不落盘（brand/canvas-patches/）。本仓 build-canvas.ts
+          # 在 desktop 构建后以 VITE_BASE=/canvas/ 构建画布、拷进 out/renderer/canvas/；
           # 若此步不跑，正式包内嵌的画布是未打补丁版（iframe 404 + 收不到宿主 key）。
           scripts/apply-canvas-patches.sh
 
@@ -940,32 +948,36 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      - name: 生成品牌图标类型
+        working-directory: ${{ github.workspace }}/open-code/opencode
+        run: bun run --cwd packages/plugin generate
+
       - name: 检查补丁后的完整 v2 工作区
         if: runner.os == 'Linux'
         working-directory: ${{ github.workspace }}/open-code/opencode
         shell: bash
-        run: bun run check
+        run: bun run lint && bun run typecheck:tsc
 
       - name: 构建品牌 CLI（v2 desktop 必需的原生内核）
         shell: bash
         env:
           VERSION: ${{ needs.detect.outputs.version }}
+          OPENCODE_TARGET: ${{ matrix.cli_target }}
         run: |
           set -euo pipefail
           export OPENCODE_VERSION="${VERSION#v}"
           export OPENCODE_CHANNEL=latest
-          bun opencode/packages/cli/script/build.ts --target=${{ matrix.cli_target }} --skip-install
+          bun opencode/packages/cli/script/build.ts --skip-install
 
-      - name: 准备 desktop 资源与 dokng 版本号
+      - name: 写入 dokng 版本号
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
         shell: bash
         env:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
           set -euo pipefail
-          export OPENCODE_VERSION="${VERSION#v}"
-          # 上游 prepare 复制 CLI/图标并更新版本；品牌 prebuild 同时构建内嵌画布。
-          bun scripts/prepare.ts
+          # 上游 script/build.ts 已接管 CLI/图标资源准备，版本号由品牌发布流程提供。
+          bun -e 'const file = Bun.file("package.json"); const pkg = await file.json(); pkg.version = process.env.VERSION.replace(/^v/, ""); await Bun.write(file, JSON.stringify(pkg, null, 2) + "\n")'
 
       - name: 构建 desktop（bun run build）
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
@@ -973,6 +985,9 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=4096
           OPENCODE_VERSION: ${{ needs.detect.outputs.version }}
         run: bun run build
+
+      - name: 构建并嵌入画布
+        run: bun scripts/build-canvas.ts
 
       - name: 打包（electron-builder + brand 配置）
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
@@ -1128,7 +1143,7 @@ jobs:
       - detect
       - package
     if: >-
-      !cancelled() && needs.detect.result == 'success' &&
+      !cancelled() && !inputs.build_only && needs.detect.result == 'success' &&
       needs.detect.outputs.should_release == 'true' &&
       (needs.package.result == 'success' ||
        (inputs.reuse_run_id != '' && needs.package.result == 'skipped'))

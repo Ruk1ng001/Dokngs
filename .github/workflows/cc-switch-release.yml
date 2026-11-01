@@ -136,7 +136,7 @@ jobs:
             label: windows-x86_64
           - os: ubuntu-22.04
             label: linux-x86_64
-          - os: macos-14
+          - os: macos-15
             label: macos-universal
 
     # [dokng] 提到 job 级：产物上传步骤用 if: env.R2_ACCESS_KEY_ID 在 R2 直传与 artifact

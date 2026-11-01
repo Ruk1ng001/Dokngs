@@ -216,6 +216,8 @@ git commit brand/BASE_TAG brand/BASE_SHA opencode -m "chore: 跟随 opencode <�
 - 推送 tag `v*-dokng.*`（如 `v1.17.15-dokng.1`）即触发发布；
 - 或在 Actions 页手动 `workflow_dispatch`，用 `mode` 选择运行哪段：
   `release`（出包发布，可强制指定版本 / 强制发布）/ `upgrade-opencode` / `upgrade-canvas`。
+- 云端验证维护分支：`gh workflow run open-code-release.yml --ref <分支> -f mode=release -f build_only=true`。
+  完成检查与四平台构建，产物进入 R2 暂存区；不创建 tag、不更新下载源。可从同一提交复用产物发布。
 
 发布前置：目标仓库已配置 4 个 `NEWAPI_*` Repository Secret（见上一节），
 以及升级段推送用的 `RELEASE_PAT`（repo 权限的 PAT）。

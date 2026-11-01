@@ -1,6 +1,7 @@
+# 账户面板、模型槽位与桌面渠道/画布桥；面板样式和桥代码只在此补丁维护。
 diff --git a/packages/app/src/components/cx-account/cx-account-api.ts b/packages/app/src/components/cx-account/cx-account-api.ts
 new file mode 100644
-index 0000000000..849a7c0326
+index 0000000000000000000000000000000000000000..849a7c03262891da3599d2265795f8f1c6a206fd
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-api.ts
 @@ -0,0 +1,655 @@
@@ -661,10 +662,10 @@ index 0000000000..849a7c0326
 +}
 diff --git a/packages/app/src/components/cx-account/cx-account-dialog.tsx b/packages/app/src/components/cx-account/cx-account-dialog.tsx
 new file mode 100644
-index 0000000000..fa8bfc5d46
+index 0000000000000000000000000000000000000000..9b13b06044fbf8d1f5dbbcaccfad72f6c9b5e8c2
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-dialog.tsx
-@@ -0,0 +1,869 @@
+@@ -0,0 +1,1078 @@
 +// [cx] 账户面板（迁自 desktop 包 renderer/balance/balance-panel.tsx，US-005 → US-013）。
 +//
 +// 本文件是账户面板从 desktop 包迁入 @opencode/app 包的落地：改用原生 v2 组件
@@ -678,9 +679,9 @@ index 0000000000..fa8bfc5d46
 +//
 +// 低冲突：独立目录 packages/app/src/components/cx-account/，全部 Cx 前缀，对上游现有文件零改动。
 +
-+import { createSignal, onMount, For, Show, Switch, Match } from "solid-js"
++import { createSignal, onCleanup, onMount, For, Show, Switch, Match } from "solid-js"
 +// [cx] 上游 v2 把 v1/v2 两条组件轨合并进 @opencode/ui：路径去掉 /v2 段，组件名去掉 V2 后缀
-+// （ButtonV2→Button、TextInputV2→TextInput、IconButtonV2→IconButton、TooltipV2→Tooltip），
++// （Button→Button、TextInput→TextInput、IconButton→IconButton、Tooltip→Tooltip），
 +// badge-v2 的 Tag 并入 ./badge 的 Badge（渲染出的 data-component="tag" 不变，css 选择器无需改）。
 +// props 面逐一核对过，与 v1 的 v2 轨一致（size/variant/placement/fit/closeLabel 全部保留）。
 +import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode/ui/dialog"
@@ -716,6 +717,19 @@ index 0000000000..fa8bfc5d46
 +  type KeyProfileState,
 +  type ResolvedKey,
 +} from "./cx-account-api"
++// [dokng] 画布四槽位状态（待办 4）：账户面板写槽位，画布页读并投递。
++import {
++  bumpCanvasModels,
++  canvasAudioKeyId,
++  canvasImageKeyId,
++  canvasTextKeyId,
++  canvasVideoKeyId,
++  pruneCanvasSlots,
++  toggleCanvasAudioKey,
++  toggleCanvasImageKey,
++  toggleCanvasTextKey,
++  toggleCanvasVideoKey,
++} from "./cx-canvas-slots"
 +
 +// [cx] US-008/US-009: 单条 key 列表项。按各自 key 独立展示 profile（loading/error/ready）；点击整行
 +// 切换激活，选中态由背景与强调边框表达，操作区只保留编辑 label / 删除（builtin 条目不可管理）。
@@ -726,6 +740,20 @@ index 0000000000..fa8bfc5d46
 +  onActivate: (entry: ResolvedKey) => void
 +  onSaveLabel: (id: string, label: string) => void
 +  onRemove: (id: string) => void
++  // [cx] 重新拉取该 key 的 profile（错误态就地重试，不必刷新全部）。
++  onRetry: (entry: ResolvedKey) => void
++  // [dokng] 刷新该 key 的模型列表（上游改了模型/名字后手动同步到内核 + 画布）。refreshing 期间禁用。
++  onRefreshModels: (id: string) => void
++  refreshingModels: boolean
++  // [dokng] 画布四槽位（待办 4）：该 key 是否已选为生图/视频/文本/音频槽 + 切换回调。
++  isImageSlot: boolean
++  isVideoSlot: boolean
++  isTextSlot: boolean
++  isAudioSlot: boolean
++  onToggleImageSlot: (id: string) => void
++  onToggleVideoSlot: (id: string) => void
++  onToggleTextSlot: (id: string) => void
++  onToggleAudioSlot: (id: string) => void
 +}) {
 +  const state = () => props.state ?? ({ status: "loading" } as KeyProfileState)
 +  const [editing, setEditing] = createSignal(false)
@@ -869,6 +897,54 @@ index 0000000000..fa8bfc5d46
 +            </div>
 +          </Show>
 +        </div>
++
++        {/* [dokng] 画布四槽位入口（待办 4/6）：生图 / 视频 / 文本 / 音频，四类模型各一个按钮。
++            移入身份行右侧——原先绝对定位钉在卡片右上角（right:44px），会压到右侧 io/指标数据上、
++            且身份列 1fr 的富余留白没被利用（「前面还很宽」）。现改为身份列内 flex 横排、垂直居中，
++            填掉那片留白、与右侧数据拉开距离，消除挤压；随容器断点自然重排，不再脱离流。
++            选中态 variant="contrast" 高亮 + tooltip 说明。仅可管理 key 且非编辑/删除确认态显示。
++            用户可自由组合：四类各选一个 key、同一 key 占多槽、只选部分。互不干扰。
++            stopPropagation 阻止冒泡到卡片整行的切换激活。 */}
++        <Show when={manageable() && !editing() && !confirmingDelete()}>
++          <div data-slot="cx-canvas-slots" onClick={(e) => e.stopPropagation()}>
++            <Tooltip value={props.isImageSlot ? "取消生图渠道" : "以此 key 启动生图"} placement="top">
++              <IconButton
++                aria-label={props.isImageSlot ? "取消生图渠道" : "以此 key 启动生图"}
++                variant={props.isImageSlot ? "contrast" : "neutral"}
++                size="small"
++                onClick={() => props.onToggleImageSlot(props.entry.id)}
++                icon={<Icon name="canvas-image" size="small" />}
++              />
++            </Tooltip>
++            <Tooltip value={props.isVideoSlot ? "取消视频渠道" : "以此 key 启动视频"} placement="top">
++              <IconButton
++                aria-label={props.isVideoSlot ? "取消视频渠道" : "以此 key 启动视频"}
++                variant={props.isVideoSlot ? "contrast" : "neutral"}
++                size="small"
++                onClick={() => props.onToggleVideoSlot(props.entry.id)}
++                icon={<Icon name="canvas-video" size="small" />}
++              />
++            </Tooltip>
++            <Tooltip value={props.isTextSlot ? "取消文本渠道" : "以此 key 启动文本"} placement="top">
++              <IconButton
++                aria-label={props.isTextSlot ? "取消文本渠道" : "以此 key 启动文本"}
++                variant={props.isTextSlot ? "contrast" : "neutral"}
++                size="small"
++                onClick={() => props.onToggleTextSlot(props.entry.id)}
++                icon={<Icon name="canvas-text" size="small" />}
++              />
++            </Tooltip>
++            <Tooltip value={props.isAudioSlot ? "取消音频渠道" : "以此 key 启动音频"} placement="top">
++              <IconButton
++                aria-label={props.isAudioSlot ? "取消音频渠道" : "以此 key 启动音频"}
++                variant={props.isAudioSlot ? "contrast" : "neutral"}
++                size="small"
++                onClick={() => props.onToggleAudioSlot(props.entry.id)}
++                icon={<Icon name="canvas-audio" size="small" />}
++              />
++            </Tooltip>
++          </div>
++        </Show>
 +      </header>
 +
 +      <Switch>
@@ -884,7 +960,23 @@ index 0000000000..fa8bfc5d46
 +          when={state().status === "error" ? (state() as Extract<KeyProfileState, { status: "error" }>) : undefined}
 +          keyed
 +        >
-+          {(err) => <div data-slot="cx-key-state">获取失败：{err.message}</div>}
++          {(err) => (
++            // [cx] 错误态给出重试入口：原先只有一行「获取失败：xxx」死文案，用户唯一的出路是点
++            // 顶部「刷新全部」（会重拉所有 key）。这里就地重试单个 key，失败原因仍然保留可读。
++            <div data-slot="cx-key-state" data-error="">
++              <span>获取失败：{err.message}</span>
++              <button
++                type="button"
++                data-slot="cx-key-retry"
++                onClick={(e) => {
++                  e.stopPropagation()
++                  props.onRetry(props.entry)
++                }}
++              >
++                重试
++              </button>
++            </div>
++          )}
 +        </Match>
 +
 +        <Match
@@ -946,22 +1038,42 @@ index 0000000000..fa8bfc5d46
 +        </Match>
 +      </Switch>
 +
-+      {/* [cx] US-009: 编辑操作固定在行末列。删除入口已移到卡片右上角（见 header 上方）。
-+          编辑态时行末显示保存 / 取消；非编辑态只显示编辑名称按钮。 */}
++      {/* [cx] US-009: 操作固定在行末列。删除入口已移到卡片右上角（见 header 上方）。
++          非编辑态显示「刷新模型 / 编辑名称」；编辑态显示保存 / 取消。刷新模型会热重载内核，
++          建议用户在会话空闲时操作，按钮进行中禁用避免重复 dispose。 */}
 +      <Show when={manageable()}>
 +        <div data-slot="cx-key-actions" onClick={(e) => e.stopPropagation()}>
 +          <Show
 +            when={editing()}
 +            fallback={
-+              <Tooltip value="编辑名称" placement="top">
-+                <IconButton
-+                  aria-label="编辑名称"
-+                  variant="neutral"
-+                  size="small"
-+                  onClick={startEdit}
-+                  icon={<Icon name="edit" size="small" />}
-+                />
-+              </Tooltip>
++              <>
++                {/* [dokng] 刷新模型：对该 key 强制重拉 /v1/models（复用主进程 channelConfigRefreshKey，
++                    无 CORS）→ 落盘 → 热重载内核 provider → reloadKeys 读回 → bump 通知画布重投。
++                    一次同时刷新「内核会话可选模型」与「画布渠道模型」，解决上游改模型后老 key 不更新。 */}
++                <Tooltip
++                  value={props.refreshingModels ? "正在刷新模型…" : "刷新模型（会短暂重载内核，请在会话空闲时操作）"}
++                  placement="top"
++                >
++                  <IconButton
++                    aria-label="刷新模型"
++                    variant="neutral"
++                    size="small"
++                    class={props.refreshingModels ? "cx-model-refresh-button" : undefined}
++                    disabled={props.refreshingModels}
++                    onClick={() => props.onRefreshModels(props.entry.id)}
++                    icon={<Icon name="reset" size="small" />}
++                  />
++                </Tooltip>
++                <Tooltip value="编辑名称" placement="top">
++                  <IconButton
++                    aria-label="编辑名称"
++                    variant="neutral"
++                    size="small"
++                    onClick={startEdit}
++                    icon={<Icon name="edit" size="small" />}
++                  />
++                </Tooltip>
++              </>
 +            }
 +          >
 +            <Tooltip value="保存名称" placement="top">
@@ -1098,8 +1210,27 @@ index 0000000000..fa8bfc5d46
 +  const [profiles, setProfiles] = createSignal<Record<string, KeyProfileState>>({})
 +  const [refreshingIds, setRefreshingIds] = createSignal<Set<string>>(new Set())
 +  const [switchingId, setSwitchingId] = createSignal<string | null>(null)
++  // [dokng] 正在刷新模型列表的 key id 集合（「刷新模型」按钮点击期间禁用该 key 的按钮）。
++  const [refreshingModelIds, setRefreshingModelIds] = createSignal<Set<string>>(new Set())
 +  const [addingKey, setAddingKey] = createSignal(false)
-+  const [notice, setNotice] = createSignal("")
++  // [cx] 通知条：带级别（info 常规反馈 / danger 失败）并自动消隐。
++  // 旧实现是裸字符串、且只在下一次操作开始时才清空——「切换失败」这类红字会一直挂在面板上，
++  // 用户重试成功后仍看到上一次的报错。现在按级别自动消失：成功类 4s，失败类 8s（留足阅读时间）。
++  const [notice, setNotice] = createSignal<{ text: string; level: "info" | "danger" } | null>(null)
++  let noticeTimer: ReturnType<typeof setTimeout> | undefined
++  function showNotice(text: string, level: "info" | "danger" = "info"): void {
++    if (noticeTimer) clearTimeout(noticeTimer)
++    setNotice({ text, level })
++    noticeTimer = setTimeout(() => setNotice(null), level === "danger" ? 8000 : 4000)
++  }
++  function clearNotice(): void {
++    if (noticeTimer) clearTimeout(noticeTimer)
++    setNotice(null)
++  }
++  // 面板关闭/卸载时清掉挂起的定时器，避免在已销毁的组件上 setState。
++  onCleanup(() => {
++    if (noticeTimer) clearTimeout(noticeTimer)
++  })
 +  const requestVersions = new Map<string, number>()
 +
 +  const activeEntry = () => keys().find((k) => k.isActive) ?? keys()[0]
@@ -1168,6 +1299,8 @@ index 0000000000..fa8bfc5d46
 +    setProfiles((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => valid.has(id))))
 +    // [cx] 同步清理已删 key 的缓存快照，避免缓存无限增长 / 下次误填已删 key 的旧数据。
 +    pruneCachedProfiles(next.map((entry) => entry.id))
++    // [dokng] 同步收敛画布四槽位：删掉的 key 不再占槽（落盘），避免重启后画布拿到已不存在的 keyId。
++    pruneCanvasSlots(valid)
 +    setInitializing(false)
 +    if (options.loadMissing) {
 +      for (const entry of next) {
@@ -1193,7 +1326,7 @@ index 0000000000..fa8bfc5d46
 +  // [cx] 未填名称时：新增后用该 key 在 new-api 侧的 token 名称（/api/app/profile 的 token_name）
 +  // 一次性回填本地 label（后续不再与远端同步）；取名失败 / 远端也没名字时保持「未命名 key」占位。
 +  async function handleAdd(input: { label: string; key: string; baseURL: string }): Promise<void> {
-+    setNotice("")
++    clearNotice()
 +    const addKey = cxChannelApi()?.channelKeysAdd
 +    if (!addKey) throw new Error("当前环境无法保存 Key，请在桌面客户端中重试")
 +
@@ -1216,7 +1349,7 @@ index 0000000000..fa8bfc5d46
 +
 +    // 本地写入成功后立即结束提交，让表单即时收起；远端名称、模型和 profile 在后台同步，
 +    // 避免网络慢时用户点击「添加」长时间看不到反馈。
-+    setNotice(`已添加 ${input.label.trim() || "新 Key"}，账户数据正在同步。`)
++    showNotice(`已添加 ${input.label.trim() || "新 Key"}，账户数据正在同步。`)
 +    const entrySnapshot = keys().find((k) => k.id === confirmedId)
 +    void (async () => {
 +      if (!input.label.trim() && entrySnapshot) {
@@ -1272,7 +1405,7 @@ index 0000000000..fa8bfc5d46
 +  async function handleActivate(entry: ResolvedKey): Promise<void> {
 +    if (entry.builtin || entry.isActive || switchingId()) return
 +    setSwitchingId(entry.id)
-+    setNotice("")
++    clearNotice()
 +    try {
 +      await cxChannelApi()?.channelKeysSetActive?.(entry.id)
 +      // 拉该 key 的可用模型并落盘（供 provider 的可选模型）。失败返回空数组，不阻断切换。
@@ -1299,9 +1432,62 @@ index 0000000000..fa8bfc5d46
 +      const target = next.find((k) => k.id === entry.id)
 +      if (target && !profiles()[entry.id]) void loadProfile(target)
 +    } catch {
-+      setNotice("切换失败，请检查本地配置后重试。")
++      showNotice("切换失败，请检查本地配置后重试。", "danger")
 +    } finally {
 +      setSwitchingId(null)
++    }
++  }
++
++  // [dokng] 画布槽位按需拉模型：把 key 选进画布槽位 ≠ 激活它，而模型列表（fetchModelsWith）原本
++  // 只在激活时才拉落盘。若被选 key 尚无 models 缓存，投给画布的 channel 会是空模型 → 画布显示了
++  // 渠道却无模型可联动。故选中槽位（非取消）时，若该 key 无 models，就按需拉一次 /v1/models 落盘，
++  // reloadKeys 刷新本地列表，再 bumpCanvasModels 通知画布页重投带模型的 payload。builtin 条目跳过。
++  async function ensureKeyModels(id: string): Promise<void> {
++    const entry = keys().find((k) => k.id === id)
++    if (!entry || entry.builtin || entry.models.length > 0) return
++    try {
++      const models = await fetchModelsWith(entry.baseURL, entry.key)
++      if (models.length === 0) return
++      await cxChannelApi()?.channelKeysSetModels?.(id, models)
++      await reloadKeys()
++      bumpCanvasModels()
++    } catch {
++      // 拉取失败静默：画布仍收到渠道（只是无模型），不阻断槽位选择。
++    }
++  }
++
++  // [dokng] 槽位切换统一封装：先 toggle 槽位（即时更新 UI + 触发画布重投），再对「选中」态按需拉模型。
++  // 取消（toggle 后该槽不再是本 key）时不拉模型。
++  function handleToggleSlot(toggle: (id: string) => void, isSelectedAfter: (id: string) => boolean, id: string): void {
++    toggle(id)
++    if (isSelectedAfter(id)) void ensureKeyModels(id)
++  }
++
++  // [dokng] 手动刷新某 key 的模型列表：上游改了模型/新增/改名后，模型列表不会自动同步（无轮询）。
++  // 此按钮一次同步两条链路——复用主进程现成的 channelConfigRefreshKey：它在主进程侧拉该 key 的
++  // /v1/models（无 CORS）→ 落盘 store → 重写内核 config + POST /global/dispose 热重载内核（会话可选
++  // 模型即时刷新）。再 reloadKeys 让面板读回新 models，bumpCanvasModels 通知画布页重投带新模型的 payload。
++  // dispose 会中断进行中的流式回复（同原生加/连 provider），故建议会话空闲时点。builtin 条目无需刷新。
++  async function handleRefreshModels(id: string): Promise<void> {
++    const entry = keys().find((k) => k.id === id)
++    if (!entry || entry.builtin || refreshingModelIds().has(id)) return
++    setRefreshingModelIds((prev) => new Set(prev).add(id))
++    clearNotice()
++    try {
++      const refreshKey = cxChannelApi()?.channelConfigRefreshKey
++      if (!refreshKey) throw new Error("客户端刷新接口不可用")
++      await refreshKey(id)
++      await reloadKeys()
++      bumpCanvasModels()
++      showNotice("模型刷新请求已完成；opencode 与画布渠道已重新同步。")
++    } catch {
++      showNotice("刷新模型失败，请检查该 key 的渠道地址后重试。", "danger")
++    } finally {
++      setRefreshingModelIds((prev) => {
++        const next = new Set(prev)
++        next.delete(id)
++        return next
++      })
 +    }
 +  }
 +
@@ -1397,8 +1583,12 @@ index 0000000000..fa8bfc5d46
 +                  </Match>
 +                </Switch>
 +                <div data-slot="cx-dashboard-actions">
-+                  <Tooltip value="刷新全部账户数据" placement="bottom">
++                  {/* [cx] 刷新中给出进行中反馈：原先只是 disabled，按钮变灰但没有任何「正在刷新」
++                      的信号，慢网络下看起来像点击没生效。现在图标旋转 + tooltip 文案同步切换。 */}
++                  <Tooltip value={anyLoading() ? "正在刷新账户数据…" : "刷新全部账户数据"} placement="bottom">
 +                    <IconButton
++                      data-slot="cx-refresh-button"
++                      data-spinning={anyLoading() ? "" : undefined}
 +                      aria-label="刷新全部账户数据"
 +                      variant="neutral"
 +                      size="normal"
@@ -1491,8 +1681,17 @@ index 0000000000..fa8bfc5d46
 +                )
 +              })()}
 +
-+              <Show when={notice()}>
-+                <div data-slot="cx-notice">{notice()}</div>
++              {/* [cx] 通知条：level 决定配色（danger 走 v2 危险色描边），role 让读屏播报。 */}
++              <Show when={notice()} keyed>
++                {(current) => (
++                  <div
++                    data-slot="cx-notice"
++                    data-level={current.level}
++                    role={current.level === "danger" ? "alert" : "status"}
++                  >
++                    {current.text}
++                  </div>
++                )}
 +              </Show>
 +
 +              <div data-slot="cx-key-col">
@@ -1522,6 +1721,17 @@ index 0000000000..fa8bfc5d46
 +                        onActivate={(e) => void handleActivate(e)}
 +                        onSaveLabel={(id, label) => void handleSaveLabel(id, label)}
 +                        onRemove={(id) => void handleRemove(id)}
++                        onRetry={(e) => void loadProfile(e)}
++                        isImageSlot={canvasImageKeyId() === entry.id}
++                        isVideoSlot={canvasVideoKeyId() === entry.id}
++                        isTextSlot={canvasTextKeyId() === entry.id}
++                        isAudioSlot={canvasAudioKeyId() === entry.id}
++                        onToggleImageSlot={(id) => handleToggleSlot(toggleCanvasImageKey, (x) => canvasImageKeyId() === x, id)}
++                        onToggleVideoSlot={(id) => handleToggleSlot(toggleCanvasVideoKey, (x) => canvasVideoKeyId() === x, id)}
++                        onToggleTextSlot={(id) => handleToggleSlot(toggleCanvasTextKey, (x) => canvasTextKeyId() === x, id)}
++                        onToggleAudioSlot={(id) => handleToggleSlot(toggleCanvasAudioKey, (x) => canvasAudioKeyId() === x, id)}
++                        onRefreshModels={(id) => void handleRefreshModels(id)}
++                        refreshingModels={refreshingModelIds().has(entry.id)}
 +                      />
 +                    )}
 +                  </For>
@@ -1536,7 +1746,7 @@ index 0000000000..fa8bfc5d46
 +}
 diff --git a/packages/app/src/components/cx-account/cx-account-import.tsx b/packages/app/src/components/cx-account/cx-account-import.tsx
 new file mode 100644
-index 0000000000..bc5f6b9c4d
+index 0000000000000000000000000000000000000000..bc5f6b9c4dc7daf60fed87c9bae011a1c34e6e69
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-import.tsx
 @@ -0,0 +1,175 @@
@@ -1717,10 +1927,10 @@ index 0000000000..bc5f6b9c4d
 +export { CxDialogImport }
 diff --git a/packages/app/src/components/cx-account/cx-account.css b/packages/app/src/components/cx-account/cx-account.css
 new file mode 100644
-index 0000000000..70e6506d8e
+index 0000000000000000000000000000000000000000..d4f89756966d4084fb5543734827aacd064b7024
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account.css
-@@ -0,0 +1,959 @@
+@@ -0,0 +1,1074 @@
 +/* [cx] 账户工作台：完全复用 OpenCode v2 语义 token，不引入品牌外配色。
 +   上游 v2 的 @opencode/ui 导出表只放出了 ./button.css 与 ./text-input.css，icon-button /
 +   tooltip 的 css 没有对外路径（v1 的 "./v2/*.css" 通配导出已删）。但这几个组件的 tsx 自己
@@ -2002,6 +2212,44 @@ index 0000000000..70e6506d8e
 +  box-shadow: var(--v2-elevation-overlay);
 +  color: var(--v2-text-text-base);
 +  font-size: 12px;
++  animation: cx-notice-in 160ms ease-out;
++}
++
++/* [cx] 失败类通知走危险色描边 + 文字色（不整块填红，浮层上过于刺眼），
++   与 key 卡片的 danger 徽标同一套语义 token。 */
++.cx-account-body [data-slot="cx-notice"][data-level="danger"] {
++  border-color: var(--v2-state-fg-danger);
++  color: var(--v2-state-fg-danger);
++}
++
++@keyframes cx-notice-in {
++  from {
++    opacity: 0;
++    transform: translateY(4px);
++  }
++  to {
++    opacity: 1;
++    transform: translateY(0);
++  }
++}
++
++/* [cx] 刷新全部账户数据时图标持续旋转：原先只把按钮置灰，长请求下看不出「在进行中」。 */
++.cx-account-body [data-slot="cx-refresh-button"][data-spinning] svg {
++  animation: cx-spin 900ms linear infinite;
++}
++
++@keyframes cx-spin {
++  to {
++    transform: rotate(360deg);
++  }
++}
++
++/* 尊重系统「减少动态效果」：入场位移与持续旋转都关掉，只保留状态本身。 */
++@media (prefers-reduced-motion: reduce) {
++  .cx-account-body [data-slot="cx-notice"],
++  .cx-account-body [data-slot="cx-refresh-button"][data-spinning] svg {
++    animation: none;
++  }
 +}
 +
 +.cx-account-body [data-slot="cx-key-col"] {
@@ -2158,6 +2406,26 @@ index 0000000000..70e6506d8e
 +  gap: 8px;
 +}
 +
++/* [dokng] 画布四槽位入口（生图 / 视频 / 文本 / 音频）：从原「绝对定位钉右上角」（right:44px、
++   会压到右侧 io/指标数据）改为身份列（cx-key-card-head，1fr）内的 flex 子项，靠右排布，
++   填掉身份列吸收的富余留白（「前面还很宽」），与右侧数据列拉开距离，消除挤压。
++   四个 small 按钮（约 92px：4×20px + 3×4px gap）横排；flex-shrink:0 保证 label 再长也不压缩按钮，
++   label 过长以 ellipsis 兜底；随容器断点跟 header 一起重排，不再脱离流。
++   与删除/编辑同为 IconButtonV2 small。常态半透明，hover / 选中态转实；已选槽位 variant="contrast" 高亮。 */
++.cx-account-body [data-slot="cx-canvas-slots"] {
++  display: flex;
++  flex-shrink: 0;
++  gap: 4px;
++  opacity: 0.72;
++  transition: opacity 120ms ease;
++}
++
++.cx-account-body [data-slot="cx-key-card"]:hover [data-slot="cx-canvas-slots"],
++.cx-account-body [data-slot="cx-key-card"]:focus-within [data-slot="cx-canvas-slots"],
++.cx-account-body [data-slot="cx-key-card"][data-active] [data-slot="cx-canvas-slots"] {
++  opacity: 1;
++}
++
 +.cx-account-body [data-slot="cx-key-card-title"] {
 +  min-width: 0;
 +  flex: 1;
@@ -2291,14 +2559,53 @@ index 0000000000..70e6506d8e
 +  background: var(--v2-background-bg-accent);
 +}
 +
++/* [cx] loading/切换中/错误态占位。错误态里多了「重试」按钮，故改 flex 横排：
++   文案自身裁剪（min-width:0 + 内层 span 省略号），按钮不被压缩。 */
 +.cx-account-body [data-slot="cx-key-state"] {
++  display: flex;
 +  min-width: 0;
 +  grid-column: 2 / 5;
++  align-items: center;
++  gap: 8px;
 +  overflow: hidden;
 +  color: var(--v2-text-text-faint);
 +  font-size: 11px;
 +  text-overflow: ellipsis;
 +  white-space: nowrap;
++}
++
++.cx-account-body [data-slot="cx-key-state"] > span {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* 失败原因用危险色，与「加载中…」这类中性占位区分开。 */
++.cx-account-body [data-slot="cx-key-state"][data-error] > span {
++  color: var(--v2-state-fg-danger);
++}
++
++/* 就地重试按钮：文字型小按钮，不抢卡片主操作（编辑/删除）的视觉权重。 */
++.cx-account-body [data-slot="cx-key-retry"] {
++  flex-shrink: 0;
++  padding: 2px 8px;
++  border: 0.5px solid var(--v2-border-border-base);
++  border-radius: 5px;
++  background: var(--v2-background-bg-layer-03);
++  color: var(--v2-text-text-base);
++  font-size: 11px;
++  cursor: pointer;
++  transition: background-color 120ms ease;
++}
++
++.cx-account-body [data-slot="cx-key-retry"]:hover {
++  background: var(--v2-background-bg-layer-04);
++}
++
++.cx-account-body [data-slot="cx-key-retry"]:focus-visible {
++  outline: none;
++  box-shadow: inset 0 0 0 1px var(--v2-border-border-focus);
 +}
 +
 +.cx-account-body [data-slot="cx-key-actions"] {
@@ -2307,6 +2614,24 @@ index 0000000000..70e6506d8e
 +  opacity: 0.72;
 +  white-space: nowrap;
 +  transition: opacity 120ms ease;
++}
++
++/* [dokng] 模型刷新中的明确反馈：reset 图标缓慢旋转。按钮本身 disabled，避免重复触发内核 dispose；
++   prefers-reduced-motion 下停动画，保留禁用态 + tooltip「正在刷新模型…」作为状态反馈。 */
++@keyframes cx-model-refresh-spin {
++  to {
++    transform: rotate(-360deg);
++  }
++}
++
++.cx-account-body .cx-model-refresh-button [data-slot="icon-svg"] {
++  animation: cx-model-refresh-spin 1s linear infinite;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .cx-account-body .cx-model-refresh-button [data-slot="icon-svg"] {
++    animation: none;
++  }
 +}
 +
 +.cx-account-body [data-slot="cx-key-card"]:hover [data-slot="cx-key-actions"],
@@ -2682,10 +3007,10 @@ index 0000000000..70e6506d8e
 +}
 diff --git a/packages/desktop/src/renderer/cx-channel-bridge.ts b/packages/desktop/src/renderer/cx-channel-bridge.ts
 new file mode 100644
-index 0000000000..0f72f1fba5
+index 0000000000000000000000000000000000000000..d2fd9cb17fc1fc7b7ed08f8f6d08817594017824
 --- /dev/null
 +++ b/packages/desktop/src/renderer/cx-channel-bridge.ts
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,50 @@
 +// [cx] US-009: 账户面板（app 包 components/cx-account/*）到本地 key 管理 IPC 的跨包桥。
 +//
 +// 为什么需要这个文件：
@@ -2716,6 +3041,13 @@ index 0000000000..0f72f1fba5
 +export function installCxChannelBridge() {
 +  // SAFETY: 本进程自己挂的全局，app 包只读它。
 +  ;(window as unknown as Record<string, unknown>)[globalKey] = {
++    canvasFileWrite: (key: string, base64: string, mime?: string) =>
++      invoke("CanvasFileWrite", { key, base64, ...(mime ? { mime } : {}) }),
++    canvasFileRead: (key: string) => invoke("CanvasFileRead", { key }),
++    canvasFileDelete: (keys: string[]) => invoke("CanvasFileDelete", { keys }),
++    canvasFileList: () => invoke("CanvasFileList"),
++    canvasStateRead: () => invoke("CanvasStateRead"),
++    canvasStateWrite: (json: string) => invoke("CanvasStateWrite", { json }),
 +    channelKeysList: () => invoke("ChannelKeysList"),
 +    channelKeysAdd: (input: { label: string; key: string; baseURL: string }) => invoke("ChannelKeysAdd", input),
 +    channelKeysRemove: (id: string) => invoke("ChannelKeysRemove", { id }),
@@ -2730,20 +3062,17 @@ index 0000000000..0f72f1fba5
 +  }
 +}
 diff --git a/packages/desktop/src/renderer/index.tsx b/packages/desktop/src/renderer/index.tsx
-index 6b9e5e2c82..1659bb1a5b 100644
+index 6b9e5e2c82e879275c35d5c6e652066ba519761c..1659bb1a5b8254dd1d8a3564908e084f79ee8184 100644
 --- a/packages/desktop/src/renderer/index.tsx
 +++ b/packages/desktop/src/renderer/index.tsx
-@@ -4,6 +4,8 @@ import "./diagnostics"
- import "./styles.css"
+@@ -5,4 +5,6 @@ import "./styles.css"
  import { render } from "solid-js/web"
  import { api } from "./api"
 +// [cx] 账户面板（app 包）到本地 key 管理 IPC 的跨包桥。见 cx-channel-bridge.ts 的头注释。
 +import { installCxChannelBridge } from "./cx-channel-bridge"
  import { DesktopApp } from "./desktop-app"
  import { startDesktopMenu } from "./platform/menu"
- import { startDeepLinks } from "./startup/deep-links"
-@@ -18,6 +20,9 @@ startDesktopMenu(api)
- 
+@@ -19,4 +21,7 @@ startDesktopMenu(api)
  startDeepLinks(api)
  
 +// 必须在 render 之前：首启无 key 时账户面板会在挂载期就读这座桥（见 cx-account-launcher.tsx）。
@@ -2751,4 +3080,3 @@ index 6b9e5e2c82..1659bb1a5b 100644
 +
  render(() => <DesktopApp api={api} version={version} />, root)
  
- void initializeSentry(version)

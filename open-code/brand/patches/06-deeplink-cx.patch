@@ -1,9 +1,9 @@
+# Dokng 应用身份、数据目录和 dokng:// 深链协议。
 diff --git a/packages/desktop/src/main/constants.ts b/packages/desktop/src/main/constants.ts
-index 79972677a1..09c4b15fc0 100644
+index 79972677a1f73cb566eb8af5313aea4bf04d71ba..09c4b15fc0747183bab7d1a8e38f01462551ea9a 100644
 --- a/packages/desktop/src/main/constants.ts
 +++ b/packages/desktop/src/main/constants.ts
-@@ -8,19 +8,22 @@ export const CHANNEL: Channel = raw === "local" || raw === "dev" || raw === "bet
- 
+@@ -9,18 +9,21 @@ export const CHANNEL: Channel = raw === "local" || raw === "dev" || raw === "bet
  export const VERSION = app.isPackaged ? app.getVersion() : (process.env.OPENCODE_VERSION ?? app.getVersion())
  
 +// [cx] 品牌改名 Dokng：运行时应用名 / appId 全部平移到品牌值（与 brand/brand.json 的
@@ -33,12 +33,24 @@ index 79972677a1..09c4b15fc0 100644
  
 -export const APP_ID = app.isPackaged ? appIDs[CHANNEL] : "ai.opencode.desktop.dev"
 +export const APP_ID = app.isPackaged ? appIDs[CHANNEL] : "ai.dokng.desktop.dev"
+diff --git a/packages/desktop/src/main/lifecycle/configure.ts b/packages/desktop/src/main/lifecycle/configure.ts
+index e085780b89c1c609fa122b43d171db7603abeb94..087b7855e5732415302453887261f02e62de82dc 100644
+--- a/packages/desktop/src/main/lifecycle/configure.ts
++++ b/packages/desktop/src/main/lifecycle/configure.ts
+@@ -47,4 +47,8 @@ export function configureApplication() {
+   app.setPath("userData", testRoot ? path.join(testRoot, "desktop") : path.join(app.getPath("appData"), APP_ID))
+ 
++  // [dokng] Namespace the v2 service discovery before the early probe runs. A compatible
++  // upstream service would otherwise be reused without this app's channel environment.
++  if (!testRoot) process.env.XDG_STATE_HOME = app.getPath("userData")
++
+   if (testRoot) {
+     app.setPath("sessionData", path.join(testRoot, "session"))
 diff --git a/packages/desktop/src/main/lifecycle/environment.ts b/packages/desktop/src/main/lifecycle/environment.ts
-index 4b9b4e1fd4..3ccc59b653 100644
+index 67d11df749cf6051d385c894ca9953093cb28d0a..913c0cd891484fdf138a8eedb8afdfa9d80b5ca4 100644
 --- a/packages/desktop/src/main/lifecycle/environment.ts
 +++ b/packages/desktop/src/main/lifecycle/environment.ts
-@@ -37,8 +37,14 @@ export const prepareDesktop = Effect.gen(function* () {
-   const path = yield* Path.Path
+@@ -44,6 +44,12 @@ export const prepareDesktop = Effect.gen(function* () {
    const paths = yield* DesktopPaths.resolve
  
 -  if (app.isPackaged || process.env.OPENCODE_DESKTOP_DISABLE_PROTOCOL_REGISTRATION !== "1")
@@ -52,13 +64,11 @@ index 4b9b4e1fd4..3ccc59b653 100644
 +  }
    const runFork = Effect.runForkWith(yield* Effect.context())
    setProtocolReporter((level, message, data) =>
-     runFork(scoped("protocol", level === "error" ? Effect.logError(message, data) : Effect.logWarning(message, data))),
 diff --git a/packages/desktop/src/main/lifecycle/index.ts b/packages/desktop/src/main/lifecycle/index.ts
-index 5ed4fb312b..f58018270b 100644
+index df043c9b96f2933c3270767e10f9f33c1b38843d..015bcbdd9f9febc306ac8eda2a0af35ce1681377 100644
 --- a/packages/desktop/src/main/lifecycle/index.ts
 +++ b/packages/desktop/src/main/lifecycle/index.ts
-@@ -77,7 +77,11 @@ const runtime = Layer.effect(
-     }
+@@ -87,5 +87,9 @@ const runtime = Layer.effect(
  
      const secondInstance = (_event: Event, argv: string[]) => {
 -      const urls = argv.filter((arg) => arg.startsWith("opencode://"))
@@ -69,19 +79,3 @@ index 5ed4fb312b..f58018270b 100644
 +      const urls = argv.filter((arg) => arg.startsWith("opencode://") || arg.startsWith("dokng://"))
  
        if (urls.length) {
-         runFork(Effect.logInfo("deep link received via second-instance", { urls }))
-diff --git a/packages/desktop/src/main/lifecycle/configure.ts b/packages/desktop/src/main/lifecycle/configure.ts
-index 878d184a4f..f67d11253f 100644
---- a/packages/desktop/src/main/lifecycle/configure.ts
-+++ b/packages/desktop/src/main/lifecycle/configure.ts
-@@ -32,6 +32,10 @@ export function configureApplication() {
-   const testRoot = createTestRoot()
-   app.setPath("userData", testRoot ? path.join(testRoot, "desktop") : path.join(app.getPath("appData"), APP_ID))
- 
-+  // [dokng] Namespace the v2 service discovery before the early probe runs. A compatible
-+  // upstream service would otherwise be reused without this app's channel environment.
-+  if (!testRoot) process.env.XDG_STATE_HOME = app.getPath("userData")
-+
-   if (testRoot) {
-     app.setPath("sessionData", path.join(testRoot, "session"))
- 

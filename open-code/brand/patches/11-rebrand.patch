@@ -1,9 +1,9 @@
+# 普通翻译和原生菜单的品牌名替换；保留上游未命中字典时返回 undefined 的行为。
 diff --git a/packages/app/src/env.d.ts b/packages/app/src/env.d.ts
-index a55450a7e7..b0574999fc 100644
+index b18fe121e715616c875fbf2c29db2926ee7f2c60..1702f0f59e539e4c4d9cea1f22be77dd21152d20 100644
 --- a/packages/app/src/env.d.ts
 +++ b/packages/app/src/env.d.ts
-@@ -7,6 +7,10 @@ interface ImportMetaEnv {
-   readonly VITE_SENTRY_DSN?: string
+@@ -8,4 +8,8 @@ interface ImportMetaEnv {
    readonly VITE_SENTRY_ENVIRONMENT?: string
    readonly VITE_SENTRY_RELEASE?: string
 +
@@ -12,13 +12,11 @@ index a55450a7e7..b0574999fc 100644
 +  readonly PRODUCT_NAME?: string
  }
  
- interface ImportMeta {
 diff --git a/packages/app/src/runtime/i18n/language.tsx b/packages/app/src/runtime/i18n/language.tsx
-index fed6514a85..a37026a864 100644
+index 90e7792a1a072559790c85f0b22648c0be57dc24..ac25cc20de742883f37de15040d7c187d5c47ddc 100644
 --- a/packages/app/src/runtime/i18n/language.tsx
 +++ b/packages/app/src/runtime/i18n/language.tsx
-@@ -58,6 +58,33 @@ type TranslationKey<Key extends Extract<keyof Dictionary, string>> = Key extends
- 
+@@ -59,4 +59,31 @@ type TranslationKey<Key extends Extract<keyof Dictionary, string>> = Key extends
  type Source = { dict: Record<string, string> }
  
 +// [cx] 品牌名替换：在唯一翻译出口统一替换用户可见的 OpenCode 文案，同时保护真实服务名、
@@ -50,27 +48,14 @@ index fed6514a85..a37026a864 100644
 +
  export function richTemplateParts<Value>(template: string, params: Record<string, Value>) {
    return template
-     .split(/({{\s*[^}]+?\s*}})/g)
-@@ -255,12 +282,16 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
-       initialValue: dicts.get(initial) ?? base,
-     })
+@@ -267,5 +294,5 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
  
--    const t = translator(() => dictionary() ?? base, resolveTemplate) as <
-+    const translate = translator(() => dictionary() ?? base, resolveTemplate) as <
-       Key extends Extract<keyof Dictionary, string>,
-     >(
-       key: TranslationKey<Key>,
-       params?: Record<string, string | number | boolean>,
-     ) => string
-+    const t = (<Key extends Extract<keyof Dictionary, string>>(
-+      key: TranslationKey<Key>,
-+      params?: Record<string, string | number | boolean>,
-+    ) => rebrand(translate(key, params))) as typeof translate
+       // A key outside the dictionary translates to nothing, as it did with the package translator.
+-      return template === undefined ? template : resolveTemplate(template, params)
++      return template === undefined ? template : rebrand(resolveTemplate(template, params))
+     }
  
-     const pluralForm = (
-       key: PluralKey,
-@@ -310,7 +341,9 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
- 
+@@ -343,5 +370,7 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
        if (!current) return
        props.onNativeTranslations(
 -        createDesktopNativeBundle(locale(), (key) => current[key] ?? DESKTOP_NATIVE_ENGLISH[key]),
@@ -79,4 +64,3 @@ index fed6514a85..a37026a864 100644
 +        createDesktopNativeBundle(locale(), (key) => rebrand(current[key] ?? DESKTOP_NATIVE_ENGLISH[key])),
        )
      })
- 
