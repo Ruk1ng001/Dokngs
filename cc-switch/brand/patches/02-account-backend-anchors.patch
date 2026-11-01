@@ -27,11 +27,11 @@ diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
 index 9645507f9e277c22b8d3838442182bd813fd1f82..d46ffe91a691e756f4569a229d921bf7a1d3f72f 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
-@@ -17,2 +17,4 @@ mod database;
- mod deeplink;
+@@ -16,2 +16,4 @@ mod config;
+ mod database;
 +// [ccs] Dokng 账户导入深链接（resource=account）；实现见 overlay 的 deeplink_account.rs。
 +mod deeplink_account;
- mod error;
+ mod deeplink;
 @@ -280,2 +282,9 @@ fn handle_deeplink_url(
  
 +    // [ccs] resource=account 的链接由品牌账户模块接管（发 "ccs-account-import"），

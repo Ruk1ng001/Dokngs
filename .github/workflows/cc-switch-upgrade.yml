@@ -36,6 +36,11 @@ on:
     # 北京时间 00:37（UTC+8） → UTC 16:37。避开整点，减少与上游发布高峰重叠。
     - cron: "37 16 * * *"
   workflow_dispatch:
+    inputs:
+      validate_only:
+        description: "只在云端验证当前基线，不推进 main 或创建发布 tag"
+        type: boolean
+        default: false
 
 # 同时只跑一个升级流水线，避免并发写 main。
 # [monorepo] group 带产品名：open-code 的升级流水线也写 main，两者互不该排队等对方
@@ -80,10 +85,18 @@ jobs:
 
       - name: 检测上游最新稳定 tag
         id: detect
+        env:
+          VALIDATE_ONLY: ${{ inputs.validate_only }}
         run: |
           set -euo pipefail
           CURRENT="$(tr -d '[:space:]' < brand/BASE_TAG)"
           echo "当前基线 tag：$CURRENT"
+
+          if [ "$VALIDATE_ONLY" = "true" ]; then
+            echo "need=true" >> "$GITHUB_OUTPUT"
+            echo "latest=$CURRENT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # 拉取 submodule 所有 tag（origin = farion1231/cc-switch，已同步上游）。
           git -C upstream fetch --tags --quiet origin
@@ -212,7 +225,7 @@ jobs:
       - name: 补丁冲突 → 开 issue 通知维护者
         # steps.replay.outcome 而非 failure()：只为补丁冲突开 issue。后续 typecheck /
         # cargo check 失败是另一类问题（上游自身或环境），不该套用「需人工 rebase」的模板。
-        if: failure() && steps.replay.outcome == 'failure'
+        if: failure() && steps.replay.outcome == 'failure' && !inputs.validate_only
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LATEST: ${{ steps.detect.outputs.latest }}
@@ -306,7 +319,7 @@ jobs:
           cargo check --locked --manifest-path upstream/src-tauri/Cargo.toml
 
       - name: 校验通过 → 更新基线、提交并推送 main
-        if: steps.detect.outputs.need == 'true'
+        if: steps.detect.outputs.need == 'true' && !inputs.validate_only
         env:
           LATEST: ${{ steps.detect.outputs.latest }}
         run: |
