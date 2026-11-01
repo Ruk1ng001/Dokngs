@@ -1,6 +1,6 @@
 # gui-plugins 更新器：允许品牌版本后缀，安装失败时提供下载入口。
 diff --git a/packages/gui-plugins/src/updater/platform.ts b/packages/gui-plugins/src/updater/platform.ts
-index e562c5a0db4c286793b458f170e918681d1bb913..63ce525cbac5b55a2c008dfb7464bf6b6860720c 100644
+index e562c5a0db4c286793b458f170e918681d1bb913..0cbae2eeba37c8d6f3b605f451d2db302b0bddd2 100644
 --- a/packages/gui-plugins/src/updater/platform.ts
 +++ b/packages/gui-plugins/src/updater/platform.ts
 @@ -1,5 +1,5 @@
@@ -10,14 +10,15 @@ index e562c5a0db4c286793b458f170e918681d1bb913..63ce525cbac5b55a2c008dfb7464bf6b
 +import { app, autoUpdater, dialog, shell } from "electron"
  import pkg from "electron-updater"
  import { Effect } from "effect"
-@@ -11,4 +11,6 @@ const execFileAsync = promisify(execFile)
- 
+@@ -12,4 +12,7 @@ const execFileAsync = promisify(execFile)
  const restartTimeout = 10_000
+ 
 +// [dokng] 自动安装失败时提供覆盖安装入口，保留用户数据。
 +const downloadPage = "https://dokng.com/"
- 
++
  const unpackTimeout = 120_000
-@@ -25,5 +27,7 @@ export const make = Effect.fn("Updater.platform")(function* (channel: string) {
+ 
+@@ -25,5 +28,7 @@ export const make = Effect.fn("Updater.platform")(function* (channel: string) {
    updateClient.channel = "latest"
    updateClient.requestHeaders = { "User-Agent": userAgent }
 -  updateClient.allowPrerelease = false
@@ -26,7 +27,7 @@ index e562c5a0db4c286793b458f170e918681d1bb913..63ce525cbac5b55a2c008dfb7464bf6b
 +  updateClient.allowPrerelease = true
    updateClient.allowDowngrade = true
    updateClient.autoDownload = false
-@@ -158,3 +162,26 @@ const installAndRestart = Effect.callback<void, Error>((resume) => {
+@@ -158,3 +163,26 @@ const installAndRestart = Effect.callback<void, Error>((resume) => {
        ),
    }),
 +  // [dokng] ad-hoc 签名包等安装失败时，菜单和界面两条入口都能得到下载指引。

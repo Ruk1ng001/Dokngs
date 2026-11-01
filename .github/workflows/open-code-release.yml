@@ -958,11 +958,22 @@ jobs:
         shell: bash
         run: bun run lint && bun run typecheck:tsc
 
-      - name: 检查品牌补丁涉及的 GUI 文件规范
+      - name: 检查 GUI 插件补丁规范
         if: runner.os == 'Linux'
         working-directory: ${{ github.workspace }}/open-code/opencode
         shell: bash
-        run: bun run lint:changed "$(tr -d '[:space:]' < ../brand/BASE_SHA)"
+        run: |
+          set -euo pipefail
+          # gui-plugins 的 AGENTS.md 要求改动文件连 warn 级规则也必须通过。
+          # 独立重放该目录的最终改动，运行上游 lint:changed；全仓 lint/typecheck 已在上一步检查。
+          base="$(tr -d '[:space:]' < ../brand/BASE_SHA)"
+          lint_dir="$RUNNER_TEMP/opencode-gui-lint"
+          git worktree add --detach "$lint_dir" "$base"
+          git diff --binary "$base" -- packages/gui-plugins > "$RUNNER_TEMP/opencode-gui.patch"
+          git -C "$lint_dir" apply "$RUNNER_TEMP/opencode-gui.patch"
+          ln -s "$PWD/node_modules" "$lint_dir/node_modules"
+          cd "$lint_dir"
+          bun run lint:changed "$base"
 
       - name: 构建品牌 CLI（v2 desktop 必需的原生内核）
         shell: bash
