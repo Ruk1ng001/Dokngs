@@ -958,6 +958,12 @@ jobs:
         shell: bash
         run: bun run lint && bun run typecheck:tsc
 
+      - name: 检查品牌补丁涉及的 GUI 文件规范
+        if: runner.os == 'Linux'
+        working-directory: ${{ github.workspace }}/open-code/opencode
+        shell: bash
+        run: bun run lint:changed "$(tr -d '[:space:]' < ../brand/BASE_SHA)"
+
       - name: 构建品牌 CLI（v2 desktop 必需的原生内核）
         shell: bash
         env:

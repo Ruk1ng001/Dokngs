@@ -1,30 +1,12 @@
 # 账户/画布的 Shell、标题栏接线与 provider 切换。09 提供面板，17 提供画布宿主。
 diff --git a/packages/app/src/components/cx-account/cx-account-launcher.tsx b/packages/app/src/components/cx-account/cx-account-launcher.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..7daf9638d54be8abe162c2f6c8c3f48ace1852f4
+index 0000000000000000000000000000000000000000..15400c38d45069884b3a1a6d794b07cbc3b862f1
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-launcher.tsx
-@@ -0,0 +1,131 @@
-+// [cx] 账户面板在 app shell 里的接线：标题栏账户按钮 + dokng:// 一键导入深链 + 首启无 key 引导。
-+//
-+// 三件事都挂在同一个组件里，因为它们共用同一份懒加载的 cx-account 模块与同一个 useDialog()：
-+//   1. 账户入口按钮：经 TitlebarRight 挂到标题栏右侧（与原生的扩展胶囊同排）。
-+//   2. dokng:// 一键导入深链（US-013）：复用 desktop 既有 deep-link 分发（opencode:deep-link
-+//      事件 + 启动缓冲，见 cx-deep-links.ts），解析出 dokng:// 后弹导入确认框（不静默写入）。
-+//   3. 首启无 key 引导（FR-3.6）：启动时读本地 key 列表，为空则自动弹账户面板（引导新增流程）。
-+// 三者全部仅 desktop 生效（账户面板经 desktop IPC 读写本地 key），非 desktop 渲染 null。
-+//
-+// [cx] 上游 v2 重构：v1 这些接线分散在 pages/layout.tsx（旧布局：侧边栏账户按钮 + onMount 里的
-+// 深链与首启引导）与 pages/cx-account-launcher.tsx（新布局：标题栏 portal 版同款逻辑）两处——
-+// 因为 v1 同时存在 LegacyLayout 与 NewLayout 两套布局、运行时二选一。v2 只剩一套 shell
-+// （shell/shell.tsx），故两份等价逻辑合回这一个组件，挂载点也只剩一个。
-+//
-+// 为什么账户按钮走 TitlebarRight 而不是 HomeUtilityNav：v1 的落点（侧边栏底部、settings/help
-+// 同排）在 v2 的对应物是 home 页的 HomeUtilityNav，但它只在 home 页渲染——会话进行中够不到
-+// 账户面板（看余额、切 key 恰恰是会话中的需求）。标题栏是 v2 唯一跨路由常驻的 chrome。
-+// 代价：标题栏右侧挂载点（#opencode-titlebar-right）在「垂直标签页」外观下不渲染（上游
-+// titlebar.tsx 的 `<Show when={!props.verticalTabs}>`），故另注册一条命令面板入口
-+// （cx.account.open）兜底——垂直标签页是用户主动开启的非默认外观（默认 horizontal）。
+@@ -0,0 +1,124 @@
++// [cx] Shell 常驻处理深链、首启引导与命令；按钮由横向标题栏或垂直标签栏直接渲染。
++// 监听器不随标题栏布局重挂载，避免重复首启引导或漏掉 dokng:// 链接。
 +
 +import { onMount } from "solid-js"
 +import { useNavigate } from "@solidjs/router"
@@ -35,25 +17,29 @@ index 0000000000000000000000000000000000000000..7daf9638d54be8abe162c2f6c8c3f48a
 +import { makeEventListener } from "@solid-primitives/event-listener"
 +import { usePlatform } from "@/runtime/platform/platform"
 +import { useCommand } from "@/shell/commands/command"
-+import { TitlebarRight } from "@/shell/titlebar/right-slot"
 +import { deepLinkEvent, drainPendingDeepLinks } from "./cx-deep-links"
 +
 +const ACCOUNT_LABEL = "账户"
++
++function useOpenAccount() {
++  const dialog = useDialog()
++
++  return () => {
++    void import("./cx-account-dialog").then((x) => {
++      dialog.show(() => <x.CxDialogAccount />)
++    })
++  }
++}
 +
 +export function CxAccountLauncher() {
 +  const platform = usePlatform()
 +  const dialog = useDialog()
 +  const command = useCommand()
 +  const navigate = useNavigate()
++  const openAccount = useOpenAccount()
 +
 +  // 非 desktop（web 等）不渲染任何东西：账户面板经 desktop IPC 读写本地 key，web 端无此通道。
 +  if (platform.platform !== "desktop") return null
-+
-+  const openAccount = () => {
-+    void import("./cx-account-dialog").then((x) => {
-+      dialog.show(() => <x.CxDialogAccount />)
-+    })
-+  }
 +
 +  // dokng:// 一键导入深链：解析出第一条有效链接后弹导入确认框（不静默写入，见 cx-account-import）。
 +  const handleDeepLinks = (urls: string[]) => {
@@ -72,7 +58,7 @@ index 0000000000000000000000000000000000000000..7daf9638d54be8abe162c2f6c8c3f48a
 +    })
 +  }
 +
-+  // 命令面板入口：垂直标签页外观下标题栏右侧挂载点不存在，这条是该场景的兜底入口（也给键盘流用户）。
++  // 常驻命令面板入口，支持键盘操作和侧栏收起时访问。
 +  command.register("cx-account", () => [
 +    {
 +      id: "cx.account.open",
@@ -102,25 +88,33 @@ index 0000000000000000000000000000000000000000..7daf9638d54be8abe162c2f6c8c3f48a
 +      const state = await api.loadChannelState()
 +
 +      if (api.resolveKeyList(state).length > 0) return
-+      const x = await import("./cx-account-dialog")
-+      dialog.show(() => <x.CxDialogAccount />)
++      openAccount()
 +    })
 +  })
 +
++  return null
++}
++
++export function CxAccountButtons() {
++  const platform = usePlatform()
++  const navigate = useNavigate()
++  const openAccount = useOpenAccount()
++
++  if (platform.platform !== "desktop") return null
++
 +  return (
-+    <TitlebarRight>
-+      <div class="flex items-center gap-1 shrink-0">
-+        <Tooltip placement="bottom" value="画布">
-+          <IconButton
-+            type="button"
-+            variant="ghost-muted"
-+            size="large"
-+            class="shrink-0"
-+            icon={<Icon name="palette" />}
-+            onClick={() => navigate("/canvas")}
-+            aria-label="画布"
-+          />
-+        </Tooltip>
++    <div class="flex items-center gap-1 shrink-0 [app-region:no-drag]">
++      <Tooltip placement="bottom" value="画布">
++        <IconButton
++          type="button"
++          variant="ghost-muted"
++          size="large"
++          class="shrink-0"
++          icon={<Icon name="palette" />}
++          onClick={() => navigate("/canvas")}
++          aria-label="画布"
++        />
++      </Tooltip>
 +      <Tooltip placement="bottom" value={ACCOUNT_LABEL}>
 +        <IconButton
 +          type="button"
@@ -132,8 +126,7 @@ index 0000000000000000000000000000000000000000..7daf9638d54be8abe162c2f6c8c3f48a
 +          aria-label={ACCOUNT_LABEL}
 +        />
 +      </Tooltip>
-+      </div>
-+    </TitlebarRight>
++    </div>
 +  )
 +}
 diff --git a/packages/app/src/components/cx-account/cx-deep-links.ts b/packages/app/src/components/cx-account/cx-deep-links.ts
@@ -294,240 +287,50 @@ index 63c43e2bb67434d2f51c14f3122240c7f5350718..82d12f49f0ca1292cb7501d0605daffd
        <DataProvider
          data={sessionUIData()}
 diff --git a/packages/app/src/shell/shell.tsx b/packages/app/src/shell/shell.tsx
-index 52e8c1f6079ad01f3296aac8251190df0446a559..fac9ee2b02dcf62d226ff5de429add81368b45ee 100644
+index 52e8c1f6079ad01f3296aac8251190df0446a559..e2d0ee03fc36f44fea9454a13f1269bdc3e1ed1d 100644
 --- a/packages/app/src/shell/shell.tsx
 +++ b/packages/app/src/shell/shell.tsx
-@@ -1,2 +1,5 @@
+@@ -1,2 +1,4 @@
 +import CanvasHost from "@/canvas/host"
-+import { TitlebarRightProvider } from "@/shell/titlebar/right-slot"
 +import { CxAccountLauncher } from "@/components/cx-account/cx-account-launcher"
  import { Show, startTransition, Suspense, type ParentProps } from "solid-js"
  import { createStore } from "solid-js/store"
-@@ -205,110 +208,114 @@ export default function Layout(props: ParentProps) {
- 
-   return (
--    <div
--      class="relative bg-v2-background-bg-deep flex-1 min-h-0 min-w-0 flex flex-col select-none [&_input]:select-text [&_textarea]:select-text [&_[contenteditable]]:select-text"
--      style={{
--        // Mobile panels only need clearance for their outer border.
--        "--shell-inline-inset": mobile() ? "1px" : "8px",
--        // A bottom mobile titlebar leaves main's top edge to the safe area. Native Windows chrome supplies the gap;
--        // retain outer-outline clearance.
--        "--shell-top-inset": bottomTitlebar()
--          ? "0px"
--          : platform.platform === "desktop" && platform.os === "windows"
--            ? "1px"
--            : "8px",
--        "--shell-bottom-inset": bottomTitlebar()
--          ? "8px"
--          : "max(0px, calc(8px - var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))))",
--      }}
--    >
--      <Titlebar verticalTabs={verticalTabs() ? { mount: state.tabsMount } : undefined} />
--      <div class="relative flex flex-1 min-h-0 min-w-0 flex-row">
--        {/* The empty inset above the panels moves the window, as the titlebar does. */}
--        <Show when={dragInset()}>
--          <div
--            data-slot="shell-drag-inset"
--            aria-hidden="true"
--            class="absolute inset-x-0 top-0 h-[var(--shell-top-inset,8px)]"
--            data-tauri-drag-region
--          />
--        </Show>
--        <Show when={verticalTabs()}>
--          <aside
--            id="vertical-tabs-sidebar"
--            data-slot="vertical-tabs-sidebar"
--            data-state={preferences.appearance.sidebarOpen() ? "open" : "closed"}
--            data-peek={peek.shown() ? "" : undefined}
--            style={{ "--sidebar-peek-width": `${state.tabsWidth}px` }}
--            ref={(element) => setState("tabsAside", element)}
--            class="relative z-10 h-full min-h-0 shrink-0"
--          >
--            {/* Skipped rather than display: none or inert, so neither direction restyles the sidebar's contents and
--                  a reopen reuses their layout. */}
-+    <TitlebarRightProvider>
-+      <div
-+        class="relative bg-v2-background-bg-deep flex-1 min-h-0 min-w-0 flex flex-col select-none [&_input]:select-text [&_textarea]:select-text [&_[contenteditable]]:select-text"
-+        style={{
-+          // Mobile panels only need clearance for their outer border.
-+          "--shell-inline-inset": mobile() ? "1px" : "8px",
-+          // A bottom mobile titlebar leaves main's top edge to the safe area. Native Windows chrome supplies the gap;
-+          // retain outer-outline clearance.
-+          "--shell-top-inset": bottomTitlebar()
-+            ? "0px"
-+            : platform.platform === "desktop" && platform.os === "windows"
-+              ? "1px"
-+              : "8px",
-+          "--shell-bottom-inset": bottomTitlebar()
-+            ? "8px"
-+            : "max(0px, calc(8px - var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))))",
-+        }}
-+      >
-+        <Titlebar verticalTabs={verticalTabs() ? { mount: state.tabsMount } : undefined} />
-+        <CxAccountLauncher />
-+        <div class="relative flex flex-1 min-h-0 min-w-0 flex-row">
-+          {/* The empty inset above the panels moves the window, as the titlebar does. */}
-+          <Show when={dragInset()}>
-             <div
--              ref={(element) => setState("tabsPanel", element)}
--              data-slot="vertical-tabs-panel"
--              class="absolute inset-0 overflow-hidden [contain:layout_style_paint]"
--              classList={{ "[content-visibility:hidden]": !sidebarMotion.present() && !peek.shown() }}
-+              data-slot="shell-drag-inset"
-+              aria-hidden="true"
-+              class="absolute inset-x-0 top-0 h-[var(--shell-top-inset,8px)]"
-+              data-tauri-drag-region
-+            />
-+          </Show>
-+          <Show when={verticalTabs()}>
-+            <aside
-+              id="vertical-tabs-sidebar"
-+              data-slot="vertical-tabs-sidebar"
-+              data-state={preferences.appearance.sidebarOpen() ? "open" : "closed"}
-+              data-peek={peek.shown() ? "" : undefined}
-+              style={{ "--sidebar-peek-width": `${state.tabsWidth}px` }}
-+              ref={(element) => setState("tabsAside", element)}
-+              class="relative z-10 h-full min-h-0 shrink-0"
-             >
--              {/* Under a peek's contents, so they dim over the sidebar's own background, as when docking, rather than
--                  showing the content beneath through them. */}
-+              {/* Skipped rather than display: none or inert, so neither direction restyles the sidebar's contents and
-+                    a reopen reuses their layout. */}
-               <div
--                ref={peekSurface}
--                data-slot="vertical-tabs-peek-surface"
--                aria-hidden="true"
--                class="pointer-events-none absolute inset-y-0 end-0 bg-v2-background-bg-deep shadow-[var(--v2-elevation-floating)]"
--                style={{ width: `${state.tabsWidth}px` }}
--              />
-+                ref={(element) => setState("tabsPanel", element)}
-+                data-slot="vertical-tabs-panel"
-+                class="absolute inset-0 overflow-hidden [contain:layout_style_paint]"
-+                classList={{ "[content-visibility:hidden]": !sidebarMotion.present() && !peek.shown() }}
-+              >
-+                {/* Under a peek's contents, so they dim over the sidebar's own background, as when docking, rather than
-+                    showing the content beneath through them. */}
-+                <div
-+                  ref={peekSurface}
-+                  data-slot="vertical-tabs-peek-surface"
-+                  aria-hidden="true"
-+                  class="pointer-events-none absolute inset-y-0 end-0 bg-v2-background-bg-deep shadow-[var(--v2-elevation-floating)]"
-+                  style={{ width: `${state.tabsWidth}px` }}
-+                />
-+                <div
-+                  ref={(element) => setState("tabsMount", element)}
-+                  data-slot="vertical-tabs-mount"
-+                  class="absolute inset-y-0 end-0 contain-strict will-change-[opacity] flex min-h-0 flex-col bg-v2-background-bg-deep pe-2.5 ps-4.5 pb-[var(--shell-bottom-inset,8px)] pt-[var(--shell-top-inset,8px)]"
-+                  style={{
-+                    width: `${state.tabsWidth}px`,
-+                    "padding-bottom": "max(10px, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))",
-+                  }}
-+                />
-+              </div>
-+              {/* Takes the pointer while the sidebar closes, without restyling its contents. */}
-               <div
--                ref={(element) => setState("tabsMount", element)}
--                data-slot="vertical-tabs-mount"
--                class="absolute inset-y-0 end-0 contain-strict will-change-[opacity] flex min-h-0 flex-col bg-v2-background-bg-deep pe-2.5 ps-4.5 pb-[var(--shell-bottom-inset,8px)] pt-[var(--shell-top-inset,8px)]"
--                style={{
--                  width: `${state.tabsWidth}px`,
--                  "padding-bottom": "max(10px, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))",
--                }}
-+                class="absolute inset-0 z-20"
-+                classList={{ hidden: preferences.appearance.sidebarOpen() || !sidebarMotion.present() }}
-               />
--            </div>
--            {/* Takes the pointer while the sidebar closes, without restyling its contents. */}
--            <div
--              class="absolute inset-0 z-20"
--              classList={{ hidden: preferences.appearance.sidebarOpen() || !sidebarMotion.present() }}
--            />
--            <Show when={preferences.appearance.sidebarOpen()}>
--              <ResizeHandle
--                class="-end-1"
--                direction="horizontal"
--                size={state.tabsWidth}
--                min={136}
--                max={640}
--                onResize={(width) => setState("tabsWidth", width)}
--              />
--            </Show>
--          </aside>
--        </Show>
--        {/* Size containment collapses percentage-height descendants in WebKit. */}
--        <main
+@@ -223,4 +225,5 @@ export default function Layout(props: ParentProps) {
+     >
+       <Titlebar verticalTabs={verticalTabs() ? { mount: state.tabsMount } : undefined} />
++      <CxAccountLauncher />
+       <div class="relative flex flex-1 min-h-0 min-w-0 flex-row">
+         {/* The empty inset above the panels moves the window, as the titlebar does. */}
+@@ -289,5 +292,5 @@ export default function Layout(props: ParentProps) {
+         {/* Size containment collapses percentage-height descendants in WebKit. */}
+         <main
 -          class="flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
--          style={{
--            "padding-top": bottomTitlebar() ? "env(safe-area-inset-top, 0px)" : "0px",
--            "padding-bottom":
--              bottomTitlebar() || settings.active()
--                ? "0px"
-+              <Show when={preferences.appearance.sidebarOpen()}>
-+                <ResizeHandle
-+                  class="-end-1"
-+                  direction="horizontal"
-+                  size={state.tabsWidth}
-+                  min={136}
-+                  max={640}
-+                  onResize={(width) => setState("tabsWidth", width)}
-+                />
-+              </Show>
-+            </aside>
-+          </Show>
-+          {/* Size containment collapses percentage-height descendants in WebKit. */}
-+          <main
-+            class="relative flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
-+            style={{
-+              "padding-top": bottomTitlebar() ? "env(safe-area-inset-top, 0px)" : "0px",
-+              "padding-bottom":
-+                bottomTitlebar() || settings.active()
-+                  ? "0px"
-+                  : "var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))",
-+              "--settings-bottom-inset": bottomTitlebar()
-+                ? "40px"
-                 : "var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))",
--            "--settings-bottom-inset": bottomTitlebar()
--              ? "40px"
--              : "var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))",
--          }}
--        >
--          <PluginServerCover>
--            <Suspense>{props.children}</Suspense>
--          </PluginServerCover>
--        </main>
--        <CollapsedSidebarToggle />
-+            }}
-+          >
-+            <PluginServerCover>
-+              <Suspense>{props.children}</Suspense>
-+            </PluginServerCover>
-+            <CanvasHost />
-+          </main>
-+          <CollapsedSidebarToggle />
-+        </div>
-+        <PluginSlot at="window.bottom" input={{}} />
-+        <ToastRegion />
-+        <UploadToastHost />
-       </div>
--      <PluginSlot at="window.bottom" input={{}} />
--      <ToastRegion />
--      <UploadToastHost />
--    </div>
-+    </TitlebarRightProvider>
-   )
- }
++          class="relative flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
+           style={{
+             "padding-top": bottomTitlebar() ? "env(safe-area-inset-top, 0px)" : "0px",
+@@ -304,4 +307,5 @@ export default function Layout(props: ParentProps) {
+             <Suspense>{props.children}</Suspense>
+           </PluginServerCover>
++          <CanvasHost />
+         </main>
+         <CollapsedSidebarToggle />
 diff --git a/packages/app/src/shell/titlebar/titlebar.tsx b/packages/app/src/shell/titlebar/titlebar.tsx
-index 96995e467edfd05a92c671537c87c15e69dbbecf..9574b7fe33e3306346183970a18c73e72dcaacd3 100644
+index 96995e467edfd05a92c671537c87c15e69dbbecf..32bbfce4a72d6e835473f761eb78e670c345ad97 100644
 --- a/packages/app/src/shell/titlebar/titlebar.tsx
 +++ b/packages/app/src/shell/titlebar/titlebar.tsx
-@@ -389,4 +389,5 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+@@ -36,4 +36,5 @@ import { useSettingsDialog } from "@/settings/command"
+ import { rootSession } from "@/shell/routes/session"
+ import { TitlebarItems, useTitlebarItems } from "@/runtime/plugin/titlebar-items"
++import { CxAccountButtons } from "@/components/cx-account/cx-account-launcher"
+ 
+ export const newTabCommand = { id: "tab.new", keybind: "mod+t,mod+n" }
+@@ -389,4 +390,5 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                  }
  
 +                case "canvas":
                  case "settings":
                  case "connect":
-@@ -765,5 +766,6 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+@@ -765,5 +767,6 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                                  onClick={() => {
                                    setMobileTabs("open", false)
 -                                  platform.openExternal("https://opencode.ai/desktop-feedback")
@@ -535,3 +338,18 @@ index 96995e467edfd05a92c671537c87c15e69dbbecf..9574b7fe33e3306346183970a18c73e7
 +                                  platform.openExternal("https://dokng.com/")
                                  }}
                                >
+@@ -886,6 +889,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                               </Show>
+                             </div>
+-                            <Show when={titlebarItems.ids().length > 0}>
++                            <Show when={titlebarItems.ids().length > 0 || platform.platform === "desktop"}>
+                               <div data-slot="vertical-tabs-footer" class="mt-2 flex w-full shrink-0 flex-col">
++                                <CxAccountButtons />
+                                 <TitlebarItems items={titlebarItems} vertical />
+                               </div>
+@@ -902,4 +906,5 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                 <Show when={!props.verticalTabs}>
+                   <div class="relative z-20 flex shrink-0 items-center justify-end gap-0 overflow-visible">
++                    <CxAccountButtons />
+                     <TitlebarItems items={titlebarItems} />
+                   </div>

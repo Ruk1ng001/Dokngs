@@ -18,7 +18,7 @@
 | 2 | [appId](#2-appid) | `brand/brand.json` | 改一个 JSON 字段 |
 | 3 | [图标](#3-图标) | `brand/icons/` | 替换同名图标文件 |
 | 4 | [渠道变量（base_url / key / model）](#4-渠道变量base_url--key--model) | 环境变量 / CI Secret（无补丁） | 改 `channel.env` 或 Secret，不改源码 |
-| 5 | [余额接口](#5-余额接口) | 补丁 `01` + `02` | 改余额面板组件 / 注入变量 |
+| 5 | [余额接口](#5-余额接口) | 补丁 `09` + `02` | 改余额面板组件 / 注入变量 |
 | 6 | [充值 URL](#6-充值-url) | 环境变量 `NEWAPI_TOPUP_URL`（无补丁） | 改 `channel.env` 或 Secret |
 
 所有品牌值集中在单一数据源 `brand/brand.json`，打包覆盖文件
@@ -110,7 +110,8 @@ appId 派生 Linux 桌面身份（`extraMetadata.desktopName` / `linux.executabl
 - **补丁 `02-balance-newapi`**（`brand/patches/02-balance-newapi.patch`）：
   - 改 `packages/desktop/electron.vite.config.ts` —— 全系列**唯一**触碰该文件的补丁，
     统一承载构建期注入：`renderer.define` / `main.define` 的 `NEWAPI_*`、`PRODUCT_NAME`、
-    `DEFAULT_LOCALE` 与画布产物拷贝钩子（03/11/17 的 vite 增量已并入，见 manifest [02]）；
+    `DEFAULT_LOCALE`（03/11 的 vite 注入已并入，见 manifest [02]）；画布构建和复制由本仓
+    `scripts/build-canvas.ts` 负责；
   - 改 `packages/desktop/src/renderer/env.d.ts` —— 补 `ImportMetaEnv` 类型声明。
 
 要改余额接口路径 / 单位换算 / 展示，改补丁 `09` 覆盖的 `cx-account-api.ts` /
