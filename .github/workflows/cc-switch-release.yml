@@ -320,6 +320,18 @@ jobs:
           rm -f "$KEY_PATH"
           echo "✅ minisign 私钥就绪"
 
+      - name: 预取并校验 Tauri 打包工具（官方 GitHub API）
+        if: runner.os != 'macOS'
+        working-directory: ${{ github.workspace }}/cc-switch/upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 浏览器 release 下载地址可能 504；在编译前准备官方资源，保留上游哈希校验。
+          cli_version="$(node -p 'require("@tauri-apps/cli/package.json").version')"
+          python3 ../scripts/prepare-tauri-cache.py --cli-version "$cli_version"
+
       - name: 构建 Tauri App（macOS universal）
         if: runner.os == 'macOS'
         working-directory: ${{ github.workspace }}/cc-switch/upstream

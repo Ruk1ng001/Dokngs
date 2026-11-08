@@ -948,6 +948,28 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      - name: 读取 Electron 官方校验表
+        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export CX_ELECTRON_CHECKSUMS="$RUNNER_TEMP/electron-checksums.json"
+          node ../../../scripts/prepare-electron-checksums.mjs
+          echo "CX_ELECTRON_CHECKSUMS=$CX_ELECTRON_CHECKSUMS" >> "$GITHUB_ENV"
+
+      - name: 准备 electron-builder 官方工具缓存
+        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export ELECTRON_BUILDER_CACHE="$RUNNER_TEMP/electron-builder-cache"
+          node ../../../scripts/prepare-builder-cache.mjs
+          echo "ELECTRON_BUILDER_CACHE=$ELECTRON_BUILDER_CACHE" >> "$GITHUB_ENV"
+
       - name: 生成品牌图标类型
         working-directory: ${{ github.workspace }}/open-code/opencode
         run: bun run --cwd packages/plugin generate
@@ -1005,17 +1027,6 @@ jobs:
 
       - name: 构建并嵌入画布
         run: bun scripts/build-canvas.ts
-
-      - name: 读取 Electron 官方校验表
-        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          export CX_ELECTRON_CHECKSUMS="$RUNNER_TEMP/electron-checksums.json"
-          node ../../../scripts/prepare-electron-checksums.mjs
-          echo "CX_ELECTRON_CHECKSUMS=$CX_ELECTRON_CHECKSUMS" >> "$GITHUB_ENV"
 
       - name: 打包（electron-builder + brand 配置）
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
