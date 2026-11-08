@@ -85,7 +85,8 @@ const brandedPublish = [
 ]
 
 // CI 从官方 release assets API 取得校验表，避开偶发 504 的浏览器下载地址。
-// 仍交给 @electron/get 校验 Electron ZIP；mirrorOptions 确保 builder 识别新配置形态。
+// 仍交给 @electron/get 校验 Electron ZIP。force:false 让 builder 识别新配置形态并复用缓存；
+// 不用 mirrorOptions:{}：26.15.7 的 createDownloadOpts 会把该分支的 checksums 丢掉。
 const electronChecksumsFile = process.env.CX_ELECTRON_CHECKSUMS
 const electronChecksums: Record<string, string> | undefined = electronChecksumsFile
   ? JSON.parse(readFileSync(electronChecksumsFile, "utf8"))
@@ -93,7 +94,7 @@ const electronChecksums: Record<string, string> | undefined = electronChecksumsF
 
 const config: Configuration = {
   ...base,
-  ...(electronChecksums ? { electronDownload: { mirrorOptions: {}, checksums: electronChecksums } } : {}),
+  ...(electronChecksums ? { electronDownload: { force: false, checksums: electronChecksums } } : {}),
   appId: brandedAppId,
   productName: brandedProductName,
   publish: brandedPublish,
