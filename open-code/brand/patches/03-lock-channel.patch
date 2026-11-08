@@ -1,7 +1,7 @@
 # 多渠道配置文件与内核环境注入（含 PRODUCT_NAME），保留上游服务探测和版本重试。
 diff --git a/packages/desktop/src/main/channel-config.ts b/packages/desktop/src/main/channel-config.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..41a1bd0a8db57a3d5ea68964df1cf00bb8b7efdd
+index 0000000000..41a1bd0a8d
 --- /dev/null
 +++ b/packages/desktop/src/main/channel-config.ts
 @@ -0,0 +1,192 @@
@@ -198,10 +198,11 @@ index 0000000000000000000000000000000000000000..41a1bd0a8db57a3d5ea68964df1cf00b
 +  writeChannelConfigFile()
 +}
 diff --git a/packages/desktop/src/main/env.d.ts b/packages/desktop/src/main/env.d.ts
-index 353119cf06788182e8f7ac1090ae3a01d4f359c1..a2ee4fa565abed1ab2a339c7259c8fc041e11fb6 100644
+index 353119cf06..a2ee4fa565 100644
 --- a/packages/desktop/src/main/env.d.ts
 +++ b/packages/desktop/src/main/env.d.ts
-@@ -2,4 +2,9 @@ interface ImportMetaEnv {
+@@ -1,6 +1,11 @@
+ interface ImportMetaEnv {
    readonly OPENCODE_CHANNEL: string
    readonly OPENCODE_VERSION?: string
 +  // [cx] 内置渠道锁定：构建期内联的 newapi 渠道值，供主进程启动内核 sidecar 时
@@ -211,18 +212,30 @@ index 353119cf06788182e8f7ac1090ae3a01d4f359c1..a2ee4fa565abed1ab2a339c7259c8fc0
 +  readonly NEWAPI_MODEL: string
  }
  
+ interface ImportMeta {
 diff --git a/packages/desktop/src/main/service/background-service.ts b/packages/desktop/src/main/service/background-service.ts
-index f6002ba6bbd9577270530bb8e1041d4092904f89..84315e1f1a934ae6e9ba2e591ee1f40a17dc2817 100644
+index 7bf76da471..f5357ffbb8 100644
 --- a/packages/desktop/src/main/service/background-service.ts
 +++ b/packages/desktop/src/main/service/background-service.ts
-@@ -2,4 +2,6 @@ import { app } from "electron"
+@@ -3,6 +3,8 @@ import type { Endpoint } from "@opencode/client/service"
  import { Context, Effect, FileSystem, Layer, Option, Path, Schema } from "effect"
+ import { SidecarChanged } from "../../shared/ipc-rpc/events"
  import { CHANNEL } from "../constants"
-+// [cx] 内置渠道：起内核前写 config 文件并用 OPENCODE_CONFIG 指向它（见下方注入点）。
++// [cx] 内置渠道：起内核前写 config 文件并用 OPENCODE_CONFIG 指向它。
 +import { getChannelConfigPath, writeChannelConfigFile } from "../channel-config"
- import { BackgroundServiceState } from "./background-service-state"
- import { cleanStages } from "./cli-stages"
-@@ -47,4 +49,12 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
+ import { emitIpcEvent } from "../ipc-events"
+ import { getMainWindows } from "../windows"
+ import { BackgroundServiceMachine } from "./background-service-machine"
+@@ -62,6 +64,7 @@ const ensure = Effect.fn("BackgroundService.ensure")(function* (mode: Background
+     setup.client.Service.ensure({
+       file: setup.file,
+       version,
++      env: setup.channelEnv,
+       // A fixed port makes a second contender fail to bind and back off; port 0 never collides, so two
+       // services could boot against the same database.
+       command: [
+@@ -108,6 +111,14 @@ const prepare = Effect.fn("BackgroundService.prepare")(function* (mode: Backgrou
+   if (isolated) process.env.XDG_STATE_HOME = app.getPath("userData")
    const client = yield* Effect.promise(() => import("@opencode/client/service"))
  
 +  // [dokng] 文件配置可热重载；首启无 key 时也注册 watcher，后续添加渠道无需重启。
@@ -235,9 +248,13 @@ index f6002ba6bbd9577270530bb8e1041d4092904f89..84315e1f1a934ae6e9ba2e591ee1f40a
 +
    const file =
      process.env.OPENCODE_DESKTOP_SERVER_CHANNEL === "local"
-@@ -60,4 +70,5 @@ const connect = Effect.fn("BackgroundService.connect")(function* (mode: "initial
-       file,
-       version: required,
-+      env: channelEnv,
-       // A fixed port makes a second contender fail to bind and back off; port 0 never collides, so two
-       // services could boot against the same database.
+       ? path.join(
+@@ -117,7 +128,7 @@ const prepare = Effect.fn("BackgroundService.prepare")(function* (mode: Backgrou
+         )
+       : undefined
+ 
+-  return { cli, client, file, isolated, version }
++  return { cli, client, file, isolated, version, channelEnv }
+ })
+ 
+ const adopt = Effect.fn("BackgroundService.adopt")(function* (

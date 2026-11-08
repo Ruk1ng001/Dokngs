@@ -1,11 +1,12 @@
 # 账户、画布和模型槽位图标；云端安装依赖后生成 plugin 图标类型，避免手改生成文件。
 diff --git a/packages/ui/src/icons/catalog.ts b/packages/ui/src/icons/catalog.ts
-index 81b22fec4b7878fc7a9d4c942519122edb14a6e5..489fdc24775347b304f1cec4484357bfc82ad412 100644
+index 6cbe6c27d2..32d1109104 100644
 --- a/packages/ui/src/icons/catalog.ts
 +++ b/packages/ui/src/icons/catalog.ts
-@@ -3,4 +3,34 @@ import { additionalIcons, additionalIconViewBox } from "./icon/additional-icons"
- // Consumers center the SVG viewport, so each icon must center its artwork within its viewBox.
- const icons = {
+@@ -14,6 +14,36 @@ const icons = {
+     viewBox: "0 0 16 16",
+     body: `<rect x="3.5" y="7" width="9" height="7" rx="1" stroke="currentColor"/><path d="M5 7V5a3 3 0 0 1 6 0v2M8 10v1" stroke="currentColor" stroke-linecap="round"/>`,
+   },
 +  // [dokng] 画布四类模型槽位图标（生图/视频/文本/音频），语义明显区分，见 cx-account-dialog KeyCard。
 +  // 生图：相框 + 山峰 + 太阳（经典图片图标）。
 +  "canvas-image": {
@@ -36,5 +37,6 @@ index 81b22fec4b7878fc7a9d4c942519122edb14a6e5..489fdc24775347b304f1cec4484357bf
 +    viewBox: "0 0 20 20",
 +    body: `<circle cx="10" cy="6.5" r="3.25" stroke="currentColor"/><path d="M4.16675 16.6667C4.16675 13.4451 6.77842 10.8334 10.0001 10.8334C13.2217 10.8334 15.8334 13.4451 15.8334 16.6667" stroke="currentColor" stroke-linecap="square"/>`,
 +  },
-   lock: {
+   globe: {
      viewBox: "0 0 16 16",
+     body: `<circle cx="8" cy="8" r="6" stroke="currentColor"/><ellipse cx="8" cy="8" rx="2.5" ry="6" stroke="currentColor"/><path d="M2 8h12" stroke="currentColor"/>`,

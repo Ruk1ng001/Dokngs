@@ -1,26 +1,29 @@
 # 独立的 Dokng 字标组件及新会话页入口，不再修改上游 wordmark 动画实现。
 diff --git a/packages/app/src/new-session/view.tsx b/packages/app/src/new-session/view.tsx
-index 5d44390bb0b991b3c9c2117dfdf6316bc0add3db..3cca069f31ed6a0d91c7a450a6f6407593b11667 100644
+index 8bb849109f..e291424447 100644
 --- a/packages/app/src/new-session/view.tsx
 +++ b/packages/app/src/new-session/view.tsx
-@@ -38,5 +38,6 @@ import { NewSessionBranch } from "./workspace/selector"
+@@ -37,7 +37,7 @@ import type { NewSessionWorkspaceController } from "./workspace/controller"
+ import { NewSessionBranch } from "./workspace/selector"
  import { NewSessionBrickBreaker } from "./brick-breaker"
- import { NewSessionPinBoard, type PinBoardHandle } from "./pin-board"
--import { NewSessionWordmark, type LodgerBall } from "./wordmark"
-+import type { LodgerBall } from "./wordmark"
+ import { NewSessionPinBoard } from "./pin-board"
+-import { NewSessionWordmark } from "./wordmark"
 +import { DokngWordmark } from "./wordmark-brand"
- 
- const providerTipDismissalDuration = 30 * 24 * 60 * 60 * 1000
-@@ -102,5 +103,5 @@ export function NewSessionView(props: {
+ import {
+   createWordmarkState,
+   selectBrickBreaker,
+@@ -104,7 +104,7 @@ export function NewSessionView(props: {
+         />
          <div class="absolute inset-x-0 top-[25.375%] flex justify-center px-6">
            <div class={NEW_SESSION_CONTENT_WIDTH}>
 -            <NewSessionWordmark
 +            <DokngWordmark
-               ref={(box) => setWordmark("box", box)}
-               sound={settings.sounds.interfaceEnabled}
+               ref={setLogo}
+               state={wordmark}
+               onEvent={dispatchWordmark}
 diff --git a/packages/app/src/new-session/wordmark-brand.tsx b/packages/app/src/new-session/wordmark-brand.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..699b0331fbb25dd7c5cb71f45ed08474d69aa046
+index 0000000000..699b0331fb
 --- /dev/null
 +++ b/packages/app/src/new-session/wordmark-brand.tsx
 @@ -0,0 +1,95 @@

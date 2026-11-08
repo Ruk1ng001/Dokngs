@@ -1,7 +1,7 @@
 # 账户/画布的 Shell、标题栏接线与 provider 切换。09 提供面板，17 提供画布宿主。
 diff --git a/packages/app/src/components/cx-account/cx-account-launcher.tsx b/packages/app/src/components/cx-account/cx-account-launcher.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..15400c38d45069884b3a1a6d794b07cbc3b862f1
+index 0000000000..15400c38d4
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-account-launcher.tsx
 @@ -0,0 +1,124 @@
@@ -131,7 +131,7 @@ index 0000000000000000000000000000000000000000..15400c38d45069884b3a1a6d794b07cb
 +}
 diff --git a/packages/app/src/components/cx-account/cx-deep-links.ts b/packages/app/src/components/cx-account/cx-deep-links.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..2098e2aab40d8273ea76425ec38ab38f67ca0b54
+index 0000000000..2098e2aab4
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-deep-links.ts
 @@ -0,0 +1,35 @@
@@ -172,7 +172,7 @@ index 0000000000000000000000000000000000000000..2098e2aab40d8273ea76425ec38ab38f
 +}
 diff --git a/packages/app/src/components/cx-account/cx-provider-switch-bridge.tsx b/packages/app/src/components/cx-account/cx-provider-switch-bridge.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..15f39b766a8d185821d5be4770b98a55cb07e56c
+index 0000000000..15f39b766a
 --- /dev/null
 +++ b/packages/app/src/components/cx-account/cx-provider-switch-bridge.tsx
 @@ -0,0 +1,84 @@
@@ -261,10 +261,11 @@ index 0000000000000000000000000000000000000000..15f39b766a8d185821d5be4770b98a55
 +  return null
 +}
 diff --git a/packages/app/src/home/projects/controller.tsx b/packages/app/src/home/projects/controller.tsx
-index 7d3743b00dfc7406fc4645b5bd6a9e649b23ec80..7b1de4ce557ee1764c83bb9805749a0e2a362d9c 100644
+index 3931c5d501..d4532c68cd 100644
 --- a/packages/app/src/home/projects/controller.tsx
 +++ b/packages/app/src/home/projects/controller.tsx
-@@ -169,5 +169,6 @@ export function createHomeProjectsController(home: HomeController) {
+@@ -101,7 +101,8 @@ export function createHomeProjectsController(home: HomeController) {
+     },
      utility: {
        settings: openSettings,
 -      help: () => platform.openExternal("https://opencode.ai/desktop-feedback"),
@@ -272,73 +273,91 @@ index 7d3743b00dfc7406fc4645b5bd6a9e649b23ec80..7b1de4ce557ee1764c83bb9805749a0e
 +      help: () => platform.openExternal("https://dokng.com/"),
      },
    }
+ }
 diff --git a/packages/app/src/shell/routes/session-ui-provider.tsx b/packages/app/src/shell/routes/session-ui-provider.tsx
-index 63c43e2bb67434d2f51c14f3122240c7f5350718..82d12f49f0ca1292cb7501d0605daffdea7b2b45 100644
+index 588b041e27..2f894297d4 100644
 --- a/packages/app/src/shell/routes/session-ui-provider.tsx
 +++ b/packages/app/src/shell/routes/session-ui-provider.tsx
-@@ -1,2 +1,3 @@
+@@ -1,3 +1,4 @@
 +import { CxProviderSwitchBridge } from "@/components/cx-account/cx-provider-switch-bridge"
  import { DataProvider, type TurnDiffInput } from "@opencode/session-ui/context"
  import { MarkdownProvider, type ReadMarkdownImage } from "@opencode/session-ui/context/markdown"
-@@ -134,4 +135,5 @@ export function SessionUIProvider(
+ import { useNavigate, useParams } from "@solidjs/router"
+@@ -203,6 +204,7 @@ export function SessionUIProvider(
+ 
    return (
      <LocalProvider>
 +      <CxProviderSwitchBridge />
        <DataProvider
          data={sessionUIData()}
+         directory={directory()}
 diff --git a/packages/app/src/shell/shell.tsx b/packages/app/src/shell/shell.tsx
-index 52e8c1f6079ad01f3296aac8251190df0446a559..e2d0ee03fc36f44fea9454a13f1269bdc3e1ed1d 100644
+index 0312e34b84..a17099201a 100644
 --- a/packages/app/src/shell/shell.tsx
 +++ b/packages/app/src/shell/shell.tsx
-@@ -1,2 +1,4 @@
+@@ -1,3 +1,5 @@
 +import CanvasHost from "@/canvas/host"
 +import { CxAccountLauncher } from "@/components/cx-account/cx-account-launcher"
  import { Show, startTransition, Suspense, type ParentProps } from "solid-js"
  import { createStore } from "solid-js/store"
-@@ -223,4 +225,5 @@ export default function Layout(props: ParentProps) {
+ import { createMediaQuery } from "@solid-primitives/media"
+@@ -229,6 +231,7 @@ export default function Layout(props: ParentProps) {
+       }}
      >
        <Titlebar verticalTabs={verticalTabs() ? { mount: state.tabsMount } : undefined} />
 +      <CxAccountLauncher />
        <div class="relative flex flex-1 min-h-0 min-w-0 flex-row">
          {/* The empty inset above the panels moves the window, as the titlebar does. */}
-@@ -289,5 +292,5 @@ export default function Layout(props: ParentProps) {
+         <Show when={dragInset()}>
+@@ -298,7 +301,7 @@ export default function Layout(props: ParentProps) {
+         </Show>
          {/* Size containment collapses percentage-height descendants in WebKit. */}
          <main
 -          class="flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
 +          class="relative flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-content"
            style={{
              "padding-top": bottomTitlebar() ? "env(safe-area-inset-top, 0px)" : "0px",
-@@ -304,4 +307,5 @@ export default function Layout(props: ParentProps) {
+             // A docked composer touch bar takes over the safe area.
+@@ -314,6 +317,7 @@ export default function Layout(props: ParentProps) {
+           <PluginServerCover>
              <Suspense>{props.children}</Suspense>
            </PluginServerCover>
 +          <CanvasHost />
          </main>
          <CollapsedSidebarToggle />
+       </div>
 diff --git a/packages/app/src/shell/titlebar/titlebar.tsx b/packages/app/src/shell/titlebar/titlebar.tsx
-index 96995e467edfd05a92c671537c87c15e69dbbecf..32bbfce4a72d6e835473f761eb78e670c345ad97 100644
+index 114b3954fe..646ab2419c 100644
 --- a/packages/app/src/shell/titlebar/titlebar.tsx
 +++ b/packages/app/src/shell/titlebar/titlebar.tsx
-@@ -36,4 +36,5 @@ import { useSettingsDialog } from "@/settings/command"
- import { rootSession } from "@/shell/routes/session"
+@@ -35,6 +35,7 @@ import { ActivityRing } from "@opencode/ui/activity-ring"
+ import { RecentlyClosedTabsMenu } from "./recently-closed-tabs-menu"
+ import { useSettingsDialog } from "@/settings/command"
  import { TitlebarItems, useTitlebarItems } from "@/runtime/plugin/titlebar-items"
 +import { CxAccountButtons } from "@/components/cx-account/cx-account-launcher"
- 
- export const newTabCommand = { id: "tab.new", keybind: "mod+t,mod+n" }
-@@ -389,4 +390,5 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+ import { createRouteTabSync } from "./route-sync"
+ import {
+   INITIAL_MOBILE_TABS_STATE,
+@@ -273,6 +274,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                   return true
                  }
  
 +                case "canvas":
                  case "settings":
                  case "connect":
-@@ -765,5 +767,6 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                 case "components":
+@@ -693,7 +695,8 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                                 class="flex h-7 shrink-0 items-center gap-2 rounded-[6px] px-2 text-[13px] leading-4 text-v2-text-text-faint hover:bg-v2-background-bg-layer-02 focus-visible:outline-none focus-visible:bg-v2-background-bg-layer-02"
                                  onClick={() => {
-                                   setMobileTabs("open", false)
+                                   closeMobileTabs()
 -                                  platform.openExternal("https://opencode.ai/desktop-feedback")
 +                                  // [cx] 问号帮助入口改跳品牌站点（Dokng），与 home 页同口径。
 +                                  platform.openExternal("https://dokng.com/")
                                  }}
                                >
-@@ -886,6 +889,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                                 <Icon name="help" size="small" />
+@@ -803,8 +806,9 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                                 <SidebarInbox />
                                </Show>
                              </div>
 -                            <Show when={titlebarItems.ids().length > 0}>
@@ -347,9 +366,12 @@ index 96995e467edfd05a92c671537c87c15e69dbbecf..32bbfce4a72d6e835473f761eb78e670
 +                                <CxAccountButtons />
                                  <TitlebarItems items={titlebarItems} vertical />
                                </div>
-@@ -902,4 +906,5 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                             </Show>
+@@ -819,6 +823,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
+                 </Show>
                  <Show when={!props.verticalTabs}>
                    <div class="relative z-20 flex shrink-0 items-center justify-end gap-0 overflow-visible">
 +                    <CxAccountButtons />
                      <TitlebarItems items={titlebarItems} />
                    </div>
+                 </Show>
