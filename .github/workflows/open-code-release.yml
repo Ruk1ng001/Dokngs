@@ -1006,15 +1006,43 @@ jobs:
       - name: 构建并嵌入画布
         run: bun scripts/build-canvas.ts
 
+      - name: 读取 Electron 官方校验表
+        working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export CX_ELECTRON_CHECKSUMS="$RUNNER_TEMP/electron-checksums.json"
+          node ../../../scripts/prepare-electron-checksums.mjs
+          echo "CX_ELECTRON_CHECKSUMS=$CX_ELECTRON_CHECKSUMS" >> "$GITHUB_ENV"
+
       - name: 打包（electron-builder + brand 配置）
         working-directory: ${{ github.workspace }}/open-code/opencode/packages/desktop
         timeout-minutes: 60
         shell: bash
+        env:
+          DEBUG: "@electron/get*"
         run: |
+          set -euo pipefail
           # 用品牌覆盖配置出包。--publish never：只出产物，发布交给 release job。
           # 配置路径相对 desktop 目录回溯到仓库根的 brand/。
-          npx electron-builder ${{ matrix.platform_flag }} ${{ matrix.arch_flag }} --publish never \
-            --config ../../../brand/electron-builder.brand.ts
+          # 下载 Electron / 打包工具遇临时网络错误时重试；已下载内容保留在 builder 缓存中。
+          # 编译、配置、签名及校验和错误立即失败，不把真实失败当作网络波动。
+          for attempt in 1 2 3; do
+            log="$RUNNER_TEMP/electron-builder-$attempt.log"
+            if npx electron-builder ${{ matrix.platform_flag }} ${{ matrix.arch_flag }} --publish never \
+              --config ../../../brand/electron-builder.brand.ts 2>&1 | tee "$log"; then
+              break
+            else
+              status=$?
+            fi
+            if [ "$attempt" = 3 ] || ! grep -Eq 'Response code (408|429|500|502|503|504)|net::ERR_(CONNECTION_RESET|CONNECTION_TIMED_OUT|NAME_NOT_RESOLVED)|(^|[^A-Z])(ECONNRESET|ETIMEDOUT|EAI_AGAIN)([^A-Z]|$)' "$log"; then
+              exit "$status"
+            fi
+            echo "打包下载遇临时网络错误，$((attempt * 15))s 后进行第 $((attempt + 1)) 次尝试…" >&2
+            sleep "$((attempt * 15))"
+          done
 
       # [dokng] 产物交接改走 R2 暂存区，不再用 artifact。
       #

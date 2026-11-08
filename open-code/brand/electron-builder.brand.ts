@@ -1,4 +1,5 @@
 import path from "node:path"
+import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 import type { Configuration } from "electron-builder"
@@ -83,8 +84,16 @@ const brandedPublish = [
   } as const,
 ]
 
+// CI 从官方 release assets API 取得校验表，避开偶发 504 的浏览器下载地址。
+// 仍交给 @electron/get 校验 Electron ZIP；mirrorOptions 确保 builder 识别新配置形态。
+const electronChecksumsFile = process.env.CX_ELECTRON_CHECKSUMS
+const electronChecksums: Record<string, string> | undefined = electronChecksumsFile
+  ? JSON.parse(readFileSync(electronChecksumsFile, "utf8"))
+  : undefined
+
 const config: Configuration = {
   ...base,
+  ...(electronChecksums ? { electronDownload: { mirrorOptions: {}, checksums: electronChecksums } } : {}),
   appId: brandedAppId,
   productName: brandedProductName,
   publish: brandedPublish,
