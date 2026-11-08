@@ -35,6 +35,7 @@ name: cc-switch release
 #     - tag 留空（推荐）→ resolve job 用 next-version.sh 自动算下一个 vX.Y.Z-ccs.N，
 #       建 tag 并推送（下游 build/publish 用这个版本）；
 #     - tag 填已存在的版本 → 补发那一版（不新建 tag）。
+#     - build_only=true → 构建所选 ref，产物只进暂存区，不建 tag、不更新下载源。
 #
 # 需要的 Secret：
 #   TAURI_SIGNING_PRIVATE_KEY          minisign 私钥（两行原文 / base64 / 一行 base64 均可）
@@ -53,6 +54,10 @@ on:
       tag:
         description: "要出包的 tag（留空则自动算下一个 vX.Y.Z-ccs.N；填已存在的 tag 则补发那一版）"
         required: false
+      build_only:
+        description: "仅验证所选 ref 的三平台构建，产物留在暂存区；不建 tag、不更新下载源"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -91,6 +96,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "push" ]; then
@@ -107,11 +113,13 @@ jobs:
             version="$(scripts/next-version.sh)"
             [ -n "$version" ] || { echo "❌ next-version.sh 未算出版本号" >&2; exit 1; }
             echo "自动计算下一个版本：$version"
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "$version"
-            git push origin "$version"
-            echo "已建 tag 并推送：$version"
+            if [ "$BUILD_ONLY" != "true" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git tag "$version"
+              git push origin "$version"
+              echo "已建 tag 并推送：$version"
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           # app 内嵌版本 / latest.json 版本：把品牌预发布号 -ccs.N 转成纯数字 -N。
@@ -153,12 +161,12 @@ jobs:
       # [monorepo] submodules: false —— 绝不能用 recursive。本仓有三个 submodule
       # （cc-switch/upstream 77M、open-code/opencode 488M、open-code/infinite-canvas 6M），
       # recursive 会让本 job 白拉另一个产品的 494M。只按需初始化本产品这一个。
-      - name: Checkout（checkout 到出包 tag，不带 submodule）
+      - name: Checkout（发布 tag 或仅验证的提交，不带 submodule）
         uses: actions/checkout@v5
         with:
           submodules: false
           fetch-depth: 0
-          ref: ${{ needs.resolve.outputs.version }}
+          ref: ${{ inputs.build_only && github.sha || needs.resolve.outputs.version }}
 
       # 不加 --depth=1：下一步要 fetch --tags 后 checkout 到 BASE_TAG，浅克隆下
       # 该 tag 的对象可能不在本地，且 apply-patches.sh 需要完整工作树做 strict apply。
@@ -248,7 +256,7 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl wget file patchelf libssl-dev \
+            build-essential pkg-config curl wget file patchelf rpm libssl-dev \
             libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
             || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
@@ -326,7 +334,43 @@ jobs:
       - name: 构建 Tauri App（Linux x64）
         if: runner.os == 'Linux'
         working-directory: ${{ github.workspace }}/cc-switch/upstream
-        run: pnpm tauri build --bundles appimage,deb,rpm
+        run: pnpm tauri build --bundles appimage,deb
+
+      - name: 打包 RPM（拆分 Version / Release，保留应用内嵌版本）
+        if: runner.os == 'Linux'
+        working-directory: ${{ github.workspace }}/cc-switch/upstream
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.resolve.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          # Tauri 2.12 的 RPM 打包器拒绝 Version 含 '-'，但应用和 updater 必须继续用
+          # X.Y.Z-N。只对已编译二进制执行 bundle，将 RPM 元数据拆为 Version=X.Y.Z、
+          # Release=N；不重新编译，也不改 tauri.conf.json 或 AppImage/deb 的版本。
+          RPM_CONFIG="$RUNNER_TEMP/cc-switch-rpm-config.json"
+          python3 - "$RPM_CONFIG" <<'PY'
+          import json, os, re, sys
+          version = os.environ["APP_VERSION"]
+          match = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)", version)
+          if not match:
+              raise SystemExit(f"不支持的 RPM 应用版本：{version}，需要 X.Y.Z-N")
+          config = {
+              "version": match[1],
+              "bundle": {"linux": {"rpm": {"release": match[2]}}},
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump(config, f)
+              f.write("\n")
+          print(f"RPM Version={match[1]}, Release={match[2]}；应用版本={version}")
+          PY
+          pnpm tauri bundle --bundles rpm --config "$RPM_CONFIG"
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/rpm/*.rpm)
+          [ "${#packages[@]}" -eq 1 ] || { echo "应产出且仅产出一个 RPM" >&2; exit 1; }
+          actual=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "${packages[0]}")
+          [ "$actual" = "$APP_VERSION" ] || {
+            echo "RPM 版本不一致：$actual，预期 $APP_VERSION" >&2; exit 1;
+          }
 
       - name: 收集 macOS 产物
         if: runner.os == 'macOS'
@@ -517,6 +561,7 @@ jobs:
     name: 组装 latest.json + R2 上传
     runs-on: ubuntu-22.04
     needs: [resolve, build]
+    if: ${{ !inputs.build_only }}
     # [monorepo] 降到 read：本 job 不再建 GitHub Release，也不推 tag，只读仓库 + 写 R2。
     permissions:
       contents: read

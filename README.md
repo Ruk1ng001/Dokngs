@@ -86,11 +86,12 @@ OpenCode 四平台已构建成功、仅发布失败时，可补发同一批 R2 �
 
 ```bash
 gh workflow run cc-switch-upgrade.yml --ref <分支> -f validate_only=true
+gh workflow run cc-switch-release.yml --ref <分支> -f build_only=true
 gh workflow run open-code-release.yml --ref <分支> -f mode=release -f build_only=true
 ```
 
-前者验证当前 CC Switch 基线的品牌重放、前端类型和 Rust；后者检查 OpenCode 并构建四平台
-安装包，产物留在 R2 暂存区。两者均不推进 main、不创建 tag、不更新下载源。
+第一条验证当前 CC Switch 基线的品牌重放、前端类型和 Rust；后两条分别构建 CC Switch 三平台、
+OpenCode 四平台安装包，产物留在 R2 暂存区。三者均不推进 main、不创建 tag、不更新下载源。
 OpenCode 验证成功后，可从同一提交用上述 `reuse_run_id` 命令发布，无需重复构建。
 
 **monorepo 约定**：每个 job 都设 `defaults.run.working-directory: <product>`，
