@@ -43,6 +43,7 @@ packages/app/src/home/projects/controller.tsx
 packages/app/src/shell/routes/session-ui-provider.tsx
 packages/app/src/shell/shell.tsx
 packages/app/src/shell/titlebar/titlebar.tsx
+packages/gui-plugins/README.md
 packages/gui-plugins/src/dokng/i18n/en.ts
 packages/gui-plugins/src/dokng/i18n/zh.ts
 packages/gui-plugins/src/dokng/i18n/zht.ts

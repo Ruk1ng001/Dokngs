@@ -314,6 +314,26 @@ index 69af99c151..349293fc48 100644
                                  }}
                                >
                                  <Icon name="help" size="small" />
+diff --git a/packages/gui-plugins/README.md b/packages/gui-plugins/README.md
+index d3a685c55a..9915c8e7e6 100644
+--- a/packages/gui-plugins/README.md
++++ b/packages/gui-plugins/README.md
+@@ -753,6 +753,7 @@ export default setup
+ ```ts
+ /** Built-in plugins with their main entries, by id. Lists every built-in so their ids stay reserved. */
+ export const builtins = compose({
++  dokng,
+   context,
+   btw,
+   debug: { ...debug, mainEntry: () => import("./debug/main") },
+@@ -778,6 +779,7 @@ The window list adds each window entry, loaded with the app:
+ ```ts
+ /** Built-in plugins with their window entries, by id. The only place host builds name built-ins. */
+ export const builtins = compose({
++  dokng: { ...dokng, windowEntry: eager(dokngRenderer) },
+   context: { ...context, windowEntry: eager(contextRenderer) },
+   btw: { ...btw, windowEntry: eager(btwRenderer) },
+   debug: { ...debug, windowEntry: eager(debugRenderer) },
 diff --git a/packages/gui-plugins/src/dokng/i18n/en.ts b/packages/gui-plugins/src/dokng/i18n/en.ts
 new file mode 100644
 index 0000000000..5245bab37c
