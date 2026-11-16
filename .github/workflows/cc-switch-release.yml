@@ -63,7 +63,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: cc-switch-release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -570,6 +570,9 @@ jobs:
           retention-days: 1
 
   publish:
+    concurrency:
+      group: cc-switch-r2-publish
+      cancel-in-progress: false
     name: 组装 latest.json + R2 上传
     runs-on: ubuntu-22.04
     needs: [resolve, build]
@@ -589,11 +592,12 @@ jobs:
       # 只要仓库根的 scripts/（组装首页下载清单用），不需要 submodule / 全量历史。
       # 必须排在下载产物之前：actions/checkout 默认清理工作区，放在后面会把
       # release-assets/ 一起删掉。
-      - name: Checkout（仅需 scripts/，不带 submodule）
+      - name: Checkout（读取本次 workflow 的发布脚本，不带 submodule）
         uses: actions/checkout@v5
         with:
           submodules: false
-          ref: ${{ needs.resolve.outputs.version }}
+          # 构建产物来自所选 tag；发布守卫来自运行此 workflow 的提交，兼容旧 tag 补发。
+          ref: ${{ github.sha }}
 
       # [dokng] 从 R2 暂存区取回三平台产物（对应 build job 的直传）。
       # 目录形状必须与原 download-artifact + merge-multiple: true 完全一致：
@@ -774,6 +778,9 @@ jobs:
           # 版本子目录名 = 去 v 前缀的 tag（品牌发布号，形如 3.17.0-ccs.4），与组装 latest.json 时
           # url 里的前缀（REL_VERSION）一致；也与 R2 清理抽取的 -ccs.N token 一致。
           REL_VERSION="${TAG#v}"
+          # 在产品发布锁内读取 R2；旧 tag 补发不能回退当前更新源。
+          python3 ../scripts/check-release-version.py cc-switch "$TAG" \
+            --bucket "$R2_BUCKET" --endpoint "$endpoint"
 
           # [dokng] R2 布局（与 open-code 同构）：
           #   cc-switch/                       ← 产品根，updater 固定 URL 轮询

@@ -1,67 +1,27 @@
-# 06-tray-account-entry —— 托盘菜单加「我的账户」快捷入口（仅 Rust 侧）
+# 06-tray-account-entry —— 托盘账户扩展的三个锚点
 #
-# 职责：在系统托盘菜单顶部（「打开 CC Switch」之后、应用区分隔线之前）加「我的账户」项：
-#       菜单模型按 tray_language() 独立选择账户文案，加一条 TrayEntry::item；
-#       handle_tray_menu_event 加 "open_account" 分支——调上游 show_main_window(app)
-#       弹出主窗口后 emit("ccs-open-account") 通知前端。
+# 实现见 brand/overlay/src-tauri/src/tray/ccs_account.rs：菜单完成后追加账户入口，
+# 事件分派前拦截账户事件。不再把上游相邻菜单项、match 分支或语言表作为补丁上下文。
+# 账户入口位于主窗口操作区末尾；上游的「重启更新」仍紧跟「打开 CC Switch」。
+# show_main_window 的跨平台窗口恢复逻辑继续复用上游实现。
 #
-# 账户文案不扩展上游 TrayTexts：上游新增语言时不会再因遗漏 account 字段而编译失败；
-#   未列出的语言回退英文。语言来源与上游托盘面板相同（用户设置 / 系统区域）。
-#
-# 为什么分支体只有两行：上游 v4.0.0 把各平台弹窗逻辑（Windows set_skip_taskbar、
-#   Linux nudge_main_window、macOS apply_tray_policy、轻量模式重建窗口）抽成了
-#   pub fn show_main_window，"show_main" 自己也只是调它。本补丁早期版本复制过那一整段，
-#   现改为直接调用——平台逻辑后续怎么变都不必跟着改，漂移面收敛到一行。
-#
-# 位置为什么不紧贴「打开官方网站」：v4.0.0 的菜单改由 TrayEntry 模型声明式构建，官网项
-#   被挪到菜单底部（轻量模式之后）。「我的账户」和「打开 CC Switch」同类——都是弹窗口的
-#   入口，只是多切一屏，故跟在它后面；放在应用区之前也不随应用增减上下浮动。
-#
-# 前端侧的事件监听不在本补丁：已收敛进 overlay 组件
-#   brand/overlay/src/components/account/CcsAccountMount.tsx（监听 "ccs-open-account"
-#   打开账户面板），由补丁 04 的挂载点接入 App.tsx。
-#
-# 覆盖文件：src-tauri/src/tray.rs（与其它补丁不共享文件）。
-# 依赖：04（挂载点 + CcsAccountMount 已接入，事件才有人消费；反向无编译依赖）。
-# 应用（在 upstream/ 内，基线为 brand/BASE_SHA）：
-#   git -C upstream apply brand/patches/06-tray-account-entry.patch
+# 依赖 04：前端 CcsAccountMount 消费 ccs-open-account 事件。
 diff --git a/src-tauri/src/tray.rs b/src-tauri/src/tray.rs
-index ca94091f..1283c554 100644
+index 350484b549355589277922a198d1b261fbea03f8..0ec3d3dba9e66a4eecf20584310070dc378596fe 100644
 --- a/src-tauri/src/tray.rs
 +++ b/src-tauri/src/tray.rs
-@@ -1983,6 +1983,20 @@ fn build_menu_model(
+@@ -29,2 +29,4 @@ use crate::services::usage_cache::UsageCache;
+ use crate::store::AppState;
++// [ccs] 账户扩展由品牌 overlay 提供。
++mod ccs_account;
  
-     // 窗口找不回来时托盘是唯一入口，「打开 CC Switch」一直放在最上面。
-     menu.push(TrayEntry::item("show_main", texts.show_main));
-+    // [ccs] 我的账户：紧跟「打开 CC Switch」——同样是弹窗口的入口，只是多切一屏（余额/
-+    // 用量/一键铺开）。放在应用区之前，不随应用增减浮动。
-+    // 文案独立于上游 TrayTexts，新增语言自动回退英文。
-+    let account_text = match tray_language().as_str() {
-+        "zh" => "我的账户",
-+        "zh-TW" => "我的帳戶",
-+        "ja" => "マイアカウント",
-+        "ko" => "내 계정",
-+        "de" => "Mein Konto",
-+        "ru" => "Моя учётная запись",
-+        "tr" => "Hesabım",
-+        _ => "My Account",
-+    };
-+    menu.push(TrayEntry::item("open_account", account_text));
-     menu.push(TrayEntry::Separator);
- 
-     if !apps.is_empty() {
-@@ -3136,6 +3150,14 @@ pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
- 
-     match event_id {
-         "show_main" => show_main_window(app),
-+        // [ccs] 我的账户：先复用 show_main 的窗口显示逻辑弹出主窗口，再发事件让前端打开账户面板。
-+        "open_account" => {
-+            show_main_window(app);
-+            // 窗口就绪后通知前端切到账户面板。前端挂载点见 components/account/CcsAccountMount.tsx。
-+            if let Err(e) = app.emit("ccs-open-account", ()) {
-+                log::error!("发送打开账户面板事件失败: {e}");
-+            }
-+        }
-         "open_website" => {
-             if let Err(e) = app.opener().open_url("https://ccswitch.io", None::<String>) {
-                 log::error!("打开官方网站失败: {e}");
+@@ -2185,2 +2187,3 @@ fn build_menu_model(
+     ));
++    ccs_account::extend_menu(&mut menu, &tray_language());
+     menu
+@@ -3319,2 +3322,5 @@ pub fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
+ pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
++    if ccs_account::handle_event(app, event_id) {
++        return;
++    }
+     log::info!("处理托盘菜单事件: {event_id}");

@@ -123,6 +123,13 @@ jobs:
             echo "need=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: 确认升级发布使用 PAT（确保 tag 触发出包）
+        if: steps.detect.outputs.need == 'true' && !inputs.validate_only
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          [ -n "$RELEASE_PAT" ] || { echo "::error::RELEASE_PAT 未配置；拒绝推进基线，GITHUB_TOKEN 推 tag 不会触发出包"; exit 1; }
+
       - name: 安装 pnpm
         if: steps.detect.outputs.need == 'true'
         uses: pnpm/action-setup@v5
@@ -318,7 +325,15 @@ jobs:
           mkdir -p upstream/dist
           cargo check --locked --manifest-path upstream/src-tauri/Cargo.toml
 
-      - name: 校验通过 → 更新基线、提交并推送 main
+      - name: 验证账户托盘和上游更新入口顺序
+        if: steps.detect.outputs.need == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib --manifest-path upstream/src-tauri/Cargo.toml tray::ccs_account::tests
+          cargo test --locked --lib --manifest-path upstream/src-tauri/Cargo.toml downloaded_update_adds_install_item_right_below_open_main
+
+      - name: 校验通过 → 原子推送基线和发布 tag
         if: steps.detect.outputs.need == 'true' && !inputs.validate_only
         env:
           LATEST: ${{ steps.detect.outputs.latest }}
@@ -340,45 +355,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore(cc-switch): 自动升级基线到 ${LATEST}（每日自动）"
 
-          # 推 main（保存基线推进）。
-          # 加 pull --rebase + 重试：定时任务与手动触发 / 维护者推送可能并发，
-          # 裸 push 遇 non-fast-forward 会被拒。重试 3 次，每次先 rebase 再推；
-          # 基线文件冲突极少（只有并发升级才可能），冲突时放弃自动 rebase，让 job 失败
-          # 等人工介入（不强推、不覆盖他人提交）。
-          pushed=false
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
-              pushed=true
-              break
-            fi
-            echo "push main 第 $attempt 次失败（可能 non-fast-forward），rebase 后重试…" >&2
-            git fetch origin main --quiet || true
-            git rebase origin/main || { git rebase --abort || true; break; }
-          done
-          [ "$pushed" = true ] || { echo "push main 连续 3 次失败，放弃（无污染，可重跑）。" >&2; exit 1; }
-          echo "已推送 main。"
-
-          # 计算下一个 ccs 版本 tag（vX.Y.Z-ccs.N，基于新基线 BASE_TAG），打 tag 并推送
-          # （release workflow 触发器为 push tags v*-ccs.*，推此 tag 即触发自动出包）。
-          # push tag 加 3 次重试：main 已推进而 tag 未推出会让「基线已升级但没出包」，
-          # 且次日 cron 因已最新 no-op、永远不补——必须在本次 job 内尽力送达，
-          # 三次仍失败则响亮报错（维护者可手动补：git push origin <tag>）。
-          git fetch --tags --quiet origin || true
-          NEWTAG="$(scripts/next-version.sh)"
-          echo "新 ccs 版本 tag：$NEWTAG"
-          git tag "$NEWTAG"
-          tag_pushed=false
-          for attempt in 1 2 3; do
-            if git push origin "$NEWTAG"; then
-              tag_pushed=true
-              break
-            fi
-            echo "push tag $NEWTAG 第 $attempt 次失败，$((attempt * 5))s 后重试…" >&2
-            sleep $((attempt * 5))
-          done
-          if [ "$tag_pushed" != true ]; then
-            echo "❌ push tag $NEWTAG 连续 3 次失败：main 已升级但未触发出包。" >&2
-            echo "   请手动补推：git push origin $NEWTAG（或 workflow_dispatch 触发 release）。" >&2
-            exit 1
-          fi
-          echo "已推送 tag $NEWTAG。"
+          # main 与发布 tag 同一事务落地；跨产品并发只允许重放无关产品的提交。
+          python3 ../scripts/push-upgrade.py cc-switch

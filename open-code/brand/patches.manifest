@@ -33,7 +33,8 @@ packages/desktop/src/main/constants.ts
 packages/desktop/src/main/lifecycle/environment.ts
 packages/desktop/src/main/lifecycle/index.ts
 
-# 账户/画布的 Shell、标题栏接线与 provider 切换。09 提供面板，17 提供画布宿主。
+# 账户/画布的 Shell 接线与 provider 切换；标题栏按钮走官方 TitlebarItem 插件。
+# titlebar.tsx 仅保留画布路由识别和帮助地址，09 提供面板，17 提供画布宿主。
 [07-provider-switch-bridge]
 packages/app/src/components/cx-account/cx-account-launcher.tsx
 packages/app/src/components/cx-account/cx-deep-links.ts
@@ -42,6 +43,13 @@ packages/app/src/home/projects/controller.tsx
 packages/app/src/shell/routes/session-ui-provider.tsx
 packages/app/src/shell/shell.tsx
 packages/app/src/shell/titlebar/titlebar.tsx
+packages/gui-plugins/src/dokng/i18n/en.ts
+packages/gui-plugins/src/dokng/i18n/zh.ts
+packages/gui-plugins/src/dokng/i18n/zht.ts
+packages/gui-plugins/src/dokng/index.ts
+packages/gui-plugins/src/dokng/renderer.ts
+packages/gui-plugins/src/main.ts
+packages/gui-plugins/src/renderer.ts
 
 # gui-plugins 更新器：允许品牌版本后缀，安装失败时提供下载入口。
 [08-self-update-prerelease]

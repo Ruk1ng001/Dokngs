@@ -88,7 +88,7 @@ on:
 # 按事件动态选 concurrency，完整保留原三个 workflow 的隔离语义：
 #   - opencode 升级 → group=open-code-auto-upgrade（cancel-in-progress=false，不打断进行中的升级）
 #   - 画布升级    → group=open-code-auto-upgrade-canvas（与上一组独立，两种升级不互斥）
-#   - 发布        → group=open-code-release-<ref>（同一 ref 只跑一个发布流水线，新推送取消旧的）
+#   - 发布        → group=open-code-release-<ref>（同一 ref 排队，最终 R2 发布另按产品串行）
 # && / || 短路实现三分支「三元」：cond 为真取字符串（真值短路），否则落到下一个分支。
 # [monorepo] group 全部带 open-code- 前缀：同仓的 cc-switch 流水线有自己的同名概念
 # （auto-upgrade / release-<ref>），不加前缀会让两个产品的升级/发布互相排队甚至取消。
@@ -99,8 +99,8 @@ concurrency:
       || ((github.event_name == 'schedule' && github.event.schedule == '47 17 * * *') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'upgrade-canvas')) && 'open-code-auto-upgrade-canvas'
       || format('open-code-release-{0}', github.ref)
     }}
-  # 仅发布链路取消进行中的旧 run（升级链路 cancel-in-progress=false，绝不打断进行中的基线推进）。
-  cancel-in-progress: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release') }}
+  # 已进入 R2 发布阶段的运行不能被新触发中断。
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -177,6 +177,13 @@ jobs:
             echo "已是最新（或当前基线更新），无需升级。"
             echo "need=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: 确认升级发布使用 PAT（确保 tag 触发出包）
+        if: steps.detect.outputs.need == 'true'
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          [ -n "$RELEASE_PAT" ] || { echo "::error::RELEASE_PAT 未配置；拒绝推进基线，GITHUB_TOKEN 推 tag 不会触发出包"; exit 1; }
 
       - name: 切到新 tag 并按 NN 序重放补丁（strict apply）
         id: replay
@@ -343,36 +350,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore(opencode): 自动升级基线到 ${LATEST}（每日自动）"
 
-          # 推 main（保存基线推进）。GITHUB_TOKEN 推送不会触发其它 workflow，
-          # 故用 PAT checkout 后的凭据推送；真正触发出包的是下方推送的 dokng tag。
-          # 加 pull --rebase + 重试：定时任务与手动触发 / 维护者推送可能并发，
-          # 裸 push 遇 non-fast-forward 会被拒。重试 3 次，每次先 rebase 再推。
-          pushed=false
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
-              pushed=true
-              break
-            fi
-            echo "push main 第 $attempt 次失败（可能 non-fast-forward），rebase 后重试…" >&2
-            git fetch origin main --quiet || true
-            # rebase 到最新 origin/main；基线文件冲突极少（只有并发升级才可能），
-            # 冲突时放弃自动 rebase，让 job 失败等人工介入（不强推、不覆盖他人提交）。
-            git rebase origin/main || { git rebase --abort || true; break; }
-          done
-          [ "$pushed" = true ] || { echo "push main 连续 3 次失败，放弃（无污染，可重跑）。" >&2; exit 1; }
-          echo "已推送 main。"
-
-          # 计算下一个 dokng 版本 tag（vX.Y.Z-dokng.N，基于新基线 BASE_TAG），打 tag 并推送。
-          # 本 workflow 的 push:tags v* 触发器会据此起新 run 走发布段（复用现有版本号规则）。
-          git fetch --tags --quiet origin || true
-          # next-dokng-version.sh 的 stdout 只打「纯 tag 值」一行（KEY=VALUE 只进
-          # GITHUB_OUTPUT），故 $() 直接拿到干净 tag，无需再 sed 抽取。
-          NEWTAG="$(scripts/next-dokng-version.sh)"
-          [ -n "$NEWTAG" ] || { echo "计算 dokng tag 失败（输出为空）。" >&2; exit 1; }
-          echo "新 dokng 版本 tag：$NEWTAG"
-          git tag "$NEWTAG"
-          git push origin "$NEWTAG"
-          echo "已推送 tag ${NEWTAG}，本 workflow 的 push:tag 发布段将据此自动出包。"
+          # main 与发布 tag 同一事务落地；拒绝合入未经验证的本产品改动。
+          python3 ../scripts/push-upgrade.py open-code
 
   # ── upgrade-canvas：每日升级 infinite-canvas 上游基线（原 auto-upgrade-canvas.yml）──
   #
@@ -991,6 +970,8 @@ jobs:
           base="$(tr -d '[:space:]' < ../brand/BASE_SHA)"
           lint_dir="$RUNNER_TEMP/opencode-gui-lint"
           git worktree add --detach "$lint_dir" "$base"
+          # 品牌插件含新增文件；将它们纳入 diff，避免 lint:changed 漏检。
+          git add -N -- packages/gui-plugins
           git diff --binary "$base" -- packages/gui-plugins > "$RUNNER_TEMP/opencode-gui.patch"
           git -C "$lint_dir" apply "$RUNNER_TEMP/opencode-gui.patch"
           ln -s "$PWD/node_modules" "$lint_dir/node_modules"
@@ -1195,6 +1176,9 @@ jobs:
 
   # ── release：汇总产物，合并 latest*.yml，上传 R2 ────────────────
   release:
+    concurrency:
+      group: open-code-r2-publish
+      cancel-in-progress: false
     needs:
       - detect
       - package
@@ -1366,6 +1350,9 @@ jobs:
           # 版本子目录名：去掉 v 前缀的完整版本号，形如 1.17.15-dokng.3（与安装包文件名内的
           # 版本 token、finalize-latest-yml.ts 写进 yml 的 url 前缀一致）。
           VERSION="${OPENCODE_VERSION#v}"
+          # 在产品发布锁内读取 R2；旧 tag 补发不能回退当前更新源。
+          python3 ../scripts/check-release-version.py open-code "$OPENCODE_VERSION" \
+            --bucket "$R2_BUCKET" --endpoint "$endpoint"
 
           # [dokng] R2 布局（与 cc-switch 同构）：
           #   open-code/                       ← 产品根，updater 固定 URL 轮询

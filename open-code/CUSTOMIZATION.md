@@ -159,7 +159,7 @@ release。凡是必须改动 submodule 内源码的定制，都导出为 `brand/
 | `04-channel-keys-store` | 主进程多 key 数据层（electron-store `channelKeys`） |
 | `05-channel-keys-ipc` | 渠道 RPC/handler，以及渠道和画布的统一 IPC 注册 |
 | `06-deeplink-cx` | 运行时品牌名 / appId + `dokng://` 深链协议注册 |
-| `07-provider-switch-bridge` | provider 切换桥、账户/画布 Shell 和标题栏接线 |
+| `07-provider-switch-bridge` | provider 切换桥、账户/画布 Shell 接线；按钮通过官方 `TitlebarItem` 插件注册 |
 | `08-self-update-prerelease` | `gui-plugins` 更新器的品牌版本与安装失败指引 |
 | `09-cx-account-app` | 账户面板、画布模型槽位、样式与桌面 RPC 桥 |
 | `10-default-locale-zh` | 首启默认中文 locale |
@@ -173,6 +173,10 @@ release。凡是必须改动 submodule 内源码的定制，都导出为 `brand/
 
 画布构建由本仓 `scripts/build-canvas.ts` 在 desktop 构建完成后执行并复制到
 `out/renderer/canvas/`。不再修改上游 prebuild，也不再使用 Vite 的复制 hook；缺少画布产物会中止打包。
+
+账户和画布按钮由 `gui-plugins/src/dokng/` 注册到上游 `TitlebarItem`，横向标题栏和纵向标签栏
+共用上游渲染与可访问性行为，不再补写两套标题栏 JSX。按钮事件仍由 Shell 的
+`CxAccountLauncher` 打开原有账户面板或画布路由，深链和首次启动引导保持原路径。
 
 画布侧同理：`brand/canvas-patches/` + `brand/canvas-patches.manifest`（01 宿主注入 /
 02 嵌入态 UI 与图片代理 / 03 提示词预览渲染 / 04 media 子域改写 / 05 文件桥），应用于
@@ -213,6 +217,11 @@ scripts/rebase-patches.sh continue          # ② 从断点继续
 scripts/rebase-patches.sh finish            # ③ 重导出漂移补丁 + 刷新 BASE + --check
 # 画布补丁栈同理：scripts/rebase-patches.sh --target canvas plan v0.9.1 …
 ```
+
+`finish` 验证失败时保留 worktree 和检查点。可在该 worktree 修正有唯一补丁归属的文件后
+再次 `finish`，修正会并回对应补丁。多个补丁共用的文件需要在其对应检查点中修正，脚本会
+拒绝自动归属，避免把后序改动混进前序补丁；有未提交冲突断点时必须先 `continue`。
+恢复流程可用 `python3 scripts/test-rebase-patches.py -v` 在临时 Git 仓库中验证。
 
 > 上游文件的每处改动建议加 `[cx] US-XXX` 注释，便于升级时快速定位并合并。
 

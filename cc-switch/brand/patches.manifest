@@ -30,7 +30,7 @@ file = src/icons/extracted/index.ts
 file = src/icons/extracted/metadata.ts
 
 [06-tray-account-entry]
-# 托盘「我的账户」入口（仅 Rust 侧）；emit 的 "ccs-open-account" 由 04 挂载的
-# CcsAccountMount 消费，故声明依赖 04。
+# 托盘只保留账户 overlay 模块声明、菜单完成与事件分派三个调用锚点。
+# overlay 的 "ccs-open-account" 由 04 挂载的 CcsAccountMount 消费。
 depends = 04-account-ui-anchors
 file = src-tauri/src/tray.rs

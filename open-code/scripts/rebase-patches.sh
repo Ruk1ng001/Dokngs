@@ -382,6 +382,7 @@ cmd_continue() {
 cmd_finish() {
   [ -d "$STATE_DIR" ] || die "没有进行中的 rebase（先跑 plan）。"
   worktree_exists || die "找不到 rebase worktree（可能已被清理，重跑 plan）。"
+  [ ! -f "$STATE_CONFLICT" ] || die "仍有待提交的冲突断点，请先运行 continue，不能直接 finish。"
 
   local target_tag target_sha wt="$WORKTREE_ABS"
   target_tag="$(cat "$STATE_TARGET" 2>/dev/null || true)"
@@ -393,7 +394,32 @@ cmd_finish() {
   nrej="$(cd "$wt" && find . -name '*.rej' 2>/dev/null | wc -l | tr -d '[:space:]')"
   [ "$nrej" = "0" ] || die "worktree 仍有 $nrej 个 .rej 未解，解完再 finish。"
 
-  # 把最终工作区（含手工解冲突结果）提交为终态检查点——供漂移补丁按区间导出。
+  # 所有补丁都必须有已提交的检查点。仅删除 .rej 不代表后续补丁已重放。
+  local expected_checkpoints actual_checkpoints last_checkpoint replay_tip
+  expected_checkpoints="$(list_patches | while IFS= read -r p; do basename "$p" .patch; done)"
+  actual_checkpoints="$(cut -f1 "$STATE_CKPT")"
+  [ "$expected_checkpoints" = "$actual_checkpoints" ] || die "补丁检查点不完整，请先 continue 完成重放。"
+  last_checkpoint="$(tail -n 1 "$STATE_CKPT" | cut -f2)"
+  replay_tip="$(git -C "$wt" rev-list --reverse --ancestry-path "${last_checkpoint}..HEAD" | sed -n 1p)"
+  [ -n "$replay_tip" ] || die "最后一个补丁尚未提交，请先 continue。"
+
+  # finish 失败后允许直接修正终态再重试；这些修改不能被 pre-N → post-N 导出丢掉。
+  # 只把文件归属唯一的修正并回其补丁。画布仍有共享文件，归属不明确时保留现场并拒绝导出。
+  local corrected_files corrected_file owners owner
+  corrected_files="$(
+    { git -C "$wt" diff --name-only "$replay_tip"; git -C "$wt" ls-files --others --exclude-standard; } | LC_ALL=C sort -u
+  )"
+  while IFS= read -r corrected_file; do
+    [ -n "$corrected_file" ] || continue
+    owners="$(awk -v file="$corrected_file" '/^\[/ {section=substr($0, 2, length($0)-2)} $0==file {print section}' "$MANIFEST_FILE")"
+    if [ -z "$owners" ] || [ "$(printf '%s\n' "$owners" | wc -l | tr -d '[:space:]')" != "1" ]; then
+      die "终态修正 ${corrected_file} 没有唯一补丁归属；请在对应检查点中修正（未改动补丁或基线，worktree 已保留）。"
+    fi
+    owner="$owners"
+    printf '%s\n' "$owner" >> "$STATE_DRIFT"
+  done < <(printf '%s\n' "$corrected_files")
+
+  # 把终态修正提交，导出时仅将这些文件取到 HEAD；其余文件仍使用各自 post-N，避免混入后序补丁。
   git -C "$wt" add -A >/dev/null 2>&1
   if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
     git -C "$wt" commit -q -m "final: all patches (with manual conflict resolution)" --allow-empty
@@ -485,7 +511,13 @@ cmd_finish() {
       tmp="$(mktemp "${TMPDIR:-/tmp}/rebase-export.XXXXXX")"
       {
         [ -n "$header" ] && printf '%s\n' "$header"
-        git -C "$wt" diff --binary "$ckpt" "$post" -- "${files[@]}"
+        for f in "${files[@]}"; do
+          if printf '%s\n' "$corrected_files" | grep -Fxq -- "$f"; then
+            git -C "$wt" diff --binary "$ckpt" HEAD -- "$f"
+          else
+            git -C "$wt" diff --binary "$ckpt" "$post" -- "$f"
+          fi
+        done
       } > "$tmp"
 
       # 结构校验：拼头后仍须是合法 unified diff（注释头是 git apply 容忍的前导文本）。
@@ -523,7 +555,7 @@ cmd_finish() {
   mkdir -p "$backup"
 
   # 备份：受控补丁目录、两个基线文件、submodule 原 HEAD。
-  cp -a "$PATCHES_DIR" "$backup/patches" 2>/dev/null || true
+  cp -a "$PATCHES_DIR" "$backup/patches" || die "备份补丁失败，未安装导出结果。"
   [ -f "$BASE_TAG_FILE" ] && cp -a "$BASE_TAG_FILE" "$backup/BASE_TAG"
   [ -f "$BASE_SHA_FILE" ] && cp -a "$BASE_SHA_FILE" "$backup/BASE_SHA"
   local prev_head
@@ -601,6 +633,8 @@ cmd_status() {
     if [ "$nrej" != "0" ]; then
       warn "待解冲突 .rej（$nrej 个）："
       (cd "$WORKTREE_ABS" && find . -name '*.rej' 2>/dev/null | sed 's#^\./#         - #') >&2
+    elif [ -f "$STATE_CONFLICT" ]; then
+      log "无残留 .rej，但冲突断点尚未提交，请先运行 continue。"
     else
       log "无残留 .rej，可运行 finish。"
     fi
