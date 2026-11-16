@@ -69,6 +69,10 @@ OpenCode 三份平台清单版本一致；两个产品更新清单引用的 9 �
 - CC Switch 实际升级需要 `RELEASE_PAT`，防止退回不能触发发布的 `GITHUB_TOKEN` 后产生假成功。
 - OpenCode 直接重建既有 tag 时核对提交一致性，拒绝将当前源码伪装成旧 tag 覆盖原安装包。
   历史补发使用当前工作流的 `reuse_run_id`，并核验源构建提交与版本。
+- 云端验证还复现了 R2 的 `CompleteMultipartUpload / InvalidPart`：Windows 安装包已生成，
+  暂存上传的分片合并失败。增加最多三次的完整上传重试（10/20 秒退避），重新创建分片上传，
+  仅对分片失效、网络、限流和服务端瞬时错误重试；认证、参数与未知错误立即失败。
+  两产品共七处上传接入，原有 CRC32、缓存策略、发布顺序与 HEAD 校验保持有效。
 
 ### 补丁维护脚本
 
@@ -80,7 +84,14 @@ OpenCode 三份平台清单版本一致；两个产品更新清单引用的 9 �
 
 ## 验证与边界
 
-本地验证和云端验证结果在完成后补充于此。
+- 23 项发布/上传故障回归及 5 项补丁维护回归通过；四份原有 workflow 加新增回归 workflow
+  均通过 actionlint 语法检查。
+- [CC Switch 云端升级验证](https://github.com/Ruk1ng001/Dokngs/actions/runs/43791092877)：
+  TypeScript、Rust 检查通过，3 项账户测试和 1 项上游更新顺序测试全过。
+- [CC Switch 三平台验证](https://github.com/Ruk1ng001/Dokngs/actions/runs/43791095827)：
+  Windows x64、Linux x64、macOS universal 均构建和暂存上传成功。
+- OpenCode 全工作区 lint、类型检查、新增 GUI 插件专项检查通过；
+  [四平台验证](https://github.com/Ruk1ng001/Dokngs/actions/runs/43791632463)的最终结果待运行结束补充。
 
 升级仍可能因上游删除接口、重构 IPC、编译器变化或外部下载故障而中止，无法保证永不失败。
 此时应维持「验证失败不发布」的行为，不能自动放宽为三方合并或跳过编译。

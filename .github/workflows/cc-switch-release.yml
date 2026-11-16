@@ -550,7 +550,9 @@ jobs:
           if [ "$n" -eq 0 ]; then
             echo "::error::release-assets/ 为空，拒绝继续" >&2; exit 1
           fi
-          aws s3 cp release-assets/ "${stage}/pkg/${LABEL}/" \
+          # 构建 checkout 可能是历史 tag；上传工具始终取本次 workflow 的提交。
+          git show "${GITHUB_SHA}:scripts/r2-upload.py" > "$RUNNER_TEMP/r2-upload.py"
+          python3 "$RUNNER_TEMP/r2-upload.py" release-assets/ "${stage}/pkg/${LABEL}/" \
             --recursive --endpoint-url "$endpoint" --checksum-algorithm CRC32 --only-show-errors
 
       # 回退路径：未配置 R2 时仍走 artifact（与 publish job 的回退分支配对）。
@@ -795,7 +797,7 @@ jobs:
           # 缓存分级（关键）：产物/.sig 文件名带版本号且进版本子目录（URL 每版唯一）→ 长缓存
           # immutable，CDN 尽量命中；两个 json 是固定 URL、每版都要覆盖 → 必须禁缓存，否则
           # Cloudflare CDN 会把旧元数据缓存住，客户端拉不到新版本、自更新延迟数小时。
-          aws s3 cp release-assets/ "s3://${R2_BUCKET}/cc-switch/${REL_VERSION}/" \
+          python3 ../scripts/r2-upload.py release-assets/ "s3://${R2_BUCKET}/cc-switch/${REL_VERSION}/" \
             --recursive \
             --exclude "latest.json" \
             --exclude "latest-downloads.json" \
@@ -832,7 +834,7 @@ jobs:
 
           # 两份元数据都是固定 URL、每版覆盖 → 同样禁缓存。
           for j in latest.json latest-downloads.json; do
-            aws s3 cp "release-assets/$j" "s3://${R2_BUCKET}/cc-switch/$j" \
+            python3 ../scripts/r2-upload.py "release-assets/$j" "s3://${R2_BUCKET}/cc-switch/$j" \
               --endpoint-url "$endpoint" \
               --checksum-algorithm CRC32 \
               --content-type "application/json" \

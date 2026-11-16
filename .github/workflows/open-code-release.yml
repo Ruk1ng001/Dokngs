@@ -1129,7 +1129,8 @@ jobs:
           fi
           echo "安装包 ${n_pkg} 个 → ${stage}/pkg/${ARTIFACT_NAME}/"
           ls -la /tmp/stage-pkg
-          aws s3 cp /tmp/stage-pkg/ "${stage}/pkg/${ARTIFACT_NAME}/" \
+          # CompleteMultipartUpload 的 InvalidPart 需重新开始上传，SDK 请求重试不够。
+          python3 scripts/r2-upload.py /tmp/stage-pkg/ "${stage}/pkg/${ARTIFACT_NAME}/" \
             --recursive --endpoint-url "$endpoint" --checksum-algorithm CRC32 --only-show-errors
 
           # 元数据（latest*.yml + blockmap）：按 meta_subdir 分目录，对齐
@@ -1146,7 +1147,7 @@ jobs:
           fi
           echo "元数据 ${n_meta} 个 → ${stage}/meta/${META_SUBDIR}/"
           ls -la /tmp/stage-meta
-          aws s3 cp /tmp/stage-meta/ "${stage}/meta/${META_SUBDIR}/" \
+          python3 scripts/r2-upload.py /tmp/stage-meta/ "${stage}/meta/${META_SUBDIR}/" \
             --recursive --endpoint-url "$endpoint" --checksum-algorithm CRC32 --only-show-errors
 
       # 回退路径：未配置 R2 时仍用 artifact（retention-days: 1 压到最小，避免撑爆配额）。
@@ -1397,7 +1398,7 @@ jobs:
 
           # --checksum-algorithm CRC32：规避 R2 对 S3 默认分块校验（CRC64NVME）的兼容问题。
           # 安装包/blockmap 文件名带版本号（URL 每版唯一）→ 长缓存 immutable，CDN 尽量命中。
-          aws s3 cp /tmp/r2-pkg/ "s3://${R2_BUCKET}/open-code/${VERSION}/" \
+          python3 ../scripts/r2-upload.py /tmp/r2-pkg/ "s3://${R2_BUCKET}/open-code/${VERSION}/" \
             --recursive \
             --endpoint-url "$endpoint" \
             --checksum-algorithm CRC32 \
@@ -1431,7 +1432,7 @@ jobs:
           # 客户端拉不到新版本、自更新延迟数小时。逐个上传并显式 text/yaml + no-cache。
           for y in /tmp/r2-meta/*; do
             [ -f "$y" ] || continue
-            aws s3 cp "$y" "s3://${R2_BUCKET}/open-code/$(basename "$y")" \
+            python3 ../scripts/r2-upload.py "$y" "s3://${R2_BUCKET}/open-code/$(basename "$y")" \
               --endpoint-url "$endpoint" \
               --checksum-algorithm CRC32 \
               --content-type "text/yaml" \
