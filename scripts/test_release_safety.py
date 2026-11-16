@@ -181,6 +181,50 @@ class AtomicUpgradeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.run_git(self.remote, "tag", "--list"), "v1.2.4-ccs.1")
 
+    def exercise_lost_ack_and_failed_probe(self, advance_main=False):
+        self.prepare_upgrade()
+        validated = self.run_git(self.work, "rev-parse", "HEAD")
+        real_git = upgrade.git
+        pushes = []
+        probes = []
+        concurrent = []
+
+        def network_failure(*args, **kwargs):
+            if args[0] == "ls-remote":
+                probes.append(args)
+                if len(probes) == 1:
+                    raise subprocess.CalledProcessError(1, ["git", *args], stderr="network unavailable")
+            result = real_git(*args, **kwargs)
+            if args[:2] == ("push", "--atomic"):
+                pushes.append(args)
+                self.assertEqual(result.returncode, 0)
+                if advance_main:
+                    concurrent.append(self.advance_remote("open-code/brand/after-publish.json"))
+                return subprocess.CompletedProcess(result.args, 1, result.stdout, "lost acknowledgement")
+            return result
+
+        original = Path.cwd()
+        try:
+            os.chdir(self.work)
+            with patch.object(upgrade, "git", network_failure):
+                tag = upgrade.push_upgrade("cc-switch", delay=0)
+        finally:
+            os.chdir(original)
+        self.assertEqual(tag, "v1.2.4-ccs.1")
+        self.assertEqual(len(pushes), 1, "an unknown transaction must not trigger another release")
+        self.assertEqual(len(probes), 2)
+        self.assertEqual(self.run_git(self.remote, "tag", "--list"), tag)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", f"refs/tags/{tag}"), validated)
+        expected_main = concurrent[0] if concurrent else validated
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), expected_main)
+        self.run_git(self.remote, "merge-base", "--is-ancestor", validated, "main")
+
+    def test_lost_ack_and_failed_probe_recover_same_publication(self):
+        self.exercise_lost_ack_and_failed_probe()
+
+    def test_lost_ack_and_failed_probe_recover_after_another_product_advances_main(self):
+        self.exercise_lost_ack_and_failed_probe(advance_main=True)
+
 
 class VersionGuardTests(unittest.TestCase):
     def test_numeric_version_order_and_same_version_retry(self):

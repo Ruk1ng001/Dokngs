@@ -618,11 +618,22 @@ jobs:
         env:
           # 覆盖版本（workflow_dispatch 手填）优先；否则脚本按 BASE_TAG + 已有 tag 计算。
           FORCE_VERSION: ${{ inputs.force_version }}
+          SOURCE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: |
+          set -euo pipefail
           BASE_TAG="$(tr -d '[:space:]' < brand/BASE_TAG)"
           echo "基线 opencode tag：$BASE_TAG"
 
           if [ -n "$FORCE_VERSION" ]; then
+            [[ "$FORCE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dokng\.[0-9]+$ ]] || { echo "::error::force_version 必须为 vX.Y.Z-dokng.N"; exit 1; }
+            # 构建内容必须与已有 tag 相符；补发暂存产物另由后续来源检查验证。
+            if [ -z "$SOURCE_RUN_ID" ]; then
+              tagged_sha="$(git rev-parse --verify "refs/tags/${FORCE_VERSION}^{commit}" 2>/dev/null || true)"
+              if [ -n "$tagged_sha" ] && [ "$tagged_sha" != "$(git rev-parse HEAD)" ]; then
+                echo "::error::指定 tag 与当前构建提交不同；用 reuse_run_id 补发该 tag 的已验证产物，或不指定 force_version 发布新版本。"
+                exit 1
+              fi
+            fi
             echo "使用强制指定版本：$FORCE_VERSION"
             echo "version=$FORCE_VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=$FORCE_VERSION" >> "$GITHUB_OUTPUT"

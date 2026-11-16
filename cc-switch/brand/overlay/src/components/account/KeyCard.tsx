@@ -11,7 +11,6 @@
 
 import { RefreshCw, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -81,8 +80,8 @@ export function KeyCard({
     : 0;
 
   return (
-    <Card>
-      <CardContent className="p-4 space-y-3">
+    <div className="rounded-lg border bg-surface text-card-foreground shadow-sm">
+      <div className="p-4 space-y-3">
         {/* 头部：图标 + 名称 + 打码 key + 徽标 + 刷新 */}
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
@@ -230,8 +229,8 @@ export function KeyCard({
             </Button>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }
 

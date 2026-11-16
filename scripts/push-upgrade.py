@@ -53,9 +53,9 @@ def fetch_main():
 def published(tag, commit):
     # A lost push response is not a failed transaction. Query both references
     # before retrying so we do not create a second release for the same commit.
-    result = git("ls-remote", "--refs", "origin", "refs/heads/main", f"refs/tags/{tag}", check=False)
-    if result.returncode:
-        return False
+    # A failed probe leaves the transaction unknown, not rejected. Let the
+    # caller retry this same candidate before selecting another version.
+    result = git("ls-remote", "--refs", "origin", "refs/heads/main", f"refs/tags/{tag}")
     refs = {line.split()[1]: line.split()[0] for line in result.stdout.splitlines()}
     if refs.get(f"refs/tags/{tag}") != commit:
         return False
@@ -71,11 +71,23 @@ def push_upgrade(product, attempts=3, delay=5):
     if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
         raise RuntimeError("Upgrade commit must have a clean tracked worktree")
     validated_base = git("rev-parse", "HEAD^").stdout.strip()
+    pending = None
     for attempt in range(1, attempts + 1):
         tag = None
         commit = None
         completed = False
         try:
+            if pending is not None:
+                tag, commit = pending
+                if published(tag, commit):
+                    completed = True
+                    print(f"Published main and {tag} atomically ({commit})")
+                    return tag
+                # The remote answered and did not contain this transaction.
+                # It is now safe to revalidate main and choose a fresh tag.
+                pending = None
+                tag = None
+                commit = None
             fetch_main()
             git("fetch", "--quiet", "--tags", "origin")
             remote = git("rev-parse", "origin/main").stdout.strip()
@@ -93,11 +105,13 @@ def push_upgrade(product, attempts=3, delay=5):
             tag = next_tag(product)
             commit = git("rev-parse", "HEAD").stdout.strip()
             git("tag", tag, commit)
+            pending = (tag, commit)
             result = git("push", "--atomic", "origin", "HEAD:refs/heads/main", f"refs/tags/{tag}:refs/tags/{tag}", check=False)
             if result.returncode == 0 or published(tag, commit):
                 completed = True
                 print(f"Published main and {tag} atomically ({commit})")
                 return tag
+            pending = None
             print(f"Atomic push attempt {attempt}/{attempts} rejected; main and tag were not partially published", file=sys.stderr)
         except subprocess.CalledProcessError as error:
             print(f"Git {error.cmd[1]} failed on attempt {attempt}/{attempts}", file=sys.stderr)
@@ -110,6 +124,8 @@ def push_upgrade(product, attempts=3, delay=5):
                     git("tag", "--delete", tag)
         if attempt < attempts:
             time.sleep(delay * attempt)
+    if pending is not None:
+        raise RuntimeError(f"Could not confirm atomic publication of {pending[0]}; check remote main and tag before retrying")
     raise RuntimeError("Atomic publication failed; rerun the upgrade after resolving the push failure")
 
 
