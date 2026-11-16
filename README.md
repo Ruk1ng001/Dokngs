@@ -79,6 +79,7 @@ CC Switch / OpenCode 自动升级通过 `scripts/push-upgrade.py` 原子推送 m
 
 | 文件 | 触发 | 干什么 |
 |------|------|--------|
+| `brand-checks.yml` | 脚本 / workflow 变更、PR / 手动 | 临时 Git 仓库回归测试，不初始化产品 submodule、不发布 |
 | `cc-switch-release.yml` | push tag `v*-ccs.*` / 手动 | 三平台出包 → 上传 R2 |
 | `cc-switch-upgrade.yml` | 每日 16:37 UTC / 手动 | 升级 cc-switch 基线，推 main + 打 tag |
 | `open-code-release.yml` | push tag `v*-dokng.*` / 每日 16:23、17:47 UTC / 手动 | 基线升级 + 四平台出包 → 上传 R2 |

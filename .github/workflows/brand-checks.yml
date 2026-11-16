@@ -1,0 +1,30 @@
+name: brand regression checks
+
+on:
+  push:
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/**'
+      - 'open-code/scripts/**'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/**'
+      - 'open-code/scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+      - name: 发布事务、版本保护与补丁修复回归
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          python3 open-code/scripts/test-rebase-patches.py -v
